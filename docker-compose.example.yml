@@ -5,38 +5,71 @@ services:
     container_name: arr-sentinel
     restart: unless-stopped
     environment:
-      # ---- mode ----
+      # ---------- mode ----------
       SENTINEL_MODE: cron            # cron | event
       SENTINEL_INTERVAL: "900"       # cron: seconds between sweeps
-      SENTINEL_MIN_STRIKES: "2"      # consecutive sweeps an item must be stuck before acting
-      SENTINEL_MAX_ACTIONS: "20"     # max removals per sweep (rate limit)
-      SENTINEL_BLOCKLIST: "true"     # blocklist removed grabs so the *arr fetches a different release
       SENTINEL_DRY_RUN: "false"      # true = log only, change nothing
-      # SENTINEL_LOAD_MAX: "30"      # pause a sweep if host 1-min load is above this (needs /proc/loadavg, see below)
+      SENTINEL_LOG_LEVEL: INFO
+      SENTINEL_LOG_FILE: /data/sentinel.log   # rotating file log (also logs to stdout)
+
+      # ---------- which checks to run ----------
+      ENABLE_QUEUE: "true"           # *arr stuck-queue cleaner
+      ENABLE_DECYPHARR: "true"       # decypharr mount-hang watchdog
+      ENABLE_PLEX: "true"            # Plex reachability
+      ENABLE_RESOURCES: "true"       # host load / mem / swap
+      ENABLE_JANITOR: "false"        # usenet dead-file quarantine (needs a decypharr log file)
+
+      # ---------- queue check ----------
+      SENTINEL_MIN_STRIKES: "2"      # consecutive sweeps stuck before acting (ignores transient blips)
+      SENTINEL_MAX_ACTIONS: "20"     # max removals per sweep
+      SENTINEL_BLOCKLIST: "true"     # blocklist removed grabs so a different release is fetched
+      # SENTINEL_LOAD_MAX: "60"      # skip queue sweep if host 1-min load above this
       # SENTINEL_CONDITIONS: "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"
 
-      # ---- instances (add as many as you like: INSTANCE_2_*, INSTANCE_3_* ...) ----
       INSTANCE_1_NAME: sonarr
       INSTANCE_1_TYPE: sonarr
       INSTANCE_1_URL: http://sonarr:8989
       INSTANCE_1_APIKEY: ${SONARR_API_KEY}
-
       INSTANCE_2_NAME: radarr
       INSTANCE_2_TYPE: radarr
       INSTANCE_2_URL: http://radarr:7878
       INSTANCE_2_APIKEY: ${RADARR_API_KEY}
-
       INSTANCE_3_NAME: sonarr4k
       INSTANCE_3_TYPE: sonarr
       INSTANCE_3_URL: http://sonarr4k:8989
       INSTANCE_3_APIKEY: ${SONARR4K_API_KEY}
-
       INSTANCE_4_NAME: radarr4k
       INSTANCE_4_TYPE: radarr
       INSTANCE_4_URL: http://radarr4k:7878
       INSTANCE_4_APIKEY: ${RADARR4K_API_KEY}
+
+      # ---------- decypharr (mount-hang watchdog) ----------
+      DECYPHARR_URL: http://192.168.1.10:8282        # API reachability (optional)
+      DECYPHARR_MOUNT_TEST: /mnt/library/movies      # a dir on the FUSE mount to read-test
+      DECYPHARR_READ_TIMEOUT: "25"
+      # if a read hangs, run this to recover (decypharr is often a HOST service, so use ssh/docker):
+      # DECYPHARR_RESTART_CMD: "ssh root@192.168.1.10 systemctl restart decypharr"
+      # DECYPHARR_RESTART_CMD: "docker restart decypharr"
+
+      # ---------- plex ----------
+      PLEX_URL: http://192.168.1.20:32400
+      PLEX_TOKEN: ${PLEX_TOKEN}
+      PLEX_SCAN_ON_CHECK: "false"    # also trigger a library refresh when Plex is up
+
+      # ---------- resources ----------
+      RES_LOAD_WARN: "40"
+      RES_SWAP_WARN_MB: "7000"
+      RES_MEM_MIN_MB: "800"
+      RES_DROP_CACHES: "false"       # echo 1 > drop_caches under memory pressure (needs the mount below + privilege)
+
+      # ---------- janitor (optional) ----------
+      JANITOR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies
+      JANITOR_DECYPHARR_LOG: /logs/decypharr.log     # mount decypharr's error log here
     volumes:
-      - ./data:/data            # persists strike counts across restarts
-      # - /proc/loadavg:/proc/loadavg:ro   # uncomment to use SENTINEL_LOAD_MAX
+      - ./data:/data                                 # state + file log + quarantine manifests
+      - /mnt/library:/mnt/library                    # for mount read-test + janitor (read/write for janitor)
+      # - /proc/loadavg:/proc/loadavg:ro             # host load for resources check
+      # - /proc/meminfo:/proc/meminfo:ro             # host memory for resources check
+      # - /var/log/decypharr.log:/logs/decypharr.log:ro   # for the janitor
     # ports:
-    #   - "8088:8088"           # only needed in event mode (Sonarr/Radarr webhook target)
+    #   - "8088:8088"            # only for event mode (Sonarr/Radarr webhook target)

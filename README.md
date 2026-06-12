@@ -1,23 +1,38 @@
 # arr-sentinel
 
-**Auto-detect and fix the stuck-queue issues that silently pile up in a Sonarr/Radarr media stack.**
+**A self-hosted health daemon that auto-detects and fixes the recurring problems in a
+Sonarr/Radarr + decypharr + Plex media stack.**
 
-If you run *arr apps against usenet (decypharr, SABnzbd, NZBGet) or torrents/debrid, you've
-seen these: downloads that finish but never import, dead grabs that sit forever as
-`downloadClientUnavailable`, incomplete files whose corrupt headers make ffprobe choke so the
-import is blocked, stalled downloads with no progress. Each one quietly stops content from
-landing, and you only notice when something's "missing."
+If you run *arr apps against usenet (decypharr, SABnzbd, NZBGet) or torrents/debrid, you know
+the failure modes: downloads that finish but never import, dead grabs stuck as
+`downloadClientUnavailable`, incomplete files whose corrupt headers make ffprobe choke, a
+hung decypharr FUSE mount that takes Plex down, memory/load pressure that OOMs your arrs.
+You only notice when something's "missing" or the family complains.
 
-arr-sentinel watches your queues and clears them automatically: a stuck item is removed and
-(optionally) blocklisted, so the *arr re-searches a **different** release and the gap fills
-itself. No third-party dependencies, ~one small container, everything configured by env vars.
+arr-sentinel runs a set of **modular checks** on an interval (or on Sonarr/Radarr webhooks),
+detects these, and fixes the safe ones automatically. No third-party dependencies, one small
+container, everything configured by env vars.
 
 > Born out of a long night of hand-fixing exactly these problems on a usenet *arr stack.
 > Now it's a daemon so you never have to do it by hand again.
 
+## Checks (toggle each with `ENABLE_*`)
+
+| check | detects | fixes |
+|---|---|---|
+| **queue** | stuck/dead/blocked *arr download-queue items | removes + blocklists -> *arr re-searches a different release |
+| **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
+| **plex** | Plex unresponsive | alerts (optional library refresh) |
+| **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
+| **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
+
+Safe by design: risky actions (restart, drop_caches) are **opt-in**, the queue fixer only
+acts after an item is stuck for several consecutive checks, and everything supports
+`SENTINEL_DRY_RUN=true`.
+
 ---
 
-## What it fixes
+## What the queue check fixes
 
 Each is a named **condition** you can enable/disable via `SENTINEL_CONDITIONS`:
 

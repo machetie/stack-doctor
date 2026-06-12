@@ -1,39 +1,38 @@
 #!/usr/bin/env python3
 """
-arr-sentinel - auto-detect and fix recurring Sonarr/Radarr stack issues.
+arr-sentinel - auto-detect and fix recurring issues across a Sonarr/Radarr +
+decypharr + Plex media stack.
 
-It watches your *arr download queues and clears the things that silently pile up
-and stall a usenet/torrent media stack:
+Modular checks, each toggled and configured by environment variables:
 
-  * downloadClientUnavailable  - dead grabs the client rejected (orphans)
-  * importBlocked / importFailed - completed downloads that won't import
-  * importPending + warning     - incomplete/corrupt files ffprobe can't parse
-  * failedPending / stalled     - failed or no-progress downloads
+  queue      *arr download queues       - clear stuck/dead/blocked items -> re-search
+  decypharr  decypharr mount + API      - detect a hung FUSE mount -> run a restart hook
+  plex       Plex Media Server          - detect unresponsive Plex (+ optional library scan)
+  resources  host load / memory / swap  - report pressure, optional drop_caches relief
+  janitor    usenet dead files          - quarantine library symlinks for permanently-dead
+                                           releases (reversible) from a decypharr log file
 
-When an item has been stuck for MIN_STRIKES consecutive checks it is removed
-(optionally blocklisted) so the *arr re-searches a different release.
-
-Everything is configured by environment variables (see README). Runs as a
-cron-style interval loop OR reacts to Sonarr/Radarr webhook events.
-
+Runs as a cron-style interval loop OR reacts to Sonarr/Radarr webhook events.
 Pure Python standard library, no dependencies.
 """
 import json
 import logging
+import logging.handlers
 import os
+import re
 import signal
+import subprocess
 import sys
 import threading
 import time
 import urllib.request
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --------------------------------------------------------------------------- #
-# config
+# config helpers
 # --------------------------------------------------------------------------- #
 
-def _b(name, default):
+def _b(name, default=False):
     return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
 
 def _i(name, default):
@@ -42,37 +41,110 @@ def _i(name, default):
     except (TypeError, ValueError):
         return default
 
-MODE          = os.environ.get("SENTINEL_MODE", "cron").strip().lower()       # cron | event
-INTERVAL      = _i("SENTINEL_INTERVAL", 900)                                  # seconds between cron sweeps
-MIN_STRIKES   = _i("SENTINEL_MIN_STRIKES", 2)                                 # consecutive checks before acting
-MAX_ACTIONS   = _i("SENTINEL_MAX_ACTIONS", 20)                                # rate limit per sweep
-DRY_RUN       = _b("SENTINEL_DRY_RUN", False)
+def _f(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+MODE        = os.environ.get("SENTINEL_MODE", "cron").strip().lower()   # cron | event
+INTERVAL    = _i("SENTINEL_INTERVAL", 900)
+PORT        = _i("SENTINEL_PORT", 8088)
+LOG_LEVEL   = os.environ.get("SENTINEL_LOG_LEVEL", "INFO").upper()
+LOG_FILE    = os.environ.get("SENTINEL_LOG_FILE", "")
+TIMEOUT     = _i("SENTINEL_HTTP_TIMEOUT", 60)
+DRY_RUN     = _b("SENTINEL_DRY_RUN", False)
+
+# which checks are on
+EN_QUEUE     = _b("ENABLE_QUEUE", True)
+EN_DECYPHARR = _b("ENABLE_DECYPHARR", False)
+EN_PLEX      = _b("ENABLE_PLEX", False)
+EN_RESOURCES = _b("ENABLE_RESOURCES", False)
+EN_JANITOR   = _b("ENABLE_JANITOR", False)
+
+# queue check
+MIN_STRIKES   = _i("SENTINEL_MIN_STRIKES", 2)
+MAX_ACTIONS   = _i("SENTINEL_MAX_ACTIONS", 20)
 BLOCKLIST     = _b("SENTINEL_BLOCKLIST", True)
 REMOVE_CLIENT = _b("SENTINEL_REMOVE_FROM_CLIENT", True)
-LOAD_MAX      = float(os.environ.get("SENTINEL_LOAD_MAX", "0") or 0)          # pause if 1-min load > this (0 = off)
 STATE_FILE    = os.environ.get("SENTINEL_STATE_FILE", "/data/state.json")
-PORT          = _i("SENTINEL_PORT", 8088)
-HEALTH_REPORT = _b("SENTINEL_HEALTH_REPORT", True)
-LOG_LEVEL     = os.environ.get("SENTINEL_LOG_LEVEL", "INFO").upper()
-TIMEOUT       = _i("SENTINEL_HTTP_TIMEOUT", 60)
-
 DEFAULT_CONDITIONS = "downloadClientUnavailable,importBlocked,importFailed,importPending_warning,failedPending,stalled"
 ENABLED_CONDITIONS = [c.strip() for c in os.environ.get("SENTINEL_CONDITIONS", DEFAULT_CONDITIONS).split(",") if c.strip()]
 
-# Sonarr/Radarr webhook eventTypes that trigger a sweep in event mode
+# resource thresholds (host load uses /proc/loadavg if mounted)
+LOAD_MAX        = _f("SENTINEL_LOAD_MAX", 0)         # queue check pauses above this (0=off)
+RES_LOAD_WARN   = _f("RES_LOAD_WARN", 40)
+RES_SWAP_WARN   = _i("RES_SWAP_WARN_MB", 7000)
+RES_MEM_MIN     = _i("RES_MEM_MIN_MB", 800)
+RES_DROP_CACHES = _b("RES_DROP_CACHES", False)       # echo 1 > drop_caches on memory pressure (needs privilege)
+
+# decypharr
+DECY_URL          = os.environ.get("DECYPHARR_URL", "")             # e.g. http://192.168.50.202:8282
+DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test
+DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
+DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
+
+# plex
+PLEX_URL   = os.environ.get("PLEX_URL", "")
+PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
+PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
+
+# janitor
+JAN_LIBS      = [p.strip() for p in os.environ.get("JANITOR_LIBRARY_PATHS", "").split(",") if p.strip()]
+JAN_LOG       = os.environ.get("JANITOR_DECYPHARR_LOG", "")         # decypharr log file (errors w/ release dirs)
+JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
+JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing").split(",")
+
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "SENTINEL_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("arr-sentinel")
+# --------------------------------------------------------------------------- #
+# logging
+# --------------------------------------------------------------------------- #
+handlers = [logging.StreamHandler(sys.stdout)]
+if LOG_FILE:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+        handlers.append(logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3))
+    except Exception:
+        pass
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers)
+log = logging.getLogger("sentinel")
 
 # --------------------------------------------------------------------------- #
-# stuck-condition predicates
+# small helpers
 # --------------------------------------------------------------------------- #
+
+def http_code(url, headers=None, t=10):
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=t)
+        return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+def run_cmd(cmd):
+    if not cmd:
+        return None
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
+        return (p.returncode, (p.stdout + p.stderr).strip()[:300])
+    except Exception as e:
+        return (1, "cmd error: " + str(e)[:120])
+
+def host_load():
+    try:
+        with open("/proc/loadavg") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 0.0
+
+# =========================================================================== #
+# CHECK: queue
+# =========================================================================== #
 
 def _msgs(rec):
     out = []
@@ -90,8 +162,7 @@ CONDITIONS = {
                                           and r.get("trackedDownloadStatus") in ("warning", "error"),
     "failedPending":            lambda r: r.get("trackedDownloadState") == "failedPending",
     "stalled":                  lambda r: r.get("trackedDownloadStatus") == "warning"
-                                          and any("stall" in m.lower() or "no files" in m.lower()
-                                                  for m in _msgs(r)),
+                                          and any("stall" in m.lower() or "no files" in m.lower() for m in _msgs(r)),
 }
 
 def stuck_reason(rec):
@@ -101,14 +172,9 @@ def stuck_reason(rec):
             return name
     return None
 
-# --------------------------------------------------------------------------- #
-# *arr client
-# --------------------------------------------------------------------------- #
-
 class Arr:
     def __init__(self, name, kind, url, apikey):
-        self.name = name
-        self.kind = kind  # "sonarr" | "radarr"
+        self.name, self.kind = name, kind
         self.base = url.rstrip("/") + "/api/v3"
         self.apikey = apikey
         self.unknown = "includeUnknownSeriesItems=true" if kind == "sonarr" else "includeUnknownMovieItems=true"
@@ -120,11 +186,9 @@ class Arr:
 
     def queue(self):
         try:
-            data = json.load(self._req("GET", "/queue?page=1&pageSize=1000&" + self.unknown))
-            return data.get("records", [])
+            return json.load(self._req("GET", "/queue?page=1&pageSize=1000&" + self.unknown)).get("records", [])
         except Exception as e:
-            log.warning("[%s] queue fetch failed: %s", self.name, e)
-            return None
+            log.warning("[%s] queue fetch failed: %s", self.name, e); return None
 
     def health(self):
         try:
@@ -136,187 +200,300 @@ class Arr:
         q = "removeFromClient=%s&blocklist=%s" % (str(REMOVE_CLIENT).lower(), str(BLOCKLIST).lower())
         self._req("DELETE", "/queue/%d?%s" % (item_id, q))
 
-# --------------------------------------------------------------------------- #
-# instances from env (INSTANCE_<N>_URL / _APIKEY / _TYPE / _NAME)
-# --------------------------------------------------------------------------- #
-
 def load_instances():
     out = []
     for n in range(1, 51):
         url = os.environ.get("INSTANCE_%d_URL" % n)
         if not url:
             continue
-        apikey = os.environ.get("INSTANCE_%d_APIKEY" % n, "")
+        key = os.environ.get("INSTANCE_%d_APIKEY" % n, "")
         kind = os.environ.get("INSTANCE_%d_TYPE" % n, "").strip().lower()
         if kind not in ("sonarr", "radarr"):
-            # infer from url/name if not given
             kind = "radarr" if "radarr" in url.lower() else "sonarr"
         name = os.environ.get("INSTANCE_%d_NAME" % n, "%s-%d" % (kind, n))
-        if not apikey:
-            log.warning("INSTANCE_%d has no APIKEY, skipping", n)
-            continue
-        out.append(Arr(name, kind, url, apikey))
+        if not key:
+            log.warning("INSTANCE_%d has no APIKEY, skipping", n); continue
+        out.append(Arr(name, kind, url, key))
     return out
 
-# --------------------------------------------------------------------------- #
-# strike state (persisted)
-# --------------------------------------------------------------------------- #
+INSTANCES = []
 
-def load_state():
+def _load_state():
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        return json.load(open(STATE_FILE))
     except Exception:
         return {}
 
-def save_state(state):
+def _save_state(s):
     try:
         os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        log.debug("state save failed: %s", e)
-
-# --------------------------------------------------------------------------- #
-# the sweep
-# --------------------------------------------------------------------------- #
-
-def host_load():
-    try:
-        with open("/proc/loadavg") as f:
-            return float(f.read().split()[0])
+        json.dump(s, open(STATE_FILE, "w"))
     except Exception:
-        return 0.0
+        pass
 
-_sweep_lock = threading.Lock()
+def check_queue(only=None):
+    if LOAD_MAX > 0 and host_load() > LOAD_MAX:
+        log.info("[queue] host load > %.0f -> skipping", LOAD_MAX); return
+    state = _load_state(); actions = 0
+    for arr in INSTANCES:
+        if only and arr.name.lower() != only.lower():
+            continue
+        recs = arr.queue()
+        if recs is None:
+            continue
+        strikes = state.get(arr.name, {}); new = {}; stuck = 0
+        for r in recs:
+            reason = stuck_reason(r)
+            if not reason:
+                continue
+            stuck += 1; iid = str(r.get("id")); cnt = strikes.get(iid, 0) + 1; new[iid] = cnt
+            if cnt >= MIN_STRIKES and actions < MAX_ACTIONS:
+                title = (r.get("title") or "")[:70]
+                if DRY_RUN:
+                    log.info("[queue:%s] WOULD remove (%s strike %d): %s", arr.name, reason, cnt, title)
+                else:
+                    try:
+                        arr.remove(r["id"]); actions += 1; new.pop(iid, None)
+                        log.info("[queue:%s] removed (%s, blocklist=%s) -> re-search: %s", arr.name, reason, BLOCKLIST, title)
+                    except Exception as e:
+                        log.warning("[queue:%s] remove failed: %s", arr.name, e)
+        state[arr.name] = new
+        if stuck:
+            log.info("[queue:%s] %d stuck tracked, %d acted", arr.name, stuck, actions)
+        for h in arr.health():
+            if h.get("type") in ("error", "warning"):
+                log.debug("[queue:%s] health %s: %s", arr.name, h.get("type"), (h.get("message") or "")[:90])
+    _save_state(state)
 
-def sweep(instances, only=None):
-    if not _sweep_lock.acquire(blocking=False):
-        log.debug("sweep already running, skipping")
-        return
+# =========================================================================== #
+# CHECK: decypharr (mount hang -> restart hook)
+# =========================================================================== #
+
+def _read_test(path, timeout):
+    """Return True if a file under path read its first bytes within timeout, else False (hung/failed)."""
+    result = {"ok": False}
+    target = {"f": None}
     try:
-        if LOAD_MAX > 0:
-            l = host_load()
-            if l > LOAD_MAX:
-                log.info("host load %.0f > %.0f -> skipping sweep (protecting the host)", l, LOAD_MAX)
-                return
-        state = load_state()
-        actions = 0
-        for arr in instances:
-            if only and arr.name.lower() != only.lower():
-                continue
-            recs = arr.queue()
-            if recs is None:
-                continue
-            strikes = state.get(arr.name, {})
-            new_strikes = {}
-            stuck_now = 0
-            for r in recs:
-                reason = stuck_reason(r)
-                if not reason:
+        for root, _, files in os.walk(path):
+            for fn in files:
+                if fn.lower().endswith((".mkv", ".mp4", ".avi", ".m4v", ".ts")):
+                    target["f"] = os.path.join(root, fn); break
+            if target["f"]:
+                break
+    except Exception:
+        return None  # cannot even list -> unknown
+    if not target["f"]:
+        return None
+    def _do():
+        try:
+            with open(target["f"], "rb") as fh:
+                fh.read(65536)
+            result["ok"] = True
+        except Exception:
+            result["ok"] = False
+    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
+    if th.is_alive():
+        return False  # hung
+    return result["ok"]
+
+_decy_last_restart = [0.0]
+
+def check_decypharr():
+    if DECY_URL:
+        c = http_code(DECY_URL, t=10)
+        log.info("[decypharr] api %s -> %s", DECY_URL, c if c else "DOWN")
+    if not DECY_MOUNT_TEST:
+        return
+    ok = _read_test(DECY_MOUNT_TEST, DECY_READ_TIMEOUT)
+    if ok is None:
+        log.warning("[decypharr] mount %s: no test file found / unlistable", DECY_MOUNT_TEST); return
+    if ok:
+        log.info("[decypharr] mount %s read OK", DECY_MOUNT_TEST); return
+    log.error("[decypharr] mount %s READ HUNG (FUSE stall)", DECY_MOUNT_TEST)
+    if DRY_RUN or not DECY_RESTART_CMD:
+        log.error("[decypharr] no restart cmd set (or dry-run) -> alert only"); return
+    if time.time() - _decy_last_restart[0] < 300:
+        log.warning("[decypharr] restarted <5m ago, holding off"); return
+    log.error("[decypharr] running restart hook: %s", DECY_RESTART_CMD)
+    rc = run_cmd(DECY_RESTART_CMD); _decy_last_restart[0] = time.time()
+    log.error("[decypharr] restart hook rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
+
+# =========================================================================== #
+# CHECK: plex
+# =========================================================================== #
+
+def check_plex():
+    if not PLEX_URL:
+        return
+    sep = "&" if "?" in PLEX_URL else "?"
+    url = PLEX_URL.rstrip("/") + "/identity"
+    c = http_code(url + (sep + "X-Plex-Token=" + PLEX_TOKEN if PLEX_TOKEN else ""), t=10)
+    if c == 200:
+        log.info("[plex] %s -> 200 OK", PLEX_URL)
+    else:
+        log.error("[plex] %s -> %s (unresponsive)", PLEX_URL, c if c else "DOWN")
+    if PLEX_SCAN and PLEX_TOKEN and c == 200:
+        try:
+            urllib.request.urlopen(PLEX_URL.rstrip("/") + "/library/sections/all/refresh?X-Plex-Token=" + PLEX_TOKEN, timeout=10)
+            log.info("[plex] triggered library refresh")
+        except Exception as e:
+            log.debug("[plex] refresh failed: %s", e)
+
+# =========================================================================== #
+# CHECK: resources
+# =========================================================================== #
+
+def _meminfo():
+    d = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            d[k.strip()] = int(v.split()[0]) // 1024  # MB
+    except Exception:
+        pass
+    return d
+
+def check_resources():
+    l1 = host_load()
+    mi = _meminfo()
+    avail = mi.get("MemAvailable", -1)
+    swap_used = mi.get("SwapTotal", 0) - mi.get("SwapFree", 0)
+    msg = "[resources] load=%.1f memAvail=%sMB swapUsed=%sMB" % (l1, avail, swap_used)
+    crit = (l1 >= RES_LOAD_WARN) or (0 <= avail < RES_MEM_MIN) or (swap_used >= RES_SWAP_WARN)
+    (log.warning if crit else log.info)(msg + (" <-- PRESSURE" if crit else ""))
+    if crit and RES_DROP_CACHES and not DRY_RUN:
+        rc = run_cmd("sync; echo 1 > /proc/sys/vm/drop_caches")
+        log.warning("[resources] dropped page cache rc=%s", rc[0] if rc else "?")
+
+# =========================================================================== #
+# CHECK: janitor (usenet dead-file quarantine, from a decypharr log file)
+# =========================================================================== #
+
+def check_janitor():
+    if not (JAN_LIBS and JAN_LOG and os.path.exists(JAN_LOG)):
+        if EN_JANITOR:
+            log.debug("[janitor] need JANITOR_LIBRARY_PATHS + a readable JANITOR_DECYPHARR_LOG")
+        return
+    bad = set()
+    try:
+        data = open(JAN_LOG, errors="ignore").read()[-2_000_000:]  # tail
+    except Exception as e:
+        log.warning("[janitor] cannot read log: %s", e); return
+    pat = re.compile(r"Error streaming file: (.+?) error=\"([^\"]*)\"")
+    for m in pat.finditer(data):
+        path, err = m.group(1), m.group(2)
+        if any(p.strip() and p.strip() in err for p in JAN_PATTERNS):
+            bad.add(path.strip().split("/")[0])
+    if not bad:
+        log.debug("[janitor] no dead releases in log tail"); return
+    moved = 0
+    qroot = os.path.join(JAN_QUAR, time.strftime("%Y%m%d-%H%M%S"))
+    manifest = []
+    for libp in JAN_LIBS:
+        for root, _, files in os.walk(libp):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                if not os.path.islink(fp):
                     continue
-                stuck_now += 1
-                iid = str(r.get("id"))
-                cnt = strikes.get(iid, 0) + 1
-                new_strikes[iid] = cnt
-                if cnt >= MIN_STRIKES and actions < MAX_ACTIONS:
-                    title = (r.get("title") or "")[:70]
+                try:
+                    tgt = os.readlink(fp)
+                except Exception:
+                    continue
+                mm = re.search(r"/__all__/([^/]+)(?:/|$)", tgt)
+                if mm and mm.group(1) in bad:
                     if DRY_RUN:
-                        log.info("[%s] WOULD remove (%s, strike %d): %s", arr.name, reason, cnt, title)
-                    else:
-                        try:
-                            arr.remove(r["id"])
-                            log.info("[%s] removed (%s, blocklist=%s) -> re-search: %s",
-                                     arr.name, reason, BLOCKLIST, title)
-                            actions += 1
-                            new_strikes.pop(iid, None)  # gone now
-                        except Exception as e:
-                            log.warning("[%s] remove failed for %s: %s", arr.name, title, e)
-            state[arr.name] = new_strikes
-            if stuck_now:
-                log.debug("[%s] %d stuck item(s) tracked", arr.name, stuck_now)
-            if HEALTH_REPORT:
-                for h in arr.health():
-                    if h.get("type") in ("error", "warning"):
-                        log.debug("[%s] health %s: %s", arr.name, h.get("type"), (h.get("message") or "")[:90])
-        save_state(state)
-        if actions:
-            log.info("sweep done: %d remediation(s) this pass", actions)
-    finally:
-        _sweep_lock.release()
-
-# --------------------------------------------------------------------------- #
-# event mode (webhook receiver)
-# --------------------------------------------------------------------------- #
-
-def make_handler(instances):
-    class Handler(BaseHTTPRequestHandler):
-        def _ok(self, code=200, body=b"ok"):
-            self.send_response(code)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            if self.path in ("/health", "/healthz", "/"):
-                self._ok(body=b"arr-sentinel ok")
-            else:
-                self._ok(404, b"not found")
-
-        def do_POST(self):
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                payload = json.loads(raw or b"{}")
-            except Exception:
-                payload = {}
-            event = payload.get("eventType") or payload.get("EventType") or "?"
-            inst = payload.get("instanceName") or payload.get("InstanceName")
-            self._ok()  # ack fast
-            if event == "Test":
-                log.info("received webhook Test from %s", inst or "?")
-                return
-            if TRIGGER_EVENTS and event not in TRIGGER_EVENTS:
-                log.debug("ignoring event %s", event)
-                return
-            log.info("event '%s' from %s -> sweep", event, inst or "all")
-            threading.Thread(target=sweep, args=(instances,), kwargs={"only": inst}, daemon=True).start()
-
-        def log_message(self, *a):
+                        log.info("[janitor] WOULD quarantine: %s", fp); continue
+                    try:
+                        dst = os.path.join(qroot, os.path.relpath(fp, "/"))
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.symlink(tgt, dst); os.unlink(fp)
+                        manifest.append({"orig": fp, "target": tgt}); moved += 1
+                    except Exception as e:
+                        log.warning("[janitor] move failed %s: %s", fp, e)
+    if manifest:
+        try:
+            os.makedirs(qroot, exist_ok=True); json.dump(manifest, open(qroot + "/manifest.json", "w"), indent=1)
+        except Exception:
             pass
-    return Handler
+    if moved:
+        log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s", moved, len(bad), qroot)
 
-# --------------------------------------------------------------------------- #
-# main
-# --------------------------------------------------------------------------- #
+# =========================================================================== #
+# sweep / loop
+# =========================================================================== #
+
+CHECKS = [("queue", EN_QUEUE, check_queue), ("decypharr", EN_DECYPHARR, check_decypharr),
+          ("plex", EN_PLEX, check_plex), ("resources", EN_RESOURCES, check_resources),
+          ("janitor", EN_JANITOR, check_janitor)]
+
+_lock = threading.Lock()
+
+def sweep(only=None):
+    if not _lock.acquire(blocking=False):
+        log.debug("sweep already running"); return
+    try:
+        for cid, en, fn in CHECKS:
+            if not en:
+                continue
+            try:
+                fn(only) if cid == "queue" else fn()
+            except Exception as e:
+                log.error("[%s] check error: %s", cid, e)
+    finally:
+        _lock.release()
 
 def main():
-    instances = load_instances()
-    if not instances:
-        log.error("no instances configured. Set INSTANCE_1_URL / INSTANCE_1_APIKEY / INSTANCE_1_TYPE (see README).")
+    global INSTANCES
+    INSTANCES = load_instances()
+    enabled = [c for c, e, _ in CHECKS if e]
+    if EN_QUEUE and not INSTANCES:
+        log.error("queue check enabled but no instances. Set INSTANCE_1_URL / _APIKEY / _TYPE.")
         sys.exit(2)
-    log.info("arr-sentinel starting | mode=%s | instances=%s | conditions=%s | min_strikes=%d | dry_run=%s | blocklist=%s",
-             MODE, ", ".join("%s(%s)" % (a.name, a.kind) for a in instances),
-             ",".join(ENABLED_CONDITIONS), MIN_STRIKES, DRY_RUN, BLOCKLIST)
+    if not enabled:
+        log.error("no checks enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR.")
+        sys.exit(2)
+    log.info("arr-sentinel v0.2 | mode=%s | checks=[%s] | instances=%s | dry_run=%s",
+             MODE, ",".join(enabled), ", ".join(a.name for a in INSTANCES) or "-", DRY_RUN)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
     signal.signal(signal.SIGINT, lambda *a: stop.set())
 
     if MODE == "event":
-        # run an initial sweep, then serve webhooks; a slow cron fallback still runs
-        sweep(instances)
-        srv = ThreadingHTTPServer(("0.0.0.0", PORT), make_handler(instances))
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        class H(BaseHTTPRequestHandler):
+            def _ok(self, code=200, body=b"ok"):
+                self.send_response(code); self.send_header("Content-Type", "text/plain"); self.end_headers(); self.wfile.write(body)
+            def do_GET(self):
+                self._ok(body=b"arr-sentinel ok") if self.path in ("/", "/health", "/healthz") else self._ok(404, b"nf")
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    p = json.loads(self.rfile.read(n) or b"{}")
+                except Exception:
+                    p = {}
+                ev = p.get("eventType") or p.get("EventType") or "?"; inst = p.get("instanceName") or p.get("InstanceName")
+                self._ok()
+                if ev == "Test":
+                    log.info("webhook Test from %s", inst or "?"); return
+                if TRIGGER_EVENTS and ev not in TRIGGER_EVENTS:
+                    return
+                log.info("event '%s' from %s -> sweep", ev, inst or "all")
+                threading.Thread(target=sweep, kwargs={"only": inst}, daemon=True).start()
+            def log_message(self, *a):
+                pass
+        sweep()
+        srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        log.info("listening for Sonarr/Radarr webhooks on :%d (events: %s)", PORT, ", ".join(sorted(TRIGGER_EVENTS)))
-        fallback = max(INTERVAL, 1800)
-        while not stop.wait(fallback):
-            sweep(instances)  # safety net in case a webhook is missed
+        log.info("listening for webhooks on :%d", PORT)
+        fb = max(INTERVAL, 1800)
+        while not stop.wait(fb):
+            sweep()
         srv.shutdown()
     else:
-        sweep(instances)
+        sweep()
         while not stop.wait(INTERVAL):
-            sweep(instances)
+            sweep()
     log.info("arr-sentinel stopped")
 
 if __name__ == "__main__":
