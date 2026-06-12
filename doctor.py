@@ -61,6 +61,11 @@ EN_DECYPHARR = _b("ENABLE_DECYPHARR", False)
 EN_PLEX      = _b("ENABLE_PLEX", False)
 EN_RESOURCES = _b("ENABLE_RESOURCES", False)
 EN_JANITOR   = _b("ENABLE_JANITOR", False)
+EN_PROVIDERS = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
+EN_BAZARR    = _b("ENABLE_BAZARR", False)      # Bazarr reachability
+
+BAZARR_URL    = os.environ.get("BAZARR_URL", "")
+BAZARR_APIKEY = os.environ.get("BAZARR_APIKEY", "")
 
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
@@ -183,17 +188,19 @@ def stuck_reason(rec):
 
 class Arr:
     def __init__(self, name, kind, url, apikey):
-        self.name, self.kind = name, kind
-        self.base = url.rstrip("/") + "/api/v3"
+        self.name, self.kind = name, kind                       # sonarr | radarr | prowlarr
+        self.base = url.rstrip("/") + ("/api/v1" if kind == "prowlarr" else "/api/v3")
         self.apikey = apikey
         self.unknown = "includeUnknownSeriesItems=true" if kind == "sonarr" else "includeUnknownMovieItems=true"
 
-    def _req(self, method, path, t=None):
-        req = urllib.request.Request(self.base + path, method=method,
+    def _req(self, method, path, data=None, t=None):
+        req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
         return urllib.request.urlopen(req, timeout=t or TIMEOUT)
 
     def queue(self):
+        if self.kind == "prowlarr":
+            return []                                            # prowlarr has no download queue
         try:
             return json.load(self._req("GET", "/queue?page=1&pageSize=1000&" + self.unknown)).get("records", [])
         except Exception as e:
@@ -209,6 +216,17 @@ class Arr:
         q = "removeFromClient=%s&blocklist=%s" % (str(REMOVE_CLIENT).lower(), str(BLOCKLIST).lower())
         self._req("DELETE", "/queue/%d?%s" % (item_id, q))
 
+    def post(self, path, t=150):
+        """POST with empty body (used for /indexer/testall, /downloadclient/testall). Returns parsed JSON or []."""
+        try:
+            body = self._req("POST", path, data=b"", t=t).read()
+            return json.loads(body) if body else []
+        except urllib.error.HTTPError as e:
+            try: return json.loads(e.read())
+            except Exception: return []
+        except Exception as ex:
+            log.debug("[%s] POST %s err %s", self.name, path, str(ex)[:50]); return []
+
 def load_instances():
     out = []
     for n in range(1, 51):
@@ -217,8 +235,9 @@ def load_instances():
             continue
         key = os.environ.get("INSTANCE_%d_APIKEY" % n, "")
         kind = os.environ.get("INSTANCE_%d_TYPE" % n, "").strip().lower()
-        if kind not in ("sonarr", "radarr"):
-            kind = "radarr" if "radarr" in url.lower() else "sonarr"
+        if kind not in ("sonarr", "radarr", "prowlarr"):
+            kind = ("radarr" if "radarr" in url.lower() else
+                    "prowlarr" if "prowlarr" in url.lower() else "sonarr")
         name = os.environ.get("INSTANCE_%d_NAME" % n, "%s-%d" % (kind, n))
         if not key:
             log.warning("INSTANCE_%d has no APIKEY, skipping", n); continue
@@ -431,12 +450,52 @@ def check_janitor():
         log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s", moved, len(bad), qroot)
 
 # =========================================================================== #
+# CHECK: providers (radarr/sonarr/prowlarr indexers + download clients that errored -> Test)
+# =========================================================================== #
+
+_PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
+
+def check_providers():
+    for arr in INSTANCES:
+        if arr.kind not in ("sonarr", "radarr", "prowlarr"):
+            continue
+        issues = [h for h in arr.health()
+                  if h.get("type") in ("warning", "error")
+                  and any(k in (h.get("message") or "").lower() for k in _PROVIDER_KEYWORDS)]
+        if not issues:
+            continue
+        log.warning("[providers:%s] %d provider issue(s): %s", arr.name, len(issues),
+                    " | ".join((h.get("message") or "")[:60] for h in issues[:2]))
+        if DRY_RUN:
+            continue
+        # re-test everything; a passing test clears the failure status and re-enables recovered ones
+        for ep, label in (("/indexer/testall", "indexers"), ("/downloadclient/testall", "download-clients")):
+            res = arr.post(ep)
+            if isinstance(res, list) and res:
+                ok = sum(1 for r in res if r.get("isValid"))
+                still = [r.get("id") for r in res if not r.get("isValid")]
+                log.info("[providers:%s] tested %s: %d ok, %d still failing %s",
+                         arr.name, label, ok, len(still), still or "")
+
+# =========================================================================== #
+# CHECK: bazarr (reachability)
+# =========================================================================== #
+
+def check_bazarr():
+    if not BAZARR_URL:
+        return
+    c = http_code(BAZARR_URL.rstrip("/") + "/api/system/status",
+                  headers={"X-API-KEY": BAZARR_APIKEY} if BAZARR_APIKEY else None, t=10)
+    (log.info if c == 200 else log.error)("[bazarr] %s -> %s", BAZARR_URL, c if c else "DOWN")
+
+# =========================================================================== #
 # sweep / loop
 # =========================================================================== #
 
-CHECKS = [("queue", EN_QUEUE, check_queue), ("decypharr", EN_DECYPHARR, check_decypharr),
-          ("plex", EN_PLEX, check_plex), ("resources", EN_RESOURCES, check_resources),
-          ("janitor", EN_JANITOR, check_janitor)]
+CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
+          ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
+          ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
+          ("bazarr", EN_BAZARR, check_bazarr)]
 
 _lock = threading.Lock()
 

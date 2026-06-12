@@ -21,10 +21,12 @@ container, everything configured by env vars.
 | check | detects | fixes |
 |---|---|---|
 | **queue** | stuck/dead/blocked *arr download-queue items | removes + blocklists -> *arr re-searches a different release |
+| **providers** | failed indexers / download clients (sonarr/radarr/**prowlarr**) | runs the **Test** on them to re-validate + clear the failure |
 | **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
+| **bazarr** | Bazarr unreachable | alerts |
 
 Safe by design: risky actions (restart, drop_caches) are **opt-in**, the queue fixer only
 acts after an item is stuck for several consecutive checks, and everything supports

@@ -14,10 +14,12 @@ services:
 
       # ---------- which checks to run ----------
       ENABLE_QUEUE: "true"           # *arr stuck-queue cleaner
+      ENABLE_PROVIDERS: "true"       # auto-Test failed indexers/download clients (sonarr/radarr/prowlarr)
       ENABLE_DECYPHARR: "true"       # decypharr mount-hang watchdog
       ENABLE_PLEX: "true"            # Plex reachability
       ENABLE_RESOURCES: "true"       # host load / mem / swap
       ENABLE_JANITOR: "false"        # usenet dead-file quarantine (needs a decypharr log file)
+      ENABLE_BAZARR: "false"         # Bazarr reachability (set BAZARR_URL/BAZARR_APIKEY)
 
       # ---------- queue check ----------
       DOCTOR_MIN_STRIKES: "2"      # consecutive sweeps stuck before acting (ignores transient blips)
@@ -42,6 +44,14 @@ services:
       INSTANCE_4_TYPE: radarr
       INSTANCE_4_URL: http://radarr4k:7878
       INSTANCE_4_APIKEY: ${RADARR4K_API_KEY}
+      INSTANCE_5_NAME: prowlarr        # prowlarr is for the providers check (no download queue)
+      INSTANCE_5_TYPE: prowlarr
+      INSTANCE_5_URL: http://prowlarr:9696
+      INSTANCE_5_APIKEY: ${PROWLARR_API_KEY}
+
+      # ---------- bazarr (optional) ----------
+      BAZARR_URL: http://bazarr:6767
+      BAZARR_APIKEY: ${BAZARR_API_KEY}
 
       # ---------- decypharr (mount-hang watchdog) ----------
       DECYPHARR_URL: http://192.168.1.10:8282        # API reachability (optional)
