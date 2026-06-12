@@ -11,10 +11,11 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY doctor.py /app/doctor.py
 
-# no third-party dependencies (Python standard library only)
-RUN useradd -r -u 1000 doctor && mkdir -p /data && chown doctor:doctor /data
+# no third-party dependencies (Python standard library only).
+# Runs as root so a bind-mounted /data (and an optional rw /mnt/library for the
+# janitor) is always writable regardless of host ownership.
+RUN mkdir -p /data
 VOLUME /data
-USER doctor
 
 # webhook port (event mode)
 EXPOSE 8088
