@@ -108,6 +108,23 @@ A full example with four instances and `.env` is in
 
 ---
 
+## Web dashboard
+
+Set `ENABLE_UI=true` and open `http://<host>:12345` for a simple, dependency-free dashboard:
+
+- **Dashboard**: which checks are on/off; the live up/down + version + health-warning count of every
+  monitored service (each *arr, Prowlarr, decypharr, Plex, Bazarr); and warmer stats, total warmed
+  plus a feed of *what* was warmed and *why* (`ondeck` / `next` / `detail-page`).
+- **Config**: edit the common tuning knobs and save. Changes write to `DOCTOR_CONFIG_FILE` and apply
+  on restart (there's a "Save and Restart" button). Secrets (API keys, tokens) are never shown.
+- **Logs**: a live tail of `DOCTOR_LOG_FILE`.
+
+It runs inside the daemon's own process (no extra container). Gate it with `DOCTOR_UI_TOKEN` if your
+LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the dashboard
+(`DOCTOR_UI_PORT`) run side by side.
+
+---
+
 ## Configuration (all via env vars)
 
 ### Behaviour
@@ -129,6 +146,10 @@ A full example with four instances and `.env` is in
 | `DOCTOR_HEALTH_REPORT` | `true` | log *arr `/health` warnings at debug level |
 | `DOCTOR_STATE_FILE` | `/data/state.json` | where strike counts persist |
 | `DOCTOR_PORT` | `8088` | webhook port (event mode) |
+| `ENABLE_UI` | `false` | serve the web dashboard (status, per-service health, warmer stats, editable config, live logs) |
+| `DOCTOR_UI_PORT` | `12345` | dashboard port |
+| `DOCTOR_UI_TOKEN` | *(none)* | if set, require `?token=` or an `X-Doctor-Token` header to reach the dashboard |
+| `DOCTOR_CONFIG_FILE` | `/data/config.json` | overlay the dashboard writes edited settings to (merged over env at startup; applies on restart) |
 | `DOCTOR_TRIGGER_EVENTS` | `Download,ManualInteractionRequired,DownloadFailed,Grab` | webhook events that trigger a sweep |
 | `DOCTOR_LOG_LEVEL` | `INFO` | `DEBUG` for verbose |
 

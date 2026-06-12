@@ -70,9 +70,26 @@ def _human(sec):
             return "%d%s" % (sec // size, suf)
     return "%ds" % sec
 
+# UI-saved overrides: merge a JSON overlay over the inherited env BEFORE config is read, so edits win.
+CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
+
+def _load_overrides():
+    try:
+        with open(CONFIG_FILE) as f:
+            for k, v in json.load(f).items():
+                if v is not None:
+                    os.environ[str(k)] = str(v)
+    except Exception:
+        pass
+
+_load_overrides()
+
 MODE        = os.environ.get("DOCTOR_MODE", "cron").strip().lower()   # cron | event
 INTERVAL    = _i("DOCTOR_INTERVAL", 900)
-PORT        = _i("DOCTOR_PORT", 8088)
+PORT        = _i("DOCTOR_PORT", 8088)                                 # webhook port (event mode)
+UI_PORT     = _i("DOCTOR_UI_PORT", 12345)                            # web dashboard port
+EN_UI       = _b("ENABLE_UI", False)
+UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional ?token= / X-Doctor-Token gate
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
@@ -670,6 +687,14 @@ class Plex:
 _warm_state = {}            # host_path -> last_warm_ts
 _warm_lock = threading.Lock()
 _warm_last_ondeck = [0.0]
+_warm_count = [0]           # total warms since start (for the UI)
+_warm_recent = []           # recent warms for the UI: [{"ts","title","why"}]
+
+def _warm_record(title, why):
+    _warm_count[0] += 1
+    _warm_recent.append({"ts": time.time(), "title": title, "why": why})
+    if len(_warm_recent) > 80:
+        del _warm_recent[:len(_warm_recent) - 80]
 
 def _host_path(f):
     if WARM_PATH_MAP and ":" in WARM_PATH_MAP:
@@ -678,7 +703,7 @@ def _host_path(f):
             return b + f[len(a):]
     return f
 
-def _warm_file(path):
+def _warm_file(path, reason="cycle"):
     p = _host_path(path)
     with _warm_lock:                                    # atomic claim: one warm per file per cooldown
         if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
@@ -714,6 +739,7 @@ def _warm_file(path):
     if res["err"]:
         _warm_state.pop(p, None)
         log.warning("[warmer] read fail %s: %s", os.path.basename(p), res["err"]); return False
+    _warm_record(os.path.basename(p), reason)
     log.info("[warmer] warmed %dMB head%s in %.1fs: %s",
              res["got"] >> 20, "+%dMB tail" % WARM_TAIL_MB if tail else "",
              time.time() - t0, os.path.basename(p))
@@ -752,10 +778,10 @@ def warm_cycle():
         log.info("[warmer] host load > %.0f -> skip cycle", WARM_LOAD_MAX); return
     targets = _warm_targets(Plex(PLEX_URL, PLEX_TOKEN))
     done = 0
-    for _, path in targets:
+    for reason, path in targets:
         if done >= WARM_MAX_CYCLE:
             break
-        if _warm_file(path):
+        if _warm_file(path, reason):
             done += 1
     if done:
         log.info("[warmer] cycle warmed %d (of %d candidate paths)", done, len(targets))
@@ -776,7 +802,7 @@ _PLEXLOG_RE = re.compile(r"/library/metadata/(\d+)\?[^\s]*includeExtras=1")
 
 def _warm_opened(plex, rk):
     for f in plex.parts(rk):                                    # numeric ratingKey -> file path(s)
-        if _warm_file(f):
+        if _warm_file(f, "detail-page"):
             log.info("[warmer] you opened rk=%s -> warmed: %s", rk, os.path.basename(_host_path(f)))
 
 def plexlog_loop(stop):
@@ -837,6 +863,259 @@ def sweep(only=None):
     finally:
         _lock.release()
 
+# =========================================================================== #
+# web dashboard (optional, no dependencies): status + per-service health +
+# warmer stats + editable tuning config + live logs. Secrets stay masked.
+# =========================================================================== #
+
+_SECRET_HINT = ("APIKEY", "API_KEY", "TOKEN", "PASSWORD", "PASS", "SECRET")
+
+UI_SCHEMA = [
+    ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
+              ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
+    ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
+              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""),
+              ("ENABLE_BAZARR", ""), ("ENABLE_WARMER", "")]),
+    ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
+              ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
+    ("Warmer", [("WARMER_PRECACHE_MB", "64"), ("WARMER_TAIL_MB", "8"), ("WARMER_SOURCES", "ondeck,next"),
+              ("WARMER_MAX_PER_CYCLE", "40"), ("WARMER_NEXT_EPISODES", "1"), ("WARMER_COOLDOWN", "3600"),
+              ("WARMER_LOAD_MAX", "0")]),
+    ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
+]
+UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
+
+def _is_secret(k):
+    ku = k.upper()
+    return any(h in ku for h in _SECRET_HINT)
+
+def _ui_health():
+    """Quick reachability of every monitored service, probed in parallel (short timeouts)."""
+    def arr_probe(a):
+        def f():
+            st = json.load(a._req("GET", "/system/status", t=5))
+            warns = [h for h in a.health() if h.get("type") in ("warning", "error")]
+            return True, ("v%s" % st.get("version", "?")) + (", %d health warn" % len(warns) if warns else "")
+        return f
+    jobs = [(a.name, a.kind, arr_probe(a)) for a in INSTANCES]
+    if DECY_URL:
+        jobs.append(("decypharr", "mount", lambda: (http_code(DECY_URL, t=5) == 200, DECY_URL)))
+    if PLEX_URL:
+        jobs.append(("plex", "plex", lambda: (
+            http_code(PLEX_URL.rstrip("/") + "/identity" + ("?X-Plex-Token=" + PLEX_TOKEN if PLEX_TOKEN else ""), t=5) == 200, "")))
+    if BAZARR_URL:
+        jobs.append(("bazarr", "bazarr", lambda: (http_code(BAZARR_URL.rstrip("/") + "/api/system/status",
+            headers={"X-API-KEY": BAZARR_APIKEY} if BAZARR_APIKEY else None, t=5) == 200, "")))
+    out = [None] * len(jobs)
+    def run(i, name, kind, fn):
+        try:
+            up, detail = fn()
+        except Exception as e:
+            up, detail = False, str(e)[:46]
+        out[i] = {"name": name, "kind": kind, "up": up, "detail": detail}
+    ths = [threading.Thread(target=run, args=(i, n, k, fn), daemon=True) for i, (n, k, fn) in enumerate(jobs)]
+    for t in ths: t.start()
+    for t in ths: t.join(7)
+    return [r for r in out if r]
+
+def _ui_status():
+    checks = [{"name": n, "on": bool(e)} for n, e, _ in CHECKS]
+    checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
+    checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
+    return {"version": "0.2", "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
+
+def _ui_warmer():
+    rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warm_recent)]
+    return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
+            "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
+            "total": _warm_count[0], "recent": rec[:40]}
+
+def _ui_config():
+    groups = []
+    for g, items in UI_SCHEMA:
+        rows = [{"key": k, "val": ("" if _is_secret(k) else os.environ.get(k, "")), "ph": ph, "secret": _is_secret(k)}
+                for k, ph in items]
+        groups.append({"group": g, "rows": rows})
+    return {"groups": groups, "file": CONFIG_FILE}
+
+def _ui_save(body):
+    try:
+        incoming = json.loads(body or b"{}")
+    except Exception:
+        return False, "bad json"
+    try:
+        ov = json.load(open(CONFIG_FILE))
+    except Exception:
+        ov = {}
+    n = 0
+    for k, v in incoming.items():
+        if k in UI_KEYS and not _is_secret(k):
+            ov[k] = v; os.environ[str(k)] = str(v); n += 1
+    try:
+        os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
+        json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+    except Exception as e:
+        return False, str(e)[:80]
+    return True, "saved %d (restart to apply)" % n
+
+def _ui_logs(n):
+    if not LOG_FILE:
+        return "(set DOCTOR_LOG_FILE to view logs here)"
+    try:
+        return "".join(open(LOG_FILE, errors="ignore").readlines()[-n:])
+    except Exception as e:
+        return "log read error: " + str(e)[:80]
+
+UI_HTML = r"""<!doctype html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>stack-doctor</title><style>
+:root{--bg:#0d1117;--card:#161b22;--bd:#21262d;--fg:#c9d1d9;--mut:#8b949e;--ok:#3fb950;--off:#6e7681;--bad:#f85149;--ac:#2f81f7;--warn:#d29922}
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:13px 18px;border-bottom:1px solid var(--bd);display:flex;gap:12px;align-items:baseline}
+h1{font-size:15px;margin:0;letter-spacing:.02em}.mut{color:var(--mut);font-size:12px}
+nav{display:flex;gap:6px;padding:10px 18px 0}
+nav button{background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px 6px 0 0;padding:7px 14px;cursor:pointer;font-size:13px}
+nav button.active{color:#fff;background:var(--bg);border-color:var(--ac)}
+main{padding:14px 18px 40px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:0 0 14px}
+h3{margin:0 0 10px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.07em}
+.badge{display:inline-block;padding:2px 9px;border-radius:11px;font-size:12px;font-weight:600}
+.b-on{background:rgba(63,185,80,.16);color:var(--ok)}.b-off{background:rgba(110,118,129,.16);color:var(--off)}.b-bad{background:rgba(248,81,73,.16);color:var(--bad)}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--bd)}.row:last-child{border:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.chip{display:flex;justify-content:space-between;align-items:center;background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:7px 10px}
+.big{font-size:26px;font-weight:700}
+table{width:100%;border-collapse:collapse;font-size:13px}td{padding:5px 6px;border-bottom:1px solid var(--bd)}td.why{color:var(--mut)}td.ago{color:var(--mut);text-align:right;white-space:nowrap}
+label{display:block;color:var(--mut);font-size:11px;margin:9px 0 3px}
+input{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:5px;padding:6px 8px;font:13px ui-monospace,monospace}
+input:disabled{color:var(--mut)}
+.cfg{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px 12px}
+button.act{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:9px 16px;cursor:pointer;font-size:13px;margin-right:8px}
+button.warn{background:var(--warn);color:#1a1a1a}
+pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px;margin:0;max-height:66vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font:12px/1.45 ui-monospace,monospace}
+#toast{position:fixed;right:16px;bottom:16px;background:var(--card);border:1px solid var(--ac);padding:10px 14px;border-radius:8px;opacity:0;transition:.3s;pointer-events:none}
+</style></head><body>
+<header><h1>stack-doctor</h1><span class=mut id=sub>loading</span></header>
+<nav><button data-t=dash class=active>Dashboard</button><button data-t=config>Config</button><button data-t=logs>Logs</button></nav>
+<main>
+<div id=dash>
+ <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
+ <div class=card><h3>Monitored services</h3><div id=health></div></div>
+ <div class=card><h3>Warmer</h3><div id=warm></div></div>
+</div>
+<div id=config style=display:none></div>
+<div id=logs style=display:none></div>
+</main><div id=toast></div>
+<script>
+var tok=new URLSearchParams(location.search).get('token')||'';
+function q(p){return p+(p.indexOf('?')>-1?'&':'?')+(tok?'token='+encodeURIComponent(tok):'')}
+function E(i){return document.getElementById(i)}
+function esc(s){return (s==null?'':''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
+function toast(m){var e=E('toast');e.textContent=m;e.style.opacity=1;setTimeout(function(){e.style.opacity=0},2600)}
+function ago(s){if(s<60)return s+'s ago';if(s<3600)return Math.floor(s/60)+'m ago';return Math.floor(s/3600)+'h ago'}
+var timer;
+function show(t){var b=document.querySelectorAll('nav button');for(var i=0;i<b.length;i++)b[i].classList.toggle('active',b[i].dataset.t===t);
+ E('dash').style.display=t==='dash'?'':'none';E('config').style.display=t==='config'?'':'none';E('logs').style.display=t==='logs'?'':'none';
+ clearInterval(timer);
+ if(t==='dash'){loadDash();timer=setInterval(loadDash,5000)}
+ if(t==='config')loadConfig();
+ if(t==='logs'){loadLogs();timer=setInterval(loadLogs,4000)}}
+var nb=document.querySelectorAll('nav button');for(var i=0;i<nb.length;i++)nb[i].onclick=(function(t){return function(){show(t)}})(nb[i].dataset.t);
+function loadDash(){
+ fetch(q('/api/status')).then(function(r){return r.json()}).then(function(s){
+  E('sub').textContent='v'+s.version+' / mode '+s.mode+' / load '+s.load+(s.dry_run?' / DRY-RUN':'');
+  var h='';for(var i=0;i<s.checks.length;i++){var c=s.checks[i];h+='<div class=chip><span>'+esc(c.name)+'</span><span class="badge '+(c.on?'b-on':'b-off')+'">'+(c.on?'on':'off')+'</span></div>'}
+  E('checks').innerHTML=h});
+ fetch(q('/api/health')).then(function(r){return r.json()}).then(function(a){
+  var h='';for(var i=0;i<a.length;i++){var s=a[i];h+='<div class=row><span>'+esc(s.name)+' <span class=mut>'+esc(s.kind)+'</span></span><span><span class=mut style="margin-right:8px">'+esc(s.detail)+'</span><span class="badge '+(s.up?'b-on':'b-bad')+'">'+(s.up?'up':'down')+'</span></span></div>'}
+  E('health').innerHTML=h||'<span class=mut>none</span>'});
+ fetch(q('/api/warmer')).then(function(r){return r.json()}).then(function(w){
+  var h='<div class=row><span class=mut>total warmed since start</span><span class=big>'+w.total+'</span></div>';
+  h+='<div class=row><span class=mut>detail-page (warm what you open)</span><span class="badge '+(w.detail_page?'b-on':'b-off')+'">'+(w.detail_page?'on':'off')+'</span></div>';
+  h+='<table style="margin-top:8px">';
+  if(!w.recent.length)h+='<tr><td class=mut>nothing warmed yet</td></tr>';
+  for(var i=0;i<w.recent.length;i++){var r=w.recent[i];h+='<tr><td>'+esc(r.title)+'</td><td class=why>'+esc(r.why)+'</td><td class=ago>'+ago(r.ago)+'</td></tr>'}
+  h+='</table>';E('warm').innerHTML=h})}
+function loadConfig(){fetch(q('/api/config')).then(function(r){return r.json()}).then(function(c){
+  var h='';for(var g=0;g<c.groups.length;g++){var grp=c.groups[g];h+='<div class=card><h3>'+esc(grp.group)+'</h3><div class=cfg>';
+   for(var i=0;i<grp.rows.length;i++){var r=grp.rows[i];h+='<div><label>'+esc(r.key)+'</label>';
+    if(r.secret)h+='<input value="set in unit (hidden)" disabled>';
+    else h+='<input id="cf_'+esc(r.key)+'" value="'+esc(r.val)+'" placeholder="'+esc(r.ph)+'">';h+='</div>'}
+   h+='</div></div>'}
+  h+='<div class=card><button class=act onclick=saveCfg()>Save</button><button class="act warn" onclick=restart()>Save and Restart</button> <span class=mut>changes apply after a restart</span></div>';
+  E('config').innerHTML=h})}
+function gather(){var o={},els=document.querySelectorAll('[id^=cf_]');for(var i=0;i<els.length;i++)o[els[i].id.slice(3)]=els[i].value;return o}
+function saveCfg(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gather())}).then(function(r){return r.json()}).then(function(r){toast(r.msg||'saved')})}
+function restart(){fetch(q('/api/config'),{method:'POST',body:JSON.stringify(gather())}).then(function(){return fetch(q('/api/restart'),{method:'POST'})}).then(function(){toast('restarting')}).then(function(){setTimeout(function(){show('dash')},4500)})}
+function loadLogs(){fetch(q('/api/logs?n=400')).then(function(r){return r.text()}).then(function(t){
+  var d=E('logs');if(!d.dataset.i){d.innerHTML='<pre id=lp></pre>';d.dataset.i=1}
+  var lp=E('lp'),bot=lp.scrollTop+lp.clientHeight>=lp.scrollHeight-40;lp.textContent=t;if(bot)lp.scrollTop=lp.scrollHeight})}
+show('dash');
+</script></body></html>"""
+
+def _build_server(port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse, parse_qs
+    class H(BaseHTTPRequestHandler):
+        def _send(self, code, ctype, body):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(code); self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body))); self.end_headers()
+            try: self.wfile.write(body)
+            except Exception: pass
+        def _authed(self):
+            if not UI_TOKEN:
+                return True
+            q = parse_qs(urlparse(self.path).query)
+            return self.headers.get("X-Doctor-Token") == UI_TOKEN or q.get("token", [""])[0] == UI_TOKEN
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ("/health", "/healthz"):
+                return self._send(200, "text/plain", "ok")
+            if not EN_UI:
+                return self._send(404, "text/plain", "nf")
+            if not self._authed():
+                return self._send(401, "text/plain", "unauthorized")
+            if path in ("/", "/ui", "/index.html"):
+                return self._send(200, "text/html; charset=utf-8", UI_HTML)
+            if path == "/api/status":  return self._send(200, "application/json", json.dumps(_ui_status()))
+            if path == "/api/health":  return self._send(200, "application/json", json.dumps(_ui_health()))
+            if path == "/api/warmer":  return self._send(200, "application/json", json.dumps(_ui_warmer()))
+            if path == "/api/config":  return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/logs":
+                try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
+                except Exception: n = 300
+                return self._send(200, "text/plain; charset=utf-8", _ui_logs(n))
+            return self._send(404, "text/plain", "nf")
+        def do_POST(self):
+            path = urlparse(self.path).path
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(length) if length else b""
+            if path in ("/api/config", "/api/restart"):
+                if not EN_UI or not self._authed():
+                    return self._send(401, "text/plain", "unauthorized")
+                if path == "/api/config":
+                    ok, msg = _ui_save(body)
+                    return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
+                self._send(200, "application/json", json.dumps({"ok": True, "msg": "restarting"}))
+                log.info("[ui] restart requested"); threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
+                return
+            if MODE == "event":                                  # arr webhook
+                try: p = json.loads(body or b"{}")
+                except Exception: p = {}
+                ev = p.get("eventType") or p.get("EventType") or "?"; inst = p.get("instanceName") or p.get("InstanceName")
+                self._send(200, "text/plain", "ok")
+                if ev == "Test":
+                    log.info("webhook Test from %s", inst or "?"); return
+                if TRIGGER_EVENTS and ev not in TRIGGER_EVENTS:
+                    return
+                log.info("event '%s' from %s -> sweep", ev, inst or "all")
+                threading.Thread(target=sweep, kwargs={"only": inst}, daemon=True).start(); return
+            self._send(404, "text/plain", "nf")
+        def log_message(self, *a):
+            pass
+    return ThreadingHTTPServer(("0.0.0.0", port), H)
+
 def main():
     global INSTANCES
     INSTANCES = load_instances()
@@ -847,11 +1126,11 @@ def main():
     if EN_QUEUE and not INSTANCES:
         log.error("queue check enabled but no instances. Set INSTANCE_1_URL / _APIKEY / _TYPE.")
         sys.exit(2)
-    if not enabled and not warmer_on:
-        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER.")
+    if not enabled and not warmer_on and not EN_UI:
+        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER / ENABLE_UI.")
         sys.exit(2)
-    log.info("stack-doctor v0.2 | mode=%s | checks=[%s]%s | instances=%s | dry_run=%s",
-             MODE, ",".join(enabled), " +warmer" if warmer_on else "",
+    log.info("stack-doctor v0.2 | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
+             MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
              ", ".join(a.name for a in INSTANCES) or "-", DRY_RUN)
 
     stop = threading.Event()
@@ -863,41 +1142,27 @@ def main():
         if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
             threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
 
+    # http server(s): arr webhooks (event mode) and/or the web dashboard (ENABLE_UI)
+    servers, wanted = [], {}
     if MODE == "event":
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        class H(BaseHTTPRequestHandler):
-            def _ok(self, code=200, body=b"ok"):
-                self.send_response(code); self.send_header("Content-Type", "text/plain"); self.end_headers(); self.wfile.write(body)
-            def do_GET(self):
-                self._ok(body=b"stack-doctor ok") if self.path in ("/", "/health", "/healthz") else self._ok(404, b"nf")
-            def do_POST(self):
-                n = int(self.headers.get("Content-Length", 0) or 0)
-                try:
-                    p = json.loads(self.rfile.read(n) or b"{}")
-                except Exception:
-                    p = {}
-                ev = p.get("eventType") or p.get("EventType") or "?"; inst = p.get("instanceName") or p.get("InstanceName")
-                self._ok()
-                if ev == "Test":
-                    log.info("webhook Test from %s", inst or "?"); return
-                if TRIGGER_EVENTS and ev not in TRIGGER_EVENTS:
-                    return
-                log.info("event '%s' from %s -> sweep", ev, inst or "all")
-                threading.Thread(target=sweep, kwargs={"only": inst}, daemon=True).start()
-            def log_message(self, *a):
-                pass
+        wanted[PORT] = "webhooks"
+    if EN_UI:
+        wanted[UI_PORT] = (wanted.get(UI_PORT, "") + "+dashboard").lstrip("+")
+    for pnum, what in wanted.items():
+        try:
+            s = _build_server(pnum)
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+            servers.append(s); log.info("http on :%d (%s)", pnum, what)
+        except Exception as e:
+            log.error("http bind :%d failed: %s", pnum, e)
+
+    sweep()
+    interval = max(INTERVAL, 1800) if MODE == "event" else INTERVAL
+    while not stop.wait(interval):
         sweep()
-        srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        log.info("listening for webhooks on :%d", PORT)
-        fb = max(INTERVAL, 1800)
-        while not stop.wait(fb):
-            sweep()
-        srv.shutdown()
-    else:
-        sweep()
-        while not stop.wait(INTERVAL):
-            sweep()
+    for s in servers:
+        try: s.shutdown()
+        except Exception: pass
     log.info("stack-doctor stopped")
 
 if __name__ == "__main__":

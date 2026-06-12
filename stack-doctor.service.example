@@ -28,6 +28,8 @@ Environment=ENABLE_PLEX=true
 Environment=ENABLE_RESOURCES=true
 Environment=ENABLE_JANITOR=true
 Environment=ENABLE_WARMER=true
+Environment=ENABLE_UI=true
+Environment=DOCTOR_UI_PORT=12345
 Environment=DOCTOR_BLOCKLIST=true
 # churn brake: after 3 dead grabs of the same episode/movie, un-monitor it, then retry in 24h
 Environment=DOCTOR_CHURN_LIMIT=3

@@ -21,6 +21,8 @@ services:
       ENABLE_JANITOR: "false"        # usenet dead-file quarantine (needs a decypharr log file)
       ENABLE_BAZARR: "false"         # Bazarr reachability (set BAZARR_URL/BAZARR_APIKEY)
       ENABLE_WARMER: "false"         # precache the head of likely-next media (needs PLEX_URL/PLEX_TOKEN)
+      ENABLE_UI: "true"              # web dashboard: status, per-service health, warmer stats, config, logs
+      # DOCTOR_UI_TOKEN: "changeme"  # require ?token= / X-Doctor-Token to reach the dashboard
 
       # ---------- queue check ----------
       DOCTOR_MIN_STRIKES: "2"      # consecutive sweeps stuck before acting (ignores transient blips)
@@ -99,5 +101,6 @@ services:
       # - /proc/loadavg:/proc/loadavg:ro             # host load for resources check
       # - /proc/meminfo:/proc/meminfo:ro             # host memory for resources check
       # - /var/log/decypharr.log:/logs/decypharr.log:ro   # for the janitor
-    # ports:
+    ports:
+      - "12345:12345"           # web dashboard (ENABLE_UI)
     #   - "8088:8088"            # only for event mode (Sonarr/Radarr webhook target)

@@ -21,7 +21,7 @@ RUN apt-get update \
     && mkdir -p /data
 VOLUME /data
 
-# webhook port (event mode)
-EXPOSE 8088
+# webhook port (event mode) + web dashboard (ENABLE_UI)
+EXPOSE 8088 12345
 
 ENTRYPOINT ["python3", "/app/doctor.py"]
