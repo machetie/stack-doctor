@@ -11,10 +11,14 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY doctor.py /app/doctor.py
 
-# no third-party dependencies (Python standard library only).
+# No Python dependencies (standard library only). openssh-client lets a restart
+# hook reach a *host* service (e.g. DECYPHARR_RESTART_CMD="ssh root@host systemctl restart decypharr").
 # Runs as root so a bind-mounted /data (and an optional rw /mnt/library for the
 # janitor) is always writable regardless of host ownership.
-RUN mkdir -p /data
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data
 VOLUME /data
 
 # webhook port (event mode)
