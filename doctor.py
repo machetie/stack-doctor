@@ -668,6 +668,7 @@ class Plex:
         return out
 
 _warm_state = {}            # host_path -> last_warm_ts
+_warm_lock = threading.Lock()
 _warm_last_ondeck = [0.0]
 
 def _host_path(f):
@@ -679,11 +680,14 @@ def _host_path(f):
 
 def _warm_file(path):
     p = _host_path(path)
-    if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
-        return False
+    with _warm_lock:                                    # atomic claim: one warm per file per cooldown
+        if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
+            return False
+        _warm_state[p] = time.time()
     try:
         sz = os.path.getsize(p)
     except Exception as e:
+        _warm_state.pop(p, None)                         # release so it can be retried
         log.debug("[warmer] stat fail %s: %s", p, str(e)[:60]); return False
     head = min(WARM_HEAD_MB << 20, sz)
     tail = WARM_TAIL_MB > 0 and sz > head + (WARM_TAIL_MB << 20)
@@ -704,11 +708,12 @@ def _warm_file(path):
     t0 = time.time()
     th = threading.Thread(target=_do, daemon=True); th.start(); th.join(WARM_READ_TIMEOUT)
     if th.is_alive():
+        _warm_state.pop(p, None)
         log.warning("[warmer] read timed out (%ds, mount slow/hung?): %s", WARM_READ_TIMEOUT, os.path.basename(p))
         return False
     if res["err"]:
+        _warm_state.pop(p, None)
         log.warning("[warmer] read fail %s: %s", os.path.basename(p), res["err"]); return False
-    _warm_state[p] = time.time()
     log.info("[warmer] warmed %dMB head%s in %.1fs: %s",
              res["got"] >> 20, "+%dMB tail" % WARM_TAIL_MB if tail else "",
              time.time() - t0, os.path.basename(p))
@@ -780,6 +785,7 @@ def plexlog_loop(stop):
     if not cmd:
         return
     plex = Plex(PLEX_URL, PLEX_TOKEN)
+    seen = {}                                                   # ratingKey -> last-handled ts
     log.info("[warmer] detail-page warming enabled (tailing Plex log)")
     while not stop.is_set():
         proc = None
@@ -790,8 +796,13 @@ def plexlog_loop(stop):
                 if stop.is_set():
                     break
                 m = _PLEXLOG_RE.search(line)
-                if m:                                           # warm off-thread so the tailer stays responsive
-                    threading.Thread(target=_warm_opened, args=(plex, m.group(1)), daemon=True).start()
+                if not m:
+                    continue
+                rk = m.group(1); now = time.time()
+                if now - seen.get(rk, 0) < 30:                  # one open writes several matching lines -> debounce
+                    continue
+                seen[rk] = now                                  # warm off-thread so the tailer stays responsive
+                threading.Thread(target=_warm_opened, args=(plex, rk), daemon=True).start()
         except Exception as e:
             log.warning("[warmer] plexlog tail error: %s", str(e)[:80])
         finally:
