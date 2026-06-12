@@ -16,6 +16,8 @@ container, everything configured by env vars.
 > Born out of a long night of hand-fixing exactly these problems on a usenet *arr stack.
 > Now it's a daemon so you never have to do it by hand again.
 
+**New here? Start with the [Deployment guide](DEPLOY.md).** It gets you running in a few copy-paste steps.
+
 ## Checks (toggle each with `ENABLE_*`)
 
 | check | detects | fixes |
