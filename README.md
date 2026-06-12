@@ -184,6 +184,8 @@ warmed, **0.02 s**. A cold 4K head took **15 s** to fetch, paid in advance inste
   every `WARMER_INTERVAL`.
 - `ondeck` , everything in Continue Watching / On Deck. Refreshed every `WARMER_ONDECK_EVERY`.
 - `recent` , the N most-recently-added per library (`WARMER_RECENT_COUNT`).
+- **detail-page** , the exact title a viewer **opens the page for**, warmed the instant they open it
+  (see `WARMER_PLEXLOG_CMD`/`_FILE` below). This is the true pre-play signal, precise and light.
 
 **Works with any caching mount, not just decypharr.** The warmer never talks to decypharr; it
 just reads the head of the file at the path Plex reports, so the bytes land in whatever cache
@@ -202,9 +204,15 @@ The warmer is self-contained: you can run it **on its own** with every other che
 (`ENABLE_WARMER=true`, all other `ENABLE_*=false`) , it needs only `PLEX_URL` + `PLEX_TOKEN`,
 no *arr instances.
 
-Plex exposes no "user opened the detail page" event (its API and webhooks are playback-only),
-so the warmer approximates intent with the high-hit-rate signals it *does* expose. It does
-**not** force-delete warmed bytes: decypharr's cache is itself the speed win and already
+**Warming the exact title you open.** Plex's API and webhooks are playback-only, but its *server
+log* records the rich `includeExtras=1&...` metadata request a client makes the moment you open a
+title's detail page. Point `WARMER_PLEXLOG_CMD` (a streaming command, e.g. `tail -F`, or
+`pct exec <ct> -- tail -n0 -F '<log>'` to reach Plex in a Proxmox container) or `WARMER_PLEXLOG_FILE`
+(a readable log path) at that log and the warmer pre-warms precisely what you're looking at, off a
+background thread so the tailer stays responsive. This is the most accurate, lowest-cost signal; the
+`ondeck`/`next` cycle is the zero-interaction backstop (resume + binge).
+
+It does **not** force-delete warmed bytes: the mount's cache is itself the speed win and already
 evicts by age/LRU. Instead it keeps speculative cost low , a small head, a per-cycle cap, a
 re-warm cooldown, and a host-load guard so it never competes with live playback.
 
@@ -213,7 +221,9 @@ re-warm cooldown, and a host-load guard so it never competes with live playback.
 | `ENABLE_WARMER` | `false` | turn the warmer on (needs `PLEX_URL` + `PLEX_TOKEN`) |
 | `WARMER_PRECACHE_MB` | `64` | how much of each file's head to pull into cache |
 | `WARMER_TAIL_MB` | `8` | also pull the tail (mkv cues / Plex end-probe); `0` = off |
-| `WARMER_SOURCES` | `ondeck,next` | which signals to warm from (`ondeck`, `next`, `recent`) |
+| `WARMER_SOURCES` | `ondeck,next` | background signals to warm from (`ondeck`, `next`, `recent`). Detail-page warming is separate, via the log vars below |
+| `WARMER_PLEXLOG_CMD` | *(none)* | stream command for Plex's server log (e.g. `tail -n0 -F '<log>'`, or `pct exec <ct> -- tail -n0 -F '<log>'`). Enables detail-page warming |
+| `WARMER_PLEXLOG_FILE` | *(none)* | a directly-readable path to Plex's log (alternative to `_CMD`) |
 | `WARMER_INTERVAL` | `120` | seconds between session polls (next-episode prefetch) |
 | `WARMER_ONDECK_EVERY` | `600` | seconds between On Deck / recent warms |
 | `WARMER_NEXT_EPISODES` | `1` | how many upcoming episodes of an active show to warm |

@@ -81,6 +81,8 @@ services:
       WARMER_COOLDOWN: "3600"        # don't re-warm the same file within this many seconds
       WARMER_LOAD_MAX: "30"          # skip a warm cycle if host 1-min load is above this (protect live playback)
       # WARMER_PATH_MAP: "/data/media:/mnt/library"   # if Plex's file path differs from this container's
+      # detail-page warming: warm the exact title a viewer opens (bind-mount Plex's log read-only, then:)
+      # WARMER_PLEXLOG_FILE: "/plexlog/Plex Media Server.log"
 
       # ---------- resources ----------
       RES_LOAD_WARN: "40"

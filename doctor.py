@@ -143,6 +143,10 @@ WARM_LOAD_MAX     = _f("WARMER_LOAD_MAX", 0)            # skip a cycle if host 1
 WARM_READ_TIMEOUT = _i("WARMER_READ_TIMEOUT", 60)       # abandon a single warm read after this long (hung mount guard)
 WARM_SOURCES      = [s.strip().lower() for s in os.environ.get("WARMER_SOURCES", "ondeck,next").split(",") if s.strip()]
 WARM_PATH_MAP     = os.environ.get("WARMER_PATH_MAP", "")   # "plexPrefix:hostPrefix" if Plex's file path != this host's
+# detail-page warming: tail Plex's server log and warm the exact title a viewer opens (the one true
+# pre-play signal Plex emits). Give it a streaming command (tail -F, or `pct exec ... tail -F`) OR a file.
+WARM_PLEXLOG_CMD  = os.environ.get("WARMER_PLEXLOG_CMD", "")
+WARM_PLEXLOG_FILE = os.environ.get("WARMER_PLEXLOG_FILE", "")
 
 # janitor (give it decypharr's error log via a file OR a command, e.g. journalctl when on-host)
 JAN_LIBS      = [p.strip() for p in os.environ.get("JANITOR_LIBRARY_PATHS", "").split(",") if p.strip()]
@@ -762,6 +766,41 @@ def warmer_loop(stop):
         if stop.wait(WARM_INTERVAL):
             break
 
+# the rich include*/async* query Plex logs only when a client OPENS a title's detail page
+_PLEXLOG_RE = re.compile(r"/library/metadata/(\d+)\?[^\s]*includeExtras=1")
+
+def _warm_opened(plex, rk):
+    for f in plex.parts(rk):                                    # numeric ratingKey -> file path(s)
+        if _warm_file(f):
+            log.info("[warmer] you opened rk=%s -> warmed: %s", rk, os.path.basename(_host_path(f)))
+
+def plexlog_loop(stop):
+    """Tail Plex's server log; warm the exact title a viewer opens (true pre-play intent)."""
+    cmd = WARM_PLEXLOG_CMD or ("tail -n0 -F %r" % WARM_PLEXLOG_FILE if WARM_PLEXLOG_FILE else "")
+    if not cmd:
+        return
+    plex = Plex(PLEX_URL, PLEX_TOKEN)
+    log.info("[warmer] detail-page warming enabled (tailing Plex log)")
+    while not stop.is_set():
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            for line in proc.stdout:
+                if stop.is_set():
+                    break
+                m = _PLEXLOG_RE.search(line)
+                if m:                                           # warm off-thread so the tailer stays responsive
+                    threading.Thread(target=_warm_opened, args=(plex, m.group(1)), daemon=True).start()
+        except Exception as e:
+            log.warning("[warmer] plexlog tail error: %s", str(e)[:80])
+        finally:
+            if proc:
+                try: proc.terminate()
+                except Exception: pass
+        if stop.wait(10):                                       # tail died/rotated -> reconnect
+            break
+
 # =========================================================================== #
 # sweep / loop
 # =========================================================================== #
@@ -810,6 +849,8 @@ def main():
 
     if warmer_on:
         threading.Thread(target=warmer_loop, args=(stop,), daemon=True).start()
+        if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
+            threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
 
     if MODE == "event":
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
