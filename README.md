@@ -228,8 +228,9 @@ The warmer is self-contained: you can run it **on its own** with every other che
 no *arr instances.
 
 **Warming the exact title you open.** Plex's API and webhooks are playback-only, but its *server
-log* records the rich `includeExtras=1&...` metadata request a client makes the moment you open a
-title's detail page. Point `WARMER_PLEXLOG_CMD` (a streaming command, e.g. `tail -F`, or
+log* records the `/extras` (and native-app `includeExtras=1`) request a client makes the moment you
+open a title's detail page, so this works for the Plex app **and** third-party clients like Infuse.
+Point `WARMER_PLEXLOG_CMD` (a streaming command, e.g. `tail -F`, or
 `pct exec <ct> -- tail -n0 -F '<log>'` to reach Plex in a Proxmox container) or `WARMER_PLEXLOG_FILE`
 (a readable log path) at that log and the warmer pre-warms precisely what you're looking at, off a
 background thread so the tailer stays responsive. This is the most accurate, lowest-cost signal; the

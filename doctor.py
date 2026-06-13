@@ -797,8 +797,9 @@ def warmer_loop(stop):
         if stop.wait(WARM_INTERVAL):
             break
 
-# the rich include*/async* query Plex logs only when a client OPENS a title's detail page
-_PLEXLOG_RE = re.compile(r"/library/metadata/(\d+)\?[^\s]*includeExtras=1")
+# opening a title's detail page fetches its extras (/extras, every client incl. Infuse) and, on the
+# native Plex app, a rich includeExtras=1 metadata request. Match either -> works for Plex + Infuse.
+_PLEXLOG_RE = re.compile(r"/library/metadata/(\d+)(?:/extras|\?[^\s]*includeExtras=1)")
 
 def _warm_opened(plex, rk):
     for f in plex.parts(rk):                                    # numeric ratingKey -> file path(s)
