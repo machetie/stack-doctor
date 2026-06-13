@@ -254,8 +254,8 @@ re-warm cooldown, and a host-load guard so it never competes with live playback.
 | `WARMER_RECENT_COUNT` | `0` | warm N most-recently-added per library (`0` = off) |
 | `WARMER_MAX_PER_CYCLE` | `12` | cap warms per cycle (rate-limit the usenet fetch) |
 | `WARMER_COOLDOWN` | `3600` | don't re-warm the same file within this many seconds |
-| `WARMER_LOAD_MAX` | `0` | pause **all** warming (cycle + detail-page) while host 1-min load is above this (`0` = off). Set it to protect live playback |
-| `WARMER_CONCURRENCY` | `2` | max simultaneous warm reads. Hard cap so a burst of detail-page opens can't flood the mount/usenet |
+| `WARMER_LOAD_MAX` | `0` | pause speculative (on-deck/recent) warming while host 1-min load is above this (`0` = off). A title you *actively open* tolerates 2x this before yielding. Set it to protect live playback |
+| `WARMER_CONCURRENCY` | `2` | max simultaneous warm reads. Hard cap so a burst of detail-page opens can't flood the mount/usenet, and so warming never starves live playback of usenet connections |
 | `WARMER_READ_TIMEOUT` | `60` | abandon a single warm read after this long (hung-mount guard) |
 | `WARMER_PATH_MAP` | *(none)* | `plexPrefix:hostPrefix` if Plex's file path differs from this host's |
 

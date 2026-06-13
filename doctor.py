@@ -707,7 +707,10 @@ def _host_path(f):
 
 def _warm_file(path, reason="cycle"):
     p = _host_path(path)
-    if WARM_LOAD_MAX > 0 and host_load() > WARM_LOAD_MAX:   # back off under load (applies to detail-page too)
+    # a title you actively opened tolerates more load (2x) than speculative background warming, but
+    # both still yield before meltdown; concurrency stays capped either way so a burst can't flood.
+    guard = (WARM_LOAD_MAX * 2) if reason == "detail-page" else WARM_LOAD_MAX
+    if guard > 0 and host_load() > guard:
         return False
     with _warm_lock:                                    # atomic claim: one warm per file per cooldown
         if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
