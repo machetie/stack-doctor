@@ -826,7 +826,20 @@ def warmer_loop(stop):
 # native Plex app, a rich includeExtras=1 metadata request. Match either -> works for Plex + Infuse.
 _PLEXLOG_RE = re.compile(r"/library/metadata/(\d+)(?:/extras|\?[^\s]*includeExtras=1)")
 
+_playing = {"ts": 0.0, "rks": set()}
+
+def _playing_rks(plex):
+    """ratingKeys with an active Plex session, cached ~10s (Plex sends the same metadata query while
+    you browse a title AND while you play it, so this tells the two apart)."""
+    if time.time() - _playing["ts"] > 10:
+        try: _playing["rks"] = set(v.get("ratingKey") for v in plex.sessions())
+        except Exception: pass
+        _playing["ts"] = time.time()
+    return _playing["rks"]
+
 def _warm_opened(plex, rk):
+    if rk in _playing_rks(plex):                                # already playing (so already cached) -> not a new open
+        return
     for f in _limit_parts(plex.parts(rk)):                      # warm just the top version(s) you'd actually play
         if _warm_file(f, "detail-page"):
             log.info("[warmer] you opened rk=%s -> warmed: %s", rk, os.path.basename(_host_path(f)))
@@ -851,7 +864,7 @@ def plexlog_loop(stop):
                 if not m:
                     continue
                 rk = m.group(1); now = time.time()
-                if now - seen.get(rk, 0) < 30:                  # one open writes several matching lines -> debounce
+                if now - seen.get(rk, 0) < 300:                 # a detail page is polled repeatedly while open -> react once per item / 5 min
                     continue
                 seen[rk] = now                                  # warm off-thread so the tailer stays responsive
                 threading.Thread(target=_warm_opened, args=(plex, rk), daemon=True).start()
