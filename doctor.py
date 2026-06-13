@@ -161,6 +161,11 @@ WARM_READ_TIMEOUT = _i("WARMER_READ_TIMEOUT", 60)       # abandon a single warm 
 WARM_CONCURRENCY  = _i("WARMER_CONCURRENCY", 2)         # simultaneous BACKGROUND (on-deck/recent) warm reads
 WARM_OPEN_CONC    = _i("WARMER_OPEN_CONCURRENCY", 4)    # dedicated lane for the title you OPEN, so it starts instantly and never queues behind background warming
 WARM_PARTS        = _i("WARMER_PARTS", 1)              # how many versions per title to warm (1 = highest-res only; 0 = all). Avoids warming a 1080p you'll never play next to the 4K
+# low-cache mode: for small / RAM-backed caches. Skips On Deck (Continue Watching) warming entirely and
+# only warms the NEXT episode as the current one nears its end, so almost nothing sits in cache early.
+WARM_LOW_CACHE    = _b("WARMER_LOW_CACHE", False)
+WARM_NEXT_REMAIN  = _i("WARMER_NEXT_REMAINING_MIN", 0)  # warm the next episode only when <= this many minutes remain (0 = as soon as playback is seen)
+WARM_NEXT_NEAR_END = WARM_NEXT_REMAIN if WARM_NEXT_REMAIN > 0 else (10 if WARM_LOW_CACHE else 0)
 WARM_SOURCES      = [s.strip().lower() for s in os.environ.get("WARMER_SOURCES", "ondeck,next").split(",") if s.strip()]
 WARM_PATH_MAP     = os.environ.get("WARMER_PATH_MAP", "")   # "plexPrefix:hostPrefix" if Plex's file path != this host's
 # detail-page warming: tail Plex's server log and warm the exact title a viewer opens (the one true
@@ -778,15 +783,22 @@ def _warm_targets(plex):
         for v in sessions:
             if v.get("type") != "episode" or not v.get("grandparentRatingKey"):
                 continue
+            if WARM_NEXT_NEAR_END > 0:                       # only warm the next ep once the current one nears the end
+                try:
+                    remain_min = (int(v.get("duration", 0)) - int(v.get("viewOffset", 0))) / 60000.0
+                except Exception:
+                    remain_min = 0
+                if remain_min > WARM_NEXT_NEAR_END:
+                    continue
             eps = plex.leaves(v.get("grandparentRatingKey"))
             idx = next((i for i, e in enumerate(eps) if e.get("ratingKey") == v.get("ratingKey")), -1)
             if idx >= 0:
                 for e in eps[idx + 1: idx + 1 + WARM_NEXT_EPS]:
                     for f in _limit_parts(plex.parts(e.get("ratingKey"))):
                         add("next-ep", f)
-    # Plex-first: speculative On Deck / recent warming pauses entirely while ANYONE is watching, so it
-    # never competes with a live stream for usenet bandwidth. It catches up when playback stops.
-    if not sessions and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
+    # Plex-first: speculative On Deck / recent warming pauses while ANYONE is watching (never competes
+    # with a live stream), and is skipped entirely in low-cache mode (keep almost nothing pre-warmed).
+    if not WARM_LOW_CACHE and not sessions and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
         _warm_last_ondeck[0] = time.time()
         if "ondeck" in WARM_SOURCES:                        # Continue Watching / Up Next
             for v in plex.ondeck():
@@ -812,8 +824,10 @@ def warm_cycle():
         log.info("[warmer] cycle warmed %d (of %d candidate paths)", done, len(targets))
 
 def warmer_loop(stop):
-    log.info("[warmer] started: head=%dMB tail=%dMB sources=%s poll=%ds ondeck-every=%ds",
-             WARM_HEAD_MB, WARM_TAIL_MB, ",".join(WARM_SOURCES) or "-", WARM_INTERVAL, WARM_ONDECK_EVERY)
+    mode = (" | LOW-CACHE: no On Deck, next ep @<=%dmin left" % WARM_NEXT_NEAR_END) if WARM_LOW_CACHE \
+        else ((" | next ep @<=%dmin left" % WARM_NEXT_NEAR_END) if WARM_NEXT_NEAR_END else "")
+    log.info("[warmer] started: head=%dMB tail=%dMB sources=%s poll=%ds ondeck-every=%ds%s",
+             WARM_HEAD_MB, WARM_TAIL_MB, ",".join(WARM_SOURCES) or "-", WARM_INTERVAL, WARM_ONDECK_EVERY, mode)
     while not stop.is_set():
         try:
             warm_cycle()

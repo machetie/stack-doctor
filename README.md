@@ -282,6 +282,8 @@ own concurrency lane, even during playback.
 | `WARMER_INTERVAL` | `120` | seconds between session polls (next-episode prefetch) |
 | `WARMER_ONDECK_EVERY` | `600` | seconds between On Deck / recent warms |
 | `WARMER_NEXT_EPISODES` | `1` | how many upcoming episodes of an active show to warm |
+| `WARMER_NEXT_REMAINING_MIN` | `0` | warm the next episode only when this many minutes (or fewer) are left in the current one (`0` = as soon as playback is seen) |
+| `WARMER_LOW_CACHE` | `false` | **low-cache mode** for small / RAM-backed caches: skip On Deck warming entirely and warm the next episode only as the current one nears its end (defaults the threshold above to 10 min). Keeps almost nothing pre-warmed |
 | `WARMER_RECENT_COUNT` | `0` | warm N most-recently-added per library (`0` = off) |
 | `WARMER_MAX_PER_CYCLE` | `12` | cap warms per cycle (rate-limit the usenet fetch) |
 | `WARMER_COOLDOWN` | `3600` | don't re-warm the same file within this many seconds |

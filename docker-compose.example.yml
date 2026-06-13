@@ -85,6 +85,9 @@ services:
       WARMER_LOAD_MAX: "12"          # pause BACKGROUND warming above this host 1-min load (protect live playback)
       WARMER_CONCURRENCY: "2"        # simultaneous BACKGROUND warm reads (keep low so it never starves playback)
       WARMER_OPEN_CONCURRENCY: "4"   # dedicated lane for a title you OPEN, so it warms instantly (never queues behind background)
+      # low-cache mode (small / RAM-backed cache): no On Deck warming, warm next ep only as the current nears its end
+      # WARMER_LOW_CACHE: "true"
+      # WARMER_NEXT_REMAINING_MIN: "10"   # minutes left in the current ep before warming the next one
       # WARMER_PATH_MAP: "/data/media:/mnt/library"   # if Plex's file path differs from this container's
       # detail-page warming: warm the exact title a viewer opens (bind-mount Plex's log read-only, then:)
       # WARMER_PLEXLOG_FILE: "/plexlog/Plex Media Server.log"
