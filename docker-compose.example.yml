@@ -74,15 +74,17 @@ services:
       PLEX_SCAN_ON_CHECK: "false"    # also trigger a library refresh when Plex is up
 
       # ---------- warmer (instant playback start; reuses PLEX_URL/PLEX_TOKEN) ----------
-      WARMER_PRECACHE_MB: "64"       # how much of each file's head to pull into cache
-      WARMER_TAIL_MB: "8"            # also pull the tail (mkv cues / Plex end-probe); 0 = off
+      WARMER_PRECACHE_MB: "24"       # head pulled per title (small = fast warm; the mount's read-ahead does the rest)
+      WARMER_TAIL_MB: "4"            # also pull the tail (mkv cues / Plex end-probe); 0 = off
+      WARMER_PARTS: "1"             # warm only the highest-res version per title (not the 4K AND the 1080p)
       WARMER_SOURCES: "ondeck,next"  # ondeck = Continue Watching, next = next episode of what's playing, recent = newly added
       WARMER_INTERVAL: "120"         # seconds between session polls (next-episode prefetch)
       WARMER_ONDECK_EVERY: "600"     # seconds between On Deck / recent warms
-      WARMER_MAX_PER_CYCLE: "12"     # cap warms per cycle (rate-limit the usenet fetch)
+      WARMER_MAX_PER_CYCLE: "40"     # cap background warms per cycle
       WARMER_COOLDOWN: "3600"        # don't re-warm the same file within this many seconds
-      WARMER_LOAD_MAX: "12"          # pause ALL warming if host 1-min load is above this (protect live playback)
-      WARMER_CONCURRENCY: "2"        # hard cap on simultaneous warm reads so a burst can't flood the mount
+      WARMER_LOAD_MAX: "12"          # pause BACKGROUND warming above this host 1-min load (protect live playback)
+      WARMER_CONCURRENCY: "2"        # simultaneous BACKGROUND warm reads (keep low so it never starves playback)
+      WARMER_OPEN_CONCURRENCY: "4"   # dedicated lane for a title you OPEN, so it warms instantly (never queues behind background)
       # WARMER_PATH_MAP: "/data/media:/mnt/library"   # if Plex's file path differs from this container's
       # detail-page warming: warm the exact title a viewer opens (bind-mount Plex's log read-only, then:)
       # WARMER_PLEXLOG_FILE: "/plexlog/Plex Media Server.log"

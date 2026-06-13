@@ -83,10 +83,20 @@ services:
     container_name: stack-doctor
     restart: unless-stopped
     environment:
-      DOCTOR_MODE: cron
+      DOCTOR_MODE: cron               # cron | event
       DOCTOR_INTERVAL: "900"
+      DOCTOR_DRY_RUN: "true"          # start safe: log only, change nothing. flip to false when happy
+      ENABLE_UI: "true"              # web dashboard on :12345 (status, per-service health, warmer, config, logs)
+
+      # ---------- queue cleaner + providers ----------
+      ENABLE_QUEUE: "true"
+      ENABLE_PROVIDERS: "true"       # auto-Test failed indexers / download clients (needs a prowlarr instance)
       DOCTOR_MIN_STRIKES: "2"
       DOCTOR_BLOCKLIST: "true"
+      DOCTOR_CHURN_LIMIT: "3"         # after 3 dead grabs of the SAME title, stop the churn (dead usenet releases)
+      DOCTOR_CHURN_ACTION: backoff    # report | park | backoff (un-monitor, then retry on DOCTOR_CHURN_BACKOFF)
+
+      # ---------- instances (number from 1; add prowlarr for the providers check) ----------
       INSTANCE_1_NAME: sonarr
       INSTANCE_1_TYPE: sonarr
       INSTANCE_1_URL: http://sonarr:8989
@@ -95,18 +105,37 @@ services:
       INSTANCE_2_TYPE: radarr
       INSTANCE_2_URL: http://radarr:7878
       INSTANCE_2_APIKEY: your_radarr_key
+      INSTANCE_3_NAME: prowlarr
+      INSTANCE_3_TYPE: prowlarr
+      INSTANCE_3_URL: http://prowlarr:9696
+      INSTANCE_3_APIKEY: your_prowlarr_key
+
+      # ---------- warmer: precache likely-next media so playback starts instantly ----------
+      ENABLE_WARMER: "true"
+      PLEX_URL: http://plex:32400
+      PLEX_TOKEN: your_plex_token
+      WARMER_SOURCES: "ondeck,next"   # what's about to be watched (add "recent" for newly-added)
+      WARMER_PRECACHE_MB: "24"        # head pulled per title (small = fast warm; decypharr/rclone read-ahead does the rest)
+      WARMER_PARTS: "1"               # warm only the highest-res version, not the 4K AND 1080p
+      WARMER_LOAD_MAX: "12"           # pause background warming above this host load (protect live playback)
+      # warm the exact title a viewer opens (tail Plex's server log; needs vfs cache on the mount):
+      # WARMER_PLEXLOG_FILE: "/plexlog/Plex Media Server.log"
+    ports:
+      - "12345:12345"               # web dashboard
     volumes:
-      - ./data:/data
+      - ./data:/data                 # state + saved config
+      # - /path/to/plex/logs:/plexlog:ro   # only for detail-page warming
 ```
 
 ```bash
 docker compose up -d
-docker compose logs -f stack-doctor
+docker compose logs -f stack-doctor      # or open the dashboard at http://<host>:12345
 ```
 
-A full example with four instances and `.env` is in
-[`docker-compose.example.yml`](docker-compose.example.yml). **Tip:** start with
-`DOCTOR_DRY_RUN: "true"` to see what it *would* remove before letting it act.
+The exhaustive example (decypharr restart hook, janitor, bazarr, resources, event mode, every
+`WARMER_*` knob) is in [`docker-compose.example.yml`](docker-compose.example.yml), and a step-by-step
+walkthrough is in the [Deployment guide](DEPLOY.md). **Tip:** it starts in `DOCTOR_DRY_RUN` above so
+you can watch the Logs tab and see what it *would* do before letting it act.
 
 ---
 
