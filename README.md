@@ -234,7 +234,9 @@ warmed, **0.02 s**. A cold 4K head took **15 s** to fetch, paid in advance inste
 **What it warms** (`WARMER_SOURCES`, default `ondeck,next`):
 - `next` , the next episode(s) of anything currently playing (great for binge sessions). Polled
   every `WARMER_INTERVAL`.
-- `ondeck` , everything in Continue Watching / On Deck. Refreshed every `WARMER_ONDECK_EVERY`.
+- `ondeck` , everything in Continue Watching / On Deck. Refreshed every `WARMER_ONDECK_EVERY`. Toggle
+  it on its own with **`WARMER_ONDECK`** (`true`/`false`) without touching the rest, useful on small or
+  RAM-backed caches where you only want just-in-time warming. (See also low-cache mode below.)
 - `recent` , the N most-recently-added per library (`WARMER_RECENT_COUNT`).
 - **detail-page** , the exact title a viewer **opens the page for**, warmed the instant they open it
   (see `WARMER_PLEXLOG_CMD`/`_FILE` below). This is the true pre-play signal, precise and light.
