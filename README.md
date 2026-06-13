@@ -237,8 +237,10 @@ background thread so the tailer stays responsive. This is the most accurate, low
 `ondeck`/`next` cycle is the zero-interaction backstop (resume + binge).
 
 It does **not** force-delete warmed bytes: the mount's cache is itself the speed win and already
-evicts by age/LRU. Instead it keeps speculative cost low , a small head, a per-cycle cap, a
-re-warm cooldown, and a host-load guard so it never competes with live playback.
+evicts by age/LRU. Instead it keeps speculative cost low , a small head, a per-cycle cap, a re-warm
+cooldown, a host-load guard, and a hard pause on background warming whenever **anyone is watching**,
+so it never competes with a live stream. The title you actively open still warms instantly, in its
+own concurrency lane, even during playback.
 
 | var | default | meaning |
 |---|---|---|
@@ -255,7 +257,8 @@ re-warm cooldown, and a host-load guard so it never competes with live playback.
 | `WARMER_MAX_PER_CYCLE` | `12` | cap warms per cycle (rate-limit the usenet fetch) |
 | `WARMER_COOLDOWN` | `3600` | don't re-warm the same file within this many seconds |
 | `WARMER_LOAD_MAX` | `0` | pause speculative (on-deck/recent) warming while host 1-min load is above this (`0` = off). A title you *actively open* tolerates 2x this before yielding. Set it to protect live playback |
-| `WARMER_CONCURRENCY` | `2` | max simultaneous warm reads. Hard cap so a burst of detail-page opens can't flood the mount/usenet, and so warming never starves live playback of usenet connections |
+| `WARMER_CONCURRENCY` | `2` | simultaneous **background** (on-deck/recent) warm reads. Kept low so background warming never starves live playback of usenet connections |
+| `WARMER_OPEN_CONCURRENCY` | `4` | simultaneous **detail-page** warm reads, a separate lane so a title you actively open starts warming instantly and never queues behind background warming |
 | `WARMER_READ_TIMEOUT` | `60` | abandon a single warm read after this long (hung-mount guard) |
 | `WARMER_PATH_MAP` | *(none)* | `plexPrefix:hostPrefix` if Plex's file path differs from this host's |
 

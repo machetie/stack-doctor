@@ -158,7 +158,8 @@ WARM_MAX_CYCLE    = _i("WARMER_MAX_PER_CYCLE", 12)      # cap warms per cycle (r
 WARM_COOLDOWN     = _i("WARMER_COOLDOWN", 3600)         # do not re-warm the same file within this many seconds
 WARM_LOAD_MAX     = _f("WARMER_LOAD_MAX", 0)            # skip warming if host 1-min load above this (protect Plex); 0=off
 WARM_READ_TIMEOUT = _i("WARMER_READ_TIMEOUT", 60)       # abandon a single warm read after this long (hung mount guard)
-WARM_CONCURRENCY  = _i("WARMER_CONCURRENCY", 2)         # max simultaneous warm reads (bounds the usenet pull so it never floods decypharr)
+WARM_CONCURRENCY  = _i("WARMER_CONCURRENCY", 2)         # simultaneous BACKGROUND (on-deck/recent) warm reads
+WARM_OPEN_CONC    = _i("WARMER_OPEN_CONCURRENCY", 4)    # dedicated lane for the title you OPEN, so it starts instantly and never queues behind background warming
 WARM_SOURCES      = [s.strip().lower() for s in os.environ.get("WARMER_SOURCES", "ondeck,next").split(",") if s.strip()]
 WARM_PATH_MAP     = os.environ.get("WARMER_PATH_MAP", "")   # "plexPrefix:hostPrefix" if Plex's file path != this host's
 # detail-page warming: tail Plex's server log and warm the exact title a viewer opens (the one true
@@ -687,7 +688,8 @@ class Plex:
 
 _warm_state = {}            # host_path -> last_warm_ts
 _warm_lock = threading.Lock()
-_warm_sem = threading.Semaphore(max(1, WARM_CONCURRENCY))   # cap concurrent warm reads (never flood decypharr)
+_warm_sem = threading.Semaphore(max(1, WARM_CONCURRENCY))        # background warming lane
+_warm_sem_open = threading.Semaphore(max(1, WARM_OPEN_CONC))     # detail-page (you opened it) lane - separate so opens never wait
 _warm_last_ondeck = [0.0]
 _warm_count = [0]           # total warms since start (for the UI)
 _warm_recent = []           # recent warms for the UI: [{"ts","title","why"}]
@@ -738,7 +740,8 @@ def _warm_file(path, reason="cycle"):
         except Exception as e:
             res["err"] = str(e)[:60]
     t0 = time.time()
-    with _warm_sem:                                     # cap concurrent usenet pulls so warming never floods decypharr
+    sem = _warm_sem_open if reason == "detail-page" else _warm_sem   # opens get their own lane (instant)
+    with sem:                                           # cap concurrent usenet pulls so warming never floods decypharr
         th = threading.Thread(target=_do, daemon=True); th.start(); th.join(WARM_READ_TIMEOUT)
     if th.is_alive():
         _warm_state.pop(p, None)
@@ -759,8 +762,9 @@ def _warm_targets(plex):
     def add(reason, path):
         if path and path not in seen:
             seen.add(path); targets.append((reason, path))
+    sessions = plex.sessions()
     if "next" in WARM_SOURCES:                              # next episode(s) of anything playing
-        for v in plex.sessions():
+        for v in sessions:
             if v.get("type") != "episode" or not v.get("grandparentRatingKey"):
                 continue
             eps = plex.leaves(v.get("grandparentRatingKey"))
@@ -769,7 +773,9 @@ def _warm_targets(plex):
                 for e in eps[idx + 1: idx + 1 + WARM_NEXT_EPS]:
                     for f in plex.parts(e.get("ratingKey")):
                         add("next-ep", f)
-    if time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
+    # Plex-first: speculative On Deck / recent warming pauses entirely while ANYONE is watching, so it
+    # never competes with a live stream for usenet bandwidth. It catches up when playback stops.
+    if not sessions and time.time() - _warm_last_ondeck[0] >= WARM_ONDECK_EVERY:
         _warm_last_ondeck[0] = time.time()
         if "ondeck" in WARM_SOURCES:                        # Continue Watching / Up Next
             for v in plex.ondeck():
