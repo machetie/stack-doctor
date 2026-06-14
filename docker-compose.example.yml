@@ -17,8 +17,10 @@ services:
       ENABLE_PROVIDERS: "true"       # auto-Test failed indexers/download clients (sonarr/radarr/prowlarr)
       ENABLE_DECYPHARR: "true"       # decypharr mount-hang watchdog
       ENABLE_PLEX: "true"            # Plex reachability
+      ENABLE_PLEX_SCAN: "false"      # recover a Plex library scan wedged with no progress (needs PLEX_URL/PLEX_TOKEN)
       ENABLE_RESOURCES: "true"       # host load / mem / swap
       ENABLE_JANITOR: "false"        # usenet dead-file quarantine (needs a decypharr log file)
+      ENABLE_REPAIR: "false"         # probe library for dead files -> remove + re-search the owning *arr
       ENABLE_BAZARR: "false"         # Bazarr reachability (set BAZARR_URL/BAZARR_APIKEY)
       ENABLE_WARMER: "false"         # precache the head of likely-next media (needs PLEX_URL/PLEX_TOKEN)
       ENABLE_UI: "true"              # web dashboard: status, per-service health, warmer stats, config, logs
@@ -73,6 +75,11 @@ services:
       PLEX_TOKEN: ${PLEX_TOKEN}
       PLEX_SCAN_ON_CHECK: "false"    # also trigger a library refresh when Plex is up
 
+      # ---------- plexscan (ENABLE_PLEX_SCAN: recover a wedged library scan; reuses the decypharr hook) ----------
+      PLEX_SCAN_STUCK_AFTER: "30m"   # a scan making no progress this long is wedged (usually a hung mount)
+      PLEX_SCAN_CANCEL: "true"       # cancel the stuck scan via the Plex activities API
+      # PLEX_RESTART_CMD: "ssh root@192.168.1.20 systemctl restart plexmediaserver"   # last resort if it stays wedged
+
       # ---------- warmer (instant playback start; reuses PLEX_URL/PLEX_TOKEN) ----------
       WARMER_PRECACHE_MB: "24"       # head pulled per title (small = fast warm; the mount's read-ahead does the rest)
       WARMER_TAIL_MB: "4"            # also pull the tail (mkv cues / Plex end-probe); 0 = off
@@ -102,6 +109,16 @@ services:
       # ---------- janitor (optional) ----------
       JANITOR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies
       JANITOR_DECYPHARR_LOG: /logs/decypharr.log     # mount decypharr's error log here
+
+      # ---------- repair (ENABLE_REPAIR: probe library for dead files -> remove + re-search) ----------
+      REPAIR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies   # defaults to JANITOR_LIBRARY_PATHS if unset
+      REPAIR_MIN_STRIKES: "3"        # consecutive failed probes before a file is treated as dead (ignores blips)
+      REPAIR_MAX_SCAN: "200"         # media files probed per sweep (rotates through the library over time)
+      REPAIR_MAX_ACTIONS: "5"        # re-grabs per sweep (stay gentle on the providers)
+      REPAIR_READ_TIMEOUT: "20"      # abandon a single file probe after this long (set above decypharr's read timeout)
+      REPAIR_RECHECK: "12h"          # don't re-probe a known-good file more often than this
+      REPAIR_LOAD_MAX: "0"           # skip the repair sweep above this host 1-min load (0 = off)
+      # REPAIR_FFPROBE: "false"      # also ffprobe the stream (deeper corruption check; needs ffprobe in the image)
     volumes:
       - ./data:/data                                 # state + file log + quarantine manifests
       - /mnt/library:/mnt/library                    # for mount read-test + janitor (read/write for janitor)
