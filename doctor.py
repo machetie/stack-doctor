@@ -96,13 +96,19 @@ TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
 DRY_RUN     = _b("DOCTOR_DRY_RUN", False)
 
 # which checks are on
-EN_QUEUE     = _b("ENABLE_QUEUE", True)
-EN_DECYPHARR = _b("ENABLE_DECYPHARR", False)
-EN_PLEX      = _b("ENABLE_PLEX", False)
-EN_RESOURCES = _b("ENABLE_RESOURCES", False)
-EN_JANITOR   = _b("ENABLE_JANITOR", False)
-EN_PROVIDERS = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
-EN_BAZARR    = _b("ENABLE_BAZARR", False)      # Bazarr reachability
+EN_QUEUE      = _b("ENABLE_QUEUE", True)
+EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
+EN_PLEX       = _b("ENABLE_PLEX", False)
+EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
+EN_JANITOR    = _b("ENABLE_JANITOR", False)
+EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)
+EN_BAZARR     = _b("ENABLE_BAZARR", False)
+EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
+
+# westrepair config
+WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
+WR_RUN_INTERVAL    = os.environ.get("WESTREPAIR_RUN_INTERVAL", "6h")
+WR_REPAIR_INTERVAL = os.environ.get("WESTREPAIR_REPAIR_INTERVAL", "1m")
 
 BAZARR_URL    = os.environ.get("BAZARR_URL", "")
 BAZARR_APIKEY = os.environ.get("BAZARR_APIKEY", "")
@@ -896,10 +902,135 @@ def plexlog_loop(stop):
 # sweep / loop
 # =========================================================================== #
 
+# =========================================================================== #
+# westrepair - symlink repair subprocess + background monitor thread
+# =========================================================================== #
+
+_wr_lock  = threading.Lock()
+_wr_state = {
+    "running": False, "pid": None,
+    "current_item": None, "current_mode": None,
+    "items_processed": 0, "items_broken": 0, "items_fixed": 0,
+    "last_action": None, "last_run_start": None, "next_run_in": None,
+    "recent_log": [],
+    "exit_code": None,
+}
+_wr_proc = None
+
+_RE_WR_PROCESSING = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(\w+)\] \[DEBUG\] Processing: (.+)')
+_RE_WR_BROKEN     = re.compile(r'\[DEBUG\] .*(broken|missing|not found|unreachable)', re.IGNORECASE)
+_RE_WR_FIXED      = re.compile(r'\[(INFO|SUCCESS)\] .*(search|trigger|fix|repair|restor)', re.IGNORECASE)
+_RE_WR_SLEEPING   = re.compile(r'[Ss]leeping for ([^\n]+)')
+_RE_WR_START      = re.compile(r'Running repair')
+
+
+def _wr_parse_line(line):
+    s = _wr_state
+    s["recent_log"].append(line.rstrip())
+    if len(s["recent_log"]) > 20:
+        s["recent_log"].pop(0)
+    m = _RE_WR_PROCESSING.search(line)
+    if m:
+        s["current_item"] = m.group(3).strip()
+        s["current_mode"] = m.group(2)
+        s["items_processed"] += 1
+        return
+    if _RE_WR_BROKEN.search(line):
+        s["items_broken"] += 1; s["last_action"] = line.strip(); return
+    if _RE_WR_FIXED.search(line):
+        s["items_fixed"] += 1; s["last_action"] = line.strip(); return
+    m2 = _RE_WR_SLEEPING.search(line)
+    if m2:
+        s["next_run_in"] = m2.group(1).strip(); s["current_item"] = None; return
+    if _RE_WR_START.search(line):
+        s["last_run_start"] = line.strip()
+        s["items_processed"] = s["items_broken"] = s["items_fixed"] = 0
+
+
+def westrepair_loop(stop):
+    """Run repair.py as a long-lived subprocess; restart on unexpected exit."""
+    global _wr_proc
+    if not os.path.exists(WR_SCRIPT):
+        log.error("[westrepair] script not found: %s", WR_SCRIPT)
+        return
+    log.info("[westrepair] starting %s | run_interval=%s repair_interval=%s",
+             WR_SCRIPT, WR_RUN_INTERVAL, WR_REPAIR_INTERVAL)
+    while not stop.is_set():
+        cmd = ["python", "-u", WR_SCRIPT, "--no-confirm",
+               "--run-interval", WR_RUN_INTERVAL,
+               "--repair-interval", WR_REPAIR_INTERVAL]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, cwd=os.path.dirname(WR_SCRIPT))
+            _wr_proc = proc
+            with _wr_lock:
+                _wr_state.update({"running": True, "pid": proc.pid, "exit_code": None})
+            for line in proc.stdout:
+                log.info("[westrepair] %s", line.rstrip())
+                with _wr_lock:
+                    _wr_parse_line(line)
+                if stop.is_set():
+                    break
+            proc.wait()
+            with _wr_lock:
+                _wr_state.update({"running": False, "exit_code": proc.returncode})
+            if stop.is_set():
+                break
+            log.warning("[westrepair] exited (code %d), restarting in 30s", proc.returncode)
+            stop.wait(30)
+        except Exception as e:
+            log.error("[westrepair] error: %s", e)
+            stop.wait(30)
+    if _wr_proc and _wr_proc.poll() is None:
+        try: _wr_proc.terminate()
+        except Exception: pass
+    log.info("[westrepair] stopped")
+
+
+def check_westrepair():
+    """No-op periodic check — westrepair runs continuously in its own thread."""
+    with _wr_lock:
+        s = dict(_wr_state)
+    if s["running"]:
+        log.debug("[westrepair] running pid=%s processed=%d broken=%d fixed=%d",
+                  s["pid"], s["items_processed"], s["items_broken"], s["items_fixed"])
+    else:
+        log.warning("[westrepair] repair.py not running (exit_code=%s)", s["exit_code"])
+
+
+def _wr_plex_rescan():
+    """Trigger a Plex library refresh for all sections. Returns (ok, message)."""
+    plex_url   = os.environ.get("PLEX_URL", "").rstrip("/")
+    plex_token = os.environ.get("PLEX_TOKEN", "")
+    if not plex_url or not plex_token:
+        return False, "PLEX_URL or PLEX_TOKEN not set"
+    # Get library sections
+    sections_url = "%s/library/sections?X-Plex-Token=%s" % (plex_url, plex_token)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(sections_url), timeout=10) as r:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.read())
+    except Exception as e:
+        return False, "could not fetch sections: %s" % str(e)[:80]
+    keys = [d.get("key") for d in root.findall(".//Directory") if d.get("key")]
+    if not keys:
+        return False, "no library sections found"
+    triggered = []
+    for key in keys:
+        scan_url = "%s/library/sections/%s/refresh?X-Plex-Token=%s" % (plex_url, key, plex_token)
+        try:
+            urllib.request.urlopen(urllib.request.Request(scan_url), timeout=10)
+            triggered.append(key)
+        except Exception as e:
+            log.warning("[westrepair] plex scan section %s failed: %s", key, e)
+    log.info("[westrepair] triggered Plex rescan for %d section(s): %s", len(triggered), triggered)
+    return True, "triggered %d section(s)" % len(triggered)
+
+
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
-          ("bazarr", EN_BAZARR, check_bazarr)]
+          ("bazarr", EN_BAZARR, check_bazarr), ("westrepair", EN_WESTREPAIR, check_westrepair)]
 
 _lock = threading.Lock()
 
@@ -929,7 +1060,9 @@ UI_SCHEMA = [
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""),
-              ("ENABLE_BAZARR", ""), ("ENABLE_WARMER", "")]),
+              ("ENABLE_BAZARR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+    ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
+              ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
               ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
     ("Warmer", [("WARMER_PRECACHE_MB", "64"), ("WARMER_TAIL_MB", "8"), ("WARMER_SOURCES", "ondeck,next"),
@@ -983,6 +1116,13 @@ def _ui_warmer():
     return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
             "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
             "total": _warm_count[0], "recent": rec[:40]}
+
+def _ui_westrepair():
+    with _wr_lock:
+        s = dict(_wr_state)
+        s["recent_log"] = list(_wr_state["recent_log"])
+    s["enabled"] = EN_WESTREPAIR
+    return s
 
 def _ui_config():
     groups = []
@@ -1055,6 +1195,7 @@ pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px
  <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
  <div class=card><h3>Monitored services</h3><div id=health></div></div>
  <div class=card><h3>Warmer</h3><div id=warm></div></div>
+ <div class=card id=wr-card style=display:none><h3>Westrepair</h3><div id=wr></div></div>
 </div>
 <div id=config style=display:none></div>
 <div id=logs style=display:none></div>
@@ -1088,7 +1229,23 @@ function loadDash(){
   h+='<table style="margin-top:8px">';
   if(!w.recent.length)h+='<tr><td class=mut>nothing warmed yet</td></tr>';
   for(var i=0;i<w.recent.length;i++){var r=w.recent[i];h+='<tr><td>'+esc(r.title)+'</td><td class=why>'+esc(r.why)+'</td><td class=ago>'+ago(r.ago)+'</td></tr>'}
-  h+='</table>';E('warm').innerHTML=h})}
+  h+='</table>';E('warm').innerHTML=h});
+ fetch(q('/api/westrepair')).then(function(r){return r.json()}).then(function(w){
+  var card=E('wr-card');if(!w.enabled){card.style.display='none';return}card.style.display='';
+  var st=w.running?'<span class="badge b-on">running</span>':'<span class="badge b-bad">stopped</span>';
+  var h='<div class=row><span class=mut>status</span>'+st+'</div>';
+  h+='<div class=row><span class=mut>processed / broken / fixed</span><span><b>'+w.items_processed+'</b> / <b>'+w.items_broken+'</b> / <b>'+w.items_fixed+'</b></span></div>';
+  if(w.current_item)h+='<div class=row><span class=mut>current item</span><span style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(w.current_item)+'</span></div>';
+  if(w.next_run_in)h+='<div class=row><span class=mut>next run in</span><span>'+esc(w.next_run_in)+'</span></div>';
+  if(w.last_action)h+='<div class=row><span class=mut>last action</span><span class=mut style="font-size:11px;max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(w.last_action)+'</span></div>';
+  var logOpen=E('wr-log')&&E('wr-log').open;
+  if(w.recent_log&&w.recent_log.length){h+='<details id=wr-log style="margin-top:8px"'+(logOpen?' open':'')+'><summary style="cursor:pointer;color:var(--mut);font-size:12px">recent log ('+w.recent_log.length+' lines)</summary>';
+   h+='<pre id=wr-logpre style="margin-top:6px;max-height:340px;font-size:11px">'+esc(w.recent_log.join('\n'))+'</pre></details>'}
+  h+='<div style="margin-top:10px"><button class=act onclick=plexRescan()>Plex Rescan</button></div>';
+  E('wr').innerHTML=h;
+  var lp=E('wr-logpre');if(lp)lp.scrollTop=lp.scrollHeight;});
+}
+function plexRescan(){fetch(q('/api/westrepair/rescan'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){toast(r.msg||'triggered')})}
 function loadConfig(){fetch(q('/api/config')).then(function(r){return r.json()}).then(function(c){
   var h='';for(var g=0;g<c.groups.length;g++){var grp=c.groups[g];h+='<div class=card><h3>'+esc(grp.group)+'</h3><div class=cfg>';
    for(var i=0;i<grp.rows.length;i++){var r=grp.rows[i];h+='<div><label>'+esc(r.key)+'</label>';
@@ -1134,8 +1291,9 @@ def _build_server(port):
                 return self._send(200, "text/html; charset=utf-8", UI_HTML)
             if path == "/api/status":  return self._send(200, "application/json", json.dumps(_ui_status()))
             if path == "/api/health":  return self._send(200, "application/json", json.dumps(_ui_health()))
-            if path == "/api/warmer":  return self._send(200, "application/json", json.dumps(_ui_warmer()))
-            if path == "/api/config":  return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
+            if path == "/api/westrepair":  return self._send(200, "application/json", json.dumps(_ui_westrepair()))
+            if path == "/api/config":      return self._send(200, "application/json", json.dumps(_ui_config()))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300
@@ -1145,12 +1303,15 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart"):
+            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
                 if path == "/api/config":
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
+                if path == "/api/westrepair/rescan":
+                    threading.Thread(target=lambda: _wr_plex_rescan(), daemon=True).start()
+                    return self._send(200, "application/json", json.dumps({"ok": True, "msg": "Plex rescan triggered"}))
                 self._send(200, "application/json", json.dumps({"ok": True, "msg": "restarting"}))
                 log.info("[ui] restart requested"); threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
                 return
@@ -1195,6 +1356,9 @@ def main():
         threading.Thread(target=warmer_loop, args=(stop,), daemon=True).start()
         if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
             threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
+
+    if EN_WESTREPAIR:
+        threading.Thread(target=westrepair_loop, args=(stop,), daemon=True).start()
 
     # http server(s): arr webhooks (event mode) and/or the web dashboard (ENABLE_UI)
     servers, wanted = [], {}
