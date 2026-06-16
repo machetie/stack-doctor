@@ -255,7 +255,7 @@ class _ColorFormatter(logging.Formatter):
         lines = [header] + rest
         return "\n".join(lines)
 
-_console = logging.StreamHandler()
+_console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(_ColorFormatter())
 handlers_colored = [_console]
 if len(handlers) > 1:                         # file handler was added
@@ -1108,8 +1108,9 @@ def missing_seasons_loop(stop):
                "--search-interval", MS_SEARCH_INTERVAL,
                "--min-age-hours", MS_MIN_AGE_HOURS]
         try:
+            _ms_cwd = os.path.dirname(os.path.abspath(MS_SCRIPT)) or None
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, cwd=os.path.dirname(MS_SCRIPT))
+                                    text=True, bufsize=1, cwd=_ms_cwd)
             _ms_proc = proc
             with _ms_lock:
                 _ms_state.update({"running": True, "pid": proc.pid, "exit_code": None})
@@ -1225,16 +1226,15 @@ def check_no_upgrade_profile():
     if not EN_NO_UPGRADE_PROFILE:
         return
 
-    # Resolve target profile id — prefer explicit env var, fall back to name lookup
-    target_id = NO_UPGRADE_PROFILE_ID
     sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
     if not sonarr_instances:
         log.warning("[no_upgrade_profile] no Sonarr instances configured")
         return
 
     for arr in sonarr_instances:
+        # Resolve target profile id per-instance — each Sonarr may have different profile IDs
+        target_id = NO_UPGRADE_PROFILE_ID
         try:
-            # Resolve profile id by name if not set explicitly
             if not target_id:
                 profiles = json.load(arr._req("GET", "/qualityprofile"))
                 match = next((p for p in profiles if p["name"] == NO_UPGRADE_PROFILE_NAME), None)
@@ -1536,8 +1536,8 @@ pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px
  <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
  <div class=card><h3>Monitored services</h3><div id=health></div></div>
  <div class=card id=plex-card style=display:none><h3>Plex</h3><div id=plex-btns style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
-  <button class=act onclick=plexRescan()>&#x21bb; Rescan Libraries</button>
-  <button class=act onclick=plexEmptyTrash()>&#x1f5d1; Empty Trash</button>
+  <button class=act onclick=plexRescan(this)>&#x21bb; Rescan Libraries</button>
+  <button class=act onclick=plexEmptyTrash(this)>&#x1f5d1; Empty Trash</button>
  </div><div id=plex-msg style="margin-top:8px;font-size:12px;color:var(--mut)"></div></div>
  <div class=card><h3>Warmer</h3><div id=warm></div></div>
  <div class=card id=wr-card style=display:none><h3>Westrepair</h3><div id=wr></div></div>
@@ -1592,13 +1592,13 @@ function loadDash(){
   var plexUp=a.some(function(s){return s.name==='plex'&&s.up});
   E('plex-card').style.display=plexUp?'':'none';});
 }
-function plexRescan(){
- var btn=event.target;btn.disabled=true;btn.textContent='Rescanning...';
+function plexRescan(btn){
+ btn.disabled=true;btn.textContent='Rescanning...';
  fetch(q('/api/plex/rescan'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){
   toast(r.msg||'done');E('plex-msg').textContent=r.msg||'';btn.disabled=false;btn.textContent='\u21bb Rescan Libraries';
  }).catch(function(e){toast('error: '+e);btn.disabled=false;btn.textContent='\u21bb Rescan Libraries';})}
-function plexEmptyTrash(){
- var btn=event.target;btn.disabled=true;btn.textContent='Emptying...';
+function plexEmptyTrash(btn){
+ btn.disabled=true;btn.textContent='Emptying...';
  fetch(q('/api/plex/emptytrash'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){
   toast(r.msg||'done');E('plex-msg').textContent=r.msg||'';btn.disabled=false;btn.textContent='\ud83d\uddd1 Empty Trash';
  }).catch(function(e){toast('error: '+e);btn.disabled=false;btn.textContent='\ud83d\uddd1 Empty Trash';})}
@@ -1668,11 +1668,11 @@ def _build_server(port):
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
                 if path in ("/api/westrepair/rescan", "/api/plex/rescan"):
-                    ok, msg = _wr_plex_rescan()
-                    return self._send(200, "application/json", json.dumps({"ok": ok, "msg": msg}))
+                    threading.Thread(target=_wr_plex_rescan, daemon=True).start()
+                    return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex rescan started"}))
                 if path == "/api/plex/emptytrash":
-                    ok, msg = _plex_empty_trash()
-                    return self._send(200, "application/json", json.dumps({"ok": ok, "msg": msg}))
+                    threading.Thread(target=_plex_empty_trash, daemon=True).start()
+                    return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex empty trash started"}))
                 self._send(200, "application/json", json.dumps({"ok": True, "msg": "restarting"}))
                 log.info("[ui] restart requested"); threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
                 return
