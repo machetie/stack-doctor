@@ -240,14 +240,20 @@ class _ColorFormatter(logging.Formatter):
         "CRITICAL": "\033[1;31m",
     }
     def format(self, record):
+        # Let the base class assemble the full message, including exc_info/exc_text/stack_info
+        full  = super().format(record)
         ts    = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
         lvl   = record.levelname
         lc    = self._LEVEL.get(lvl, "")
-        msg   = record.getMessage()
-        return (f"{self._GREY}{ts}{self._RESET} "
-                f"{lc}| {lvl:<7} |{self._RESET} "
-                f"{self._CYAN}{record.name}{self._RESET} | "
-                f"{msg}")
+        # The base formatter produces "ts | LEVEL | name | msg[\ntraceback]"
+        # We replace only the first line's header; any trailing traceback lines are kept as-is
+        first_line, *rest = full.splitlines()
+        header = (f"{self._GREY}{ts}{self._RESET} "
+                  f"{lc}| {lvl:<7} |{self._RESET} "
+                  f"{self._CYAN}{record.name}{self._RESET} | "
+                  f"{record.getMessage()}")
+        lines = [header] + rest
+        return "\n".join(lines)
 
 _console = logging.StreamHandler()
 _console.setFormatter(_ColorFormatter())
