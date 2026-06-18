@@ -133,6 +133,11 @@ services:
       # REPAIR_SEASON_PACKS: "false" # flag sonarr seasons spread across multiple dirs and search for a season pack
       # REPAIR_UNMONITORED: "false"  # include unmonitored series/movies in the repair sweep
 
+      # ---------- missing_seasons (ENABLE_MISSING_SEASONS: find sonarr seasons with 0 files -> SeasonSearch) ----------
+      # MISSING_SEASONS_MIN_AGE_HOURS: "1"  # ignore seasons added less than this long ago (avoid triggering on new shows)
+      # MISSING_SEASONS_MAX_ACTIONS: "5"    # max SeasonSearches per sweep
+      # MISSING_SEASONS_RECHECK: "24h"      # cooldown before re-searching the same season
+
     volumes:
       - ./data:/data                                 # state + file log + quarantine manifests
       - /mnt/library:/mnt/library                    # for mount read-test + janitor (read/write for janitor)

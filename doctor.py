@@ -116,12 +116,14 @@ EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: au
 EN_PLEX_SCAN  = _b("ENABLE_PLEX_SCAN", False)   # detect + recover a wedged Plex library scan
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # probe library for dead files -> remove + re-search
 
-# missing_seasons config
+# missing_seasons: walk monitored Sonarr series, find seasons that have been monitored for at least
+# MS_MIN_AGE_HOURS but have zero episode files, and trigger a SeasonSearch so Sonarr re-tries.
+# Rate-limited: at most MS_MAX_ACTIONS searches per sweep. Skips seasons already searched recently
+# (MS_RECHECK cooldown). Only acts on fully monitored seasons (all episodes monitored).
 EN_MISSING_SEASONS    = _b("ENABLE_MISSING_SEASONS", False)
-MS_SCRIPT             = os.environ.get("MISSING_SEASONS_SCRIPT", "/app/westrepair/missing_seasons.py")
-MS_RUN_INTERVAL       = os.environ.get("MISSING_SEASONS_RUN_INTERVAL", "6h")
-MS_SEARCH_INTERVAL    = os.environ.get("MISSING_SEASONS_SEARCH_INTERVAL", "30s")
-MS_MIN_AGE_HOURS      = os.environ.get("MISSING_SEASONS_MIN_AGE_HOURS", "1")
+MS_MIN_AGE_HOURS      = _f("MISSING_SEASONS_MIN_AGE_HOURS", 1)   # ignore seasons added less than this long ago
+MS_MAX_ACTIONS        = _i("MISSING_SEASONS_MAX_ACTIONS", 5)      # SeasonSearches per sweep
+MS_RECHECK            = _dur(os.environ.get("MISSING_SEASONS_RECHECK", "24h"), 86400)  # cooldown between re-searching same season
 
 # no_upgrade_profile: auto-move ended+complete Sonarr series to a no-upgrade quality profile
 EN_NO_UPGRADE_PROFILE   = _b("ENABLE_NO_UPGRADE_PROFILE", False)
@@ -1435,90 +1437,63 @@ def plexlog_loop(stop):
 # missing_seasons - find monitored Sonarr seasons with no files and re-trigger
 # =========================================================================== #
 
-_ms_lock  = threading.Lock()
-_ms_state = {
-    "running": False, "pid": None,
-    "last_run_start": None, "next_run_in": None,
-    "triggered": 0, "skipped": 0,
-    "recent_log": [],
-    "exit_code": None,
-}
-_ms_proc = None
-
-_RE_MS_TRIGGERED = re.compile(r'\[missing_seasons\] \[SUCCESS\].*Triggered search', re.IGNORECASE)
-_RE_MS_SKIP      = re.compile(r'\[missing_seasons\] \[DEBUG\]\s+SKIP', re.IGNORECASE)
-_RE_MS_SLEEP     = re.compile(r'Sleeping for ([^\n]+)')
-_RE_MS_START     = re.compile(r'Starting missing-season scan')
-
-
-def _ms_parse_line(line):
-    s = _ms_state
-    s["recent_log"].append(line.rstrip())
-    if len(s["recent_log"]) > 20:
-        s["recent_log"].pop(0)
-    if _RE_MS_TRIGGERED.search(line):
-        s["triggered"] += 1; s["last_action"] = line.strip(); return
-    if _RE_MS_SKIP.search(line):
-        s["skipped"] += 1; return
-    m = _RE_MS_SLEEP.search(line)
-    if m:
-        s["next_run_in"] = m.group(1).strip(); return
-    if _RE_MS_START.search(line):
-        s["last_run_start"] = line.strip()
-        s["triggered"] = s["skipped"] = 0
-
-
-def missing_seasons_loop(stop):
-    """Run missing_seasons.py as a long-lived subprocess; restart on unexpected exit."""
-    global _ms_proc
-    if not os.path.exists(MS_SCRIPT):
-        log.error("[missing_seasons] script not found: %s", MS_SCRIPT)
-        return
-    log.info("[missing_seasons] starting %s | run_interval=%s search_interval=%s min_age=%sh",
-             MS_SCRIPT, MS_RUN_INTERVAL, MS_SEARCH_INTERVAL, MS_MIN_AGE_HOURS)
-    while not stop.is_set():
-        cmd = ["python", "-u", MS_SCRIPT, "--no-confirm",
-               "--run-interval", MS_RUN_INTERVAL,
-               "--search-interval", MS_SEARCH_INTERVAL,
-               "--min-age-hours", MS_MIN_AGE_HOURS]
-        try:
-            _ms_cwd = os.path.dirname(os.path.abspath(MS_SCRIPT)) or None
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, cwd=_ms_cwd)
-            _ms_proc = proc
-            with _ms_lock:
-                _ms_state.update({"running": True, "pid": proc.pid, "exit_code": None})
-            for line in proc.stdout:
-                log.info("[missing_seasons] %s", line.rstrip())
-                with _ms_lock:
-                    _ms_parse_line(line)
-                if stop.is_set():
-                    break
-            proc.wait()
-            with _ms_lock:
-                _ms_state.update({"running": False, "exit_code": proc.returncode})
-            if stop.is_set():
-                break
-            log.warning("[missing_seasons] exited (code %d), restarting in 30s", proc.returncode)
-            stop.wait(30)
-        except Exception as e:
-            log.error("[missing_seasons] error: %s", e)
-            stop.wait(30)
-    if _ms_proc and _ms_proc.poll() is None:
-        try: _ms_proc.terminate()
-        except Exception: pass
-    log.info("[missing_seasons] stopped")
-
-
 def check_missing_seasons():
-    """No-op periodic check — missing_seasons runs continuously in its own thread."""
-    with _ms_lock:
-        s = dict(_ms_state)
-    if s["running"]:
-        log.debug("[missing_seasons] running pid=%s triggered=%d skipped=%d",
-                  s["pid"], s["triggered"], s["skipped"])
-    else:
-        log.warning("[missing_seasons] not running (exit_code=%s)", s["exit_code"])
+    """Walk every monitored Sonarr series. For each season that is fully monitored, has been
+    around long enough (MS_MIN_AGE_HOURS), and has zero episode files, trigger a SeasonSearch.
+    State tracks the last time each (instance, series_id, season) was searched so we don't
+    hammer the same season every sweep."""
+    sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
+    if not sonarr_instances:
+        log.debug("[missing_seasons] no sonarr instances configured"); return
+    state = _load_state(); ms = state.setdefault("__missing_seasons__", {})
+    now = time.time(); acted = 0; skipped = 0
+    min_age_secs = MS_MIN_AGE_HOURS * 3600
+    for arr in sonarr_instances:
+        try:
+            all_series = arr.series()
+        except Exception as e:
+            log.warning("[missing_seasons:%s] failed to fetch series: %s", arr.name, str(e)[:60]); continue
+        for ser in all_series:
+            if not ser.get("monitored"):
+                continue
+            sid   = ser.get("id")
+            title = (ser.get("title") or "")[:60]
+            # use the series added date as a proxy for how long it's been monitored
+            added_str = ser.get("added") or ""
+            try:
+                import email.utils
+                added_ts = email.utils.parsedate_to_datetime(added_str).timestamp() if added_str else 0
+            except Exception:
+                added_ts = 0
+            if added_ts and (now - added_ts) < min_age_secs:
+                continue                                  # too new, give Sonarr time to grab it first
+            for season in (ser.get("seasons") or []):
+                sn = season.get("seasonNumber", 0)
+                if sn == 0:
+                    continue                              # skip specials
+                if not season.get("monitored"):
+                    continue
+                stats = season.get("statistics") or {}
+                if stats.get("episodeFileCount", 0) > 0:
+                    continue                              # has files, all good
+                if stats.get("totalEpisodeCount", 0) == 0:
+                    continue                              # no episodes exist yet in Sonarr
+                key = "%s:%d:%d" % (arr.name, sid, sn)
+                if now - ms.get(key, 0) < MS_RECHECK:
+                    skipped += 1; continue               # searched recently, wait for cooldown
+                if acted >= MS_MAX_ACTIONS:
+                    break
+                if DRY_RUN:
+                    log.info("[missing_seasons:%s] DRY-RUN would search: %s S%02d", arr.name, title, sn)
+                    ms[key] = now; acted += 1; continue
+                if arr.command("SeasonSearch", seriesId=sid, seasonNumber=sn):
+                    log.warning("[missing_seasons:%s] 0 files in monitored season -> SeasonSearch: %s S%02d",
+                                arr.name, title, sn)
+                    ms[key] = now; acted += 1
+            if acted >= MS_MAX_ACTIONS:
+                break
+    _save_state(state)
+    log.info("[missing_seasons] searched %d season(s), skipped %d (cooldown)", acted, skipped)
 
 
 # =========================================================================== #
@@ -1771,6 +1746,8 @@ UI_SCHEMA = [
               ("REPAIR_FFPROBE", "false"), ("REPAIR_DEBRID_MOUNT", ""),
               ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
               ("REPAIR_UNMONITORED", "false")]),
+    ("Missing Seasons", [("MISSING_SEASONS_MIN_AGE_HOURS", "1"), ("MISSING_SEASONS_MAX_ACTIONS", "5"),
+              ("MISSING_SEASONS_RECHECK", "24h")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
               ("NO_UPGRADE_PROFILE_ID", "0")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
@@ -1832,13 +1809,6 @@ def _ui_warmer():
     return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
             "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
             "total": _warm_count[0], "recent": rec[:40]}
-
-def _ui_missing_seasons():
-    with _ms_lock:
-        s = dict(_ms_state)
-        s["recent_log"] = list(_ms_state["recent_log"])
-    s["enabled"] = EN_MISSING_SEASONS
-    return s
 
 def _ui_config():
     groups = []
@@ -2009,7 +1979,7 @@ def _build_server(port):
             if path == "/api/status":  return self._send(200, "application/json", json.dumps(_ui_status()))
             if path == "/api/health":  return self._send(200, "application/json", json.dumps(_ui_health()))
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
-            if path == "/api/missing_seasons":  return self._send(200, "application/json", json.dumps(_ui_missing_seasons()))
+
             if path == "/api/config":           return self._send(200, "application/json", json.dumps(_ui_config()))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
@@ -2078,9 +2048,6 @@ def main():
         threading.Thread(target=warmer_loop, args=(stop,), daemon=True).start()
         if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
             threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
-
-    if EN_MISSING_SEASONS:
-        threading.Thread(target=missing_seasons_loop, args=(stop,), daemon=True).start()
 
     # http server(s): arr webhooks (event mode) and/or the web dashboard (ENABLE_UI)
     servers, wanted = [], {}
