@@ -976,9 +976,14 @@ _wr_state = {
 }
 _wr_proc = None
 
-_RE_WR_PROCESSING = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(\w+)\] \[DEBUG\] Processing: (.+)')
-_RE_WR_BROKEN     = re.compile(r'\[DEBUG\] .*(broken|missing|not found|unreachable)', re.IGNORECASE)
-_RE_WR_FIXED      = re.compile(r'\[(INFO|SUCCESS)\] .*(search|trigger|fix|repair|restor)', re.IGNORECASE)
+# repair.py prefixes every line with "[datetime] [mode]", e.g.:
+#   [2026-06-19 03:55:00.123456] [symlink] Running repair
+#   [2026-06-19 03:55:00.123456] [symlink] Title: Some Show
+#   [2026-06-19 03:55:00.123456] [symlink] Broken items:
+#   [2026-06-19 03:55:00.123456] [symlink] Searching for new files
+_RE_WR_PROCESSING = re.compile(r'\[[\d\- :\.]+\] \[(\w+)\] Title: (.+)')
+_RE_WR_BROKEN     = re.compile(r'Broken items:', re.IGNORECASE)
+_RE_WR_FIXED      = re.compile(r'Searching for new files|Re-monitoring|season.pack', re.IGNORECASE)
 _RE_WR_SLEEPING   = re.compile(r'[Ss]leeping for ([^\n]+)')
 _RE_WR_START      = re.compile(r'Running repair')
 
@@ -990,8 +995,8 @@ def _wr_parse_line(line):
         s["recent_log"].pop(0)
     m = _RE_WR_PROCESSING.search(line)
     if m:
-        s["current_item"] = m.group(3).strip()
-        s["current_mode"] = m.group(2)
+        s["current_mode"] = m.group(1).strip()
+        s["current_item"] = m.group(2).strip()
         s["items_processed"] += 1
         return
     if _RE_WR_BROKEN.search(line):
