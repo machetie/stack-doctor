@@ -32,7 +32,7 @@ container, everything configured by env vars.
 | **repair** | dead library files (debrid link / usenet article gone), unreadable or 0-byte; optionally MissingFromDisk history entries (usenet/direct downloads) | removes the dead file record + re-searches the owning *arr (strike-gated, mount-safe, SeasonSearch-first) |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
-| **missing_seasons** | monitored Sonarr seasons that have been around long enough but have zero episode files | triggers a `SeasonSearch` so Sonarr re-tries (cooldown-gated, action-capped) |
+| **missing_seasons** | monitored Sonarr seasons that have been around long enough but have zero episode files (skips still-airing seasons) | triggers a `SeasonSearch` so Sonarr re-tries (cooldown-gated, action-capped) |
 | **no_upgrade_profile** | ended + fully-collected Sonarr series still on an upgrading quality profile | moves them to a no-upgrade profile so Sonarr stops searching for a better copy |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
 
@@ -247,7 +247,7 @@ Honors `DOCTOR_DRY_RUN`.
 
 ### Missing seasons
 
-`missing_seasons` walks all monitored Sonarr series and finds seasons that have been around long enough (`MISSING_SEASONS_MIN_AGE_HOURS`) but still have zero episode files. It triggers a `SeasonSearch` for each, with a per-season cooldown to avoid hammering the same season every sweep.
+`missing_seasons` walks all monitored Sonarr series and finds seasons that have been around long enough (`MISSING_SEASONS_MIN_AGE_HOURS`) but still have zero episode files. Seasons that are still airing (have episodes with future air dates) are automatically skipped to avoid triggering searches for incomplete seasons. It triggers a `SeasonSearch` for each eligible season, with a per-season cooldown to avoid hammering the same season every sweep.
 
 | var | default | meaning |
 |---|---|---|

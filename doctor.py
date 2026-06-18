@@ -39,6 +39,7 @@ import time
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 
 VERSION = "0.3"
 
@@ -1650,16 +1651,36 @@ def plexlog_loop(stop):
 # missing_seasons - find monitored Sonarr seasons with no files and re-trigger
 # =========================================================================== #
 
+def _season_still_airing(episodes, season_number):
+    """Return True if *season_number* has at least one episode whose air date is in the future.
+    This prevents triggering a SeasonSearch for a season that is still actively airing
+    (only some episodes have been released so far)."""
+    now = datetime.now(timezone.utc)
+    for ep in episodes:
+        if ep.get("seasonNumber") != season_number:
+            continue
+        air = ep.get("airDateUtc") or ""
+        if not air:
+            continue
+        try:
+            dt = datetime.fromisoformat(air.replace("Z", "+00:00"))
+            if dt > now:
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
 def check_missing_seasons():
     """Walk every monitored Sonarr series. For each season that is fully monitored, has been
-    around long enough (MS_MIN_AGE_HOURS), and has zero episode files, trigger a SeasonSearch.
+    around long enough (MS_MIN_AGE_HOURS), has zero episode files, and is not still airing
+    (no future air dates), trigger a SeasonSearch.
     State tracks the last time each (instance, series_id, season) was searched so we don't
     hammer the same season every sweep."""
     sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
     if not sonarr_instances:
         log.debug("[missing_seasons] no sonarr instances configured"); return
     state = _load_state(); ms = state.setdefault("__missing_seasons__", {})
-    now = time.time(); acted = 0; skipped = 0
+    now = time.time(); acted = 0; skipped = 0; airing = 0
     min_age_secs = MS_MIN_AGE_HOURS * 3600
     for arr in sonarr_instances:
         try:
@@ -1680,6 +1701,7 @@ def check_missing_seasons():
                 added_ts = 0
             if added_ts and (now - added_ts) < min_age_secs:
                 continue                                  # too new, give Sonarr time to grab it first
+            ep_cache = None                               # lazy-fetched per series
             for season in (ser.get("seasons") or []):
                 sn = season.get("seasonNumber", 0)
                 if sn == 0:
@@ -1696,6 +1718,16 @@ def check_missing_seasons():
                     skipped += 1; continue               # searched recently, wait for cooldown
                 if acted >= MS_MAX_ACTIONS:
                     break
+                # lazy-fetch episodes once per series to check air dates
+                if ep_cache is None:
+                    try:
+                        ep_cache = arr.episodes(sid)
+                    except Exception:
+                        ep_cache = []
+                if _season_still_airing(ep_cache, sn):
+                    airing += 1
+                    log.debug("[missing_seasons:%s] skipping still-airing season: %s S%02d", arr.name, title, sn)
+                    continue
                 if DRY_RUN:
                     log.info("[missing_seasons:%s] DRY-RUN would search: %s S%02d", arr.name, title, sn)
                     ms[key] = now; acted += 1; continue
@@ -1706,7 +1738,7 @@ def check_missing_seasons():
             if acted >= MS_MAX_ACTIONS:
                 break
     _save_state(state)
-    log.info("[missing_seasons] searched %d season(s), skipped %d (cooldown)", acted, skipped)
+    log.info("[missing_seasons] searched %d season(s), skipped %d (cooldown), %d (still airing)", acted, skipped, airing)
 
 
 # =========================================================================== #
