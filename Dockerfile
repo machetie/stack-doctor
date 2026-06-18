@@ -11,18 +11,13 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY doctor.py /app/doctor.py
 
-# westrepair: symlink repair subprocess (optional, enabled via ENABLE_WESTREPAIR=true)
-COPY westrepair/ /app/westrepair/
-
-# doctor.py itself uses only the standard library. openssh-client lets a restart
+# doctor.py uses only the standard library. openssh-client lets a restart
 # hook reach a *host* service (e.g. DECYPHARR_RESTART_CMD="ssh root@host systemctl restart decypharr").
-# westrepair/requirements.txt adds environs, discord_webhook, requests.
 # Runs as root so a bind-mounted /data (and an optional rw /mnt/library for the
 # janitor) is always writable regardless of host ownership.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r /app/westrepair/requirements.txt \
     && mkdir -p /data
 VOLUME /data
 

@@ -112,15 +112,9 @@ EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
 EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)
 EN_BAZARR     = _b("ENABLE_BAZARR", False)
-EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
 EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_PLEX_SCAN  = _b("ENABLE_PLEX_SCAN", False)   # detect + recover a wedged Plex library scan
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # probe library for dead files -> remove + re-search
-
-# westrepair config
-WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
-WR_RUN_INTERVAL    = os.environ.get("WESTREPAIR_RUN_INTERVAL", "6h")
-WR_REPAIR_INTERVAL = os.environ.get("WESTREPAIR_REPAIR_INTERVAL", "1m")
 
 # missing_seasons config
 EN_MISSING_SEASONS    = _b("ENABLE_MISSING_SEASONS", False)
@@ -1348,107 +1342,6 @@ def plexlog_loop(stop):
 # =========================================================================== #
 
 # =========================================================================== #
-# westrepair - symlink repair subprocess + background monitor thread
-# =========================================================================== #
-
-_wr_lock  = threading.Lock()
-_wr_state = {
-    "running": False, "pid": None,
-    "current_item": None, "current_mode": None,
-    "items_processed": 0, "items_broken": 0, "items_fixed": 0,
-    "last_action": None, "last_run_start": None, "next_run_in": None,
-    "recent_log": [],
-    "exit_code": None,
-}
-_wr_proc = None
-
-# repair.py prefixes every line with "[datetime] [mode]", e.g.:
-#   [2026-06-19 03:55:00.123456] [symlink] Running repair
-#   [2026-06-19 03:55:00.123456] [symlink] Title: Some Show
-#   [2026-06-19 03:55:00.123456] [symlink] Broken items:
-#   [2026-06-19 03:55:00.123456] [symlink] Searching for new files
-_RE_WR_PROCESSING = re.compile(r'\[[\d\- :\.]+\] \[(\w+)\] Title: (.+)')
-_RE_WR_BROKEN     = re.compile(r'Broken items:', re.IGNORECASE)
-_RE_WR_FIXED      = re.compile(r'Searching for new files|Re-monitoring|season.pack', re.IGNORECASE)
-_RE_WR_SLEEPING   = re.compile(r'[Ss]leeping for ([^\n]+)')
-_RE_WR_START      = re.compile(r'Running repair')
-
-
-def _wr_parse_line(line):
-    s = _wr_state
-    s["recent_log"].append(line.rstrip())
-    if len(s["recent_log"]) > 20:
-        s["recent_log"].pop(0)
-    m = _RE_WR_PROCESSING.search(line)
-    if m:
-        s["current_mode"] = m.group(1).strip()
-        s["current_item"] = m.group(2).strip()
-        s["items_processed"] += 1
-        return
-    if _RE_WR_BROKEN.search(line):
-        s["items_broken"] += 1; s["last_action"] = line.strip(); return
-    if _RE_WR_FIXED.search(line):
-        s["items_fixed"] += 1; s["last_action"] = line.strip(); return
-    m2 = _RE_WR_SLEEPING.search(line)
-    if m2:
-        s["next_run_in"] = m2.group(1).strip(); s["current_item"] = None; return
-    if _RE_WR_START.search(line):
-        s["last_run_start"] = line.strip()
-        s["items_processed"] = s["items_broken"] = s["items_fixed"] = 0
-
-
-def westrepair_loop(stop):
-    """Run repair.py as a long-lived subprocess; restart on unexpected exit."""
-    global _wr_proc
-    if not os.path.exists(WR_SCRIPT):
-        log.error("[westrepair] script not found: %s", WR_SCRIPT)
-        return
-    log.info("[westrepair] starting %s | run_interval=%s repair_interval=%s",
-             WR_SCRIPT, WR_RUN_INTERVAL, WR_REPAIR_INTERVAL)
-    while not stop.is_set():
-        cmd = ["python", "-u", WR_SCRIPT, "--no-confirm",
-               "--run-interval", WR_RUN_INTERVAL,
-               "--repair-interval", WR_REPAIR_INTERVAL]
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, bufsize=1, cwd=os.path.dirname(WR_SCRIPT))
-            _wr_proc = proc
-            with _wr_lock:
-                _wr_state.update({"running": True, "pid": proc.pid, "exit_code": None})
-            for line in proc.stdout:
-                log.info("[westrepair] %s", line.rstrip())
-                with _wr_lock:
-                    _wr_parse_line(line)
-                if stop.is_set():
-                    break
-            proc.wait()
-            with _wr_lock:
-                _wr_state.update({"running": False, "exit_code": proc.returncode})
-            if stop.is_set():
-                break
-            log.warning("[westrepair] exited (code %d), restarting in 30s", proc.returncode)
-            stop.wait(30)
-        except Exception as e:
-            log.error("[westrepair] error: %s", e)
-            stop.wait(30)
-    if _wr_proc and _wr_proc.poll() is None:
-        try: _wr_proc.terminate()
-        except Exception: pass
-    log.info("[westrepair] stopped")
-
-
-def check_westrepair():
-    """No-op periodic check — westrepair runs continuously in its own thread."""
-    with _wr_lock:
-        s = dict(_wr_state)
-    if s["running"]:
-        log.debug("[westrepair] running pid=%s processed=%d broken=%d fixed=%d",
-                  s["pid"], s["items_processed"], s["items_broken"], s["items_fixed"])
-    else:
-        log.warning("[westrepair] repair.py not running (exit_code=%s)", s["exit_code"])
-
-
-# =========================================================================== #
 # missing_seasons - find monitored Sonarr seasons with no files and re-trigger
 # =========================================================================== #
 
@@ -1691,7 +1584,7 @@ def _plex_sections():
     return plex_url, plex_token, sections
 
 
-def _wr_plex_rescan():
+def _plex_rescan():
     """Trigger a Plex library scan (refresh) for all sections. Returns (ok, message)."""
     try:
         plex_url, plex_token, sections = _plex_sections()
@@ -1746,7 +1639,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("plexscan", EN_PLEX_SCAN, check_plex_scan),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
           ("repair", EN_REPAIR, check_repair), ("bazarr", EN_BAZARR, check_bazarr),
-          ("seerr", EN_SEERR, check_seerr), ("westrepair", EN_WESTREPAIR, check_westrepair),
+          ("seerr", EN_SEERR, check_seerr),
           ("missing_seasons", EN_MISSING_SEASONS, check_missing_seasons),
           ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile)]
 
@@ -1779,7 +1672,7 @@ UI_SCHEMA = [
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_PLEX_SCAN", ""), ("ENABLE_RESOURCES", ""),
               ("ENABLE_JANITOR", ""), ("ENABLE_REPAIR", ""), ("ENABLE_BAZARR", ""),
-              ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", ""),
+              ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""),
               ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", "")]),
     ("Plex scan recovery", [("PLEX_SCAN_STUCK_AFTER", "30m"), ("PLEX_SCAN_CANCEL", "true|false")]),
     ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
@@ -1790,8 +1683,7 @@ UI_SCHEMA = [
               ("NO_UPGRADE_PROFILE_ID", "0")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
               ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
-    ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
-              ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
+
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
               ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
     ("Warmer", [("WARMER_PRECACHE_MB", "64"), ("WARMER_TAIL_MB", "8"), ("WARMER_SOURCES", "ondeck,next"),
@@ -1848,13 +1740,6 @@ def _ui_warmer():
     return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
             "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
             "total": _warm_count[0], "recent": rec[:40]}
-
-def _ui_westrepair():
-    with _wr_lock:
-        s = dict(_wr_state)
-        s["recent_log"] = list(_wr_state["recent_log"])
-    s["enabled"] = EN_WESTREPAIR
-    return s
 
 def _ui_missing_seasons():
     with _ms_lock:
@@ -1938,7 +1823,6 @@ pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px
   <button class=act onclick=plexEmptyTrash(this)>&#x1f5d1; Empty Trash</button>
  </div><div id=plex-msg style="margin-top:8px;font-size:12px;color:var(--mut)"></div></div>
  <div class=card><h3>Warmer</h3><div id=warm></div></div>
- <div class=card id=wr-card style=display:none><h3>Westrepair</h3><div id=wr></div></div>
 </div>
 <div id=config style=display:none></div>
 <div id=logs style=display:none></div>
@@ -1973,19 +1857,6 @@ function loadDash(){
   if(!w.recent.length)h+='<tr><td class=mut>nothing warmed yet</td></tr>';
   for(var i=0;i<w.recent.length;i++){var r=w.recent[i];h+='<tr><td>'+esc(r.title)+'</td><td class=why>'+esc(r.why)+'</td><td class=ago>'+ago(r.ago)+'</td></tr>'}
   h+='</table>';E('warm').innerHTML=h});
- fetch(q('/api/westrepair')).then(function(r){return r.json()}).then(function(w){
-  var card=E('wr-card');if(!w.enabled){card.style.display='none';return}card.style.display='';
-  var st=w.running?'<span class="badge b-on">running</span>':'<span class="badge b-bad">stopped</span>';
-  var h='<div class=row><span class=mut>status</span>'+st+'</div>';
-  h+='<div class=row><span class=mut>processed / broken / fixed</span><span><b>'+w.items_processed+'</b> / <b>'+w.items_broken+'</b> / <b>'+w.items_fixed+'</b></span></div>';
-  if(w.current_item)h+='<div class=row><span class=mut>current item</span><span style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(w.current_item)+'</span></div>';
-  if(w.next_run_in)h+='<div class=row><span class=mut>next run in</span><span>'+esc(w.next_run_in)+'</span></div>';
-  if(w.last_action)h+='<div class=row><span class=mut>last action</span><span class=mut style="font-size:11px;max-width:70%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(w.last_action)+'</span></div>';
-  var logOpen=E('wr-log')&&E('wr-log').open;
-  if(w.recent_log&&w.recent_log.length){h+='<details id=wr-log style="margin-top:8px"'+(logOpen?' open':'')+'><summary style="cursor:pointer;color:var(--mut);font-size:12px">recent log ('+w.recent_log.length+' lines)</summary>';
-   h+='<pre id=wr-logpre style="margin-top:6px;max-height:340px;font-size:11px">'+esc(w.recent_log.join('\n'))+'</pre></details>'}
-  E('wr').innerHTML=h;
-  var lp=E('wr-logpre');if(lp)lp.scrollTop=lp.scrollHeight;});
  fetch(q('/api/health')).then(function(r){return r.json()}).then(function(a){
   var plexUp=a.some(function(s){return s.name==='plex'&&s.up});
   E('plex-card').style.display=plexUp?'':'none';});
@@ -2046,7 +1917,6 @@ def _build_server(port):
             if path == "/api/status":  return self._send(200, "application/json", json.dumps(_ui_status()))
             if path == "/api/health":  return self._send(200, "application/json", json.dumps(_ui_health()))
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
-            if path == "/api/westrepair":       return self._send(200, "application/json", json.dumps(_ui_westrepair()))
             if path == "/api/missing_seasons":  return self._send(200, "application/json", json.dumps(_ui_missing_seasons()))
             if path == "/api/config":           return self._send(200, "application/json", json.dumps(_ui_config()))
             if path == "/api/logs":
@@ -2058,15 +1928,15 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan",
+            if path in ("/api/config", "/api/restart",
                         "/api/plex/rescan", "/api/plex/emptytrash"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
                 if path == "/api/config":
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
-                if path in ("/api/westrepair/rescan", "/api/plex/rescan"):
-                    threading.Thread(target=_wr_plex_rescan, daemon=True).start()
+                if path == "/api/plex/rescan":
+                    threading.Thread(target=_plex_rescan, daemon=True).start()
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex rescan started"}))
                 if path == "/api/plex/emptytrash":
                     threading.Thread(target=_plex_empty_trash, daemon=True).start()
@@ -2116,9 +1986,6 @@ def main():
         threading.Thread(target=warmer_loop, args=(stop,), daemon=True).start()
         if WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE:
             threading.Thread(target=plexlog_loop, args=(stop,), daemon=True).start()
-
-    if EN_WESTREPAIR:
-        threading.Thread(target=westrepair_loop, args=(stop,), daemon=True).start()
 
     if EN_MISSING_SEASONS:
         threading.Thread(target=missing_seasons_loop, args=(stop,), daemon=True).start()
