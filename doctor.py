@@ -20,6 +20,8 @@ Modular checks, each toggled and configured by environment variables:
   seerr      Overseerr/Jellyseerr/Seerr - auto-retry FAILED requests (arr add timed out under load)
   warmer     Plex-driven precache       - read the head of likely-next media so playback starts
                                            instantly (next episode + On Deck); thread, not a sweep
+  missing_seasons  Sonarr               - re-trigger searches for seasons with 0 episode files
+  no_upgrade_profile  Sonarr            - auto-move ended+complete series to a no-upgrade profile
 
 Runs as a cron-style interval loop OR reacts to Sonarr/Radarr webhook events.
 Pure Python standard library, no dependencies.
@@ -108,10 +110,10 @@ EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
 EN_PLEX       = _b("ENABLE_PLEX", False)
 EN_RESOURCES  = _b("ENABLE_RESOURCES", False)
 EN_JANITOR    = _b("ENABLE_JANITOR", False)
-EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/download clients (sonarr/radarr/prowlarr)
-EN_BAZARR     = _b("ENABLE_BAZARR", False)      # Bazarr reachability
-EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
+EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)
+EN_BAZARR     = _b("ENABLE_BAZARR", False)
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
+EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_PLEX_SCAN  = _b("ENABLE_PLEX_SCAN", False)   # detect + recover a wedged Plex library scan
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # probe library for dead files -> remove + re-search
 
@@ -120,18 +122,26 @@ WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair
 WR_RUN_INTERVAL    = os.environ.get("WESTREPAIR_RUN_INTERVAL", "6h")
 WR_REPAIR_INTERVAL = os.environ.get("WESTREPAIR_REPAIR_INTERVAL", "1m")
 
+# missing_seasons config
+EN_MISSING_SEASONS    = _b("ENABLE_MISSING_SEASONS", False)
+MS_SCRIPT             = os.environ.get("MISSING_SEASONS_SCRIPT", "/app/westrepair/missing_seasons.py")
+MS_RUN_INTERVAL       = os.environ.get("MISSING_SEASONS_RUN_INTERVAL", "6h")
+MS_SEARCH_INTERVAL    = os.environ.get("MISSING_SEASONS_SEARCH_INTERVAL", "30s")
+MS_MIN_AGE_HOURS      = os.environ.get("MISSING_SEASONS_MIN_AGE_HOURS", "1")
+
+# no_upgrade_profile: auto-move ended+complete Sonarr series to a no-upgrade quality profile
+EN_NO_UPGRADE_PROFILE   = _b("ENABLE_NO_UPGRADE_PROFILE", False)
+NO_UPGRADE_PROFILE_ID   = _i("NO_UPGRADE_PROFILE_ID", 0)   # target quality profile id in Sonarr
+NO_UPGRADE_PROFILE_NAME = os.environ.get("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)")
+
 BAZARR_URL    = os.environ.get("BAZARR_URL", "")
 BAZARR_APIKEY = os.environ.get("BAZARR_APIKEY", "")
 
-# seerr (Overseerr / Jellyseerr / Seerr) failed-request auto-retry.
-# When the arr API is briefly slow (e.g. under a heavy search load), seerr's add call times out and
-# it marks the request FAILED - it never auto-retries, so the title silently never reaches the arr.
-# We periodically re-drive those FAILED requests so a transient blip self-heals, with an attempt cap
-# so a genuinely-bad request (dead tmdb id, etc.) doesn't get retried forever.
+# seerr (Overseerr / Jellyseerr / Seerr) failed-request auto-retry
 SEERR_URL       = os.environ.get("SEERR_URL", "")
 SEERR_APIKEY    = os.environ.get("SEERR_APIKEY", "")
-SEERR_MAX       = _i("SEERR_RETRY_MAX", 10)      # max requests retried per sweep (rate-limit the re-adds)
-SEERR_MAX_TRIES = _i("SEERR_MAX_ATTEMPTS", 5)    # give up on a request after this many auto-retries (0 = never give up)
+SEERR_MAX       = _i("SEERR_RETRY_MAX", 10)      # max requests retried per sweep
+SEERR_MAX_TRIES = _i("SEERR_MAX_ATTEMPTS", 5)    # give up after this many auto-retries (0 = never)
 
 # queue check
 MIN_STRIKES   = _i("DOCTOR_MIN_STRIKES", 2)
@@ -246,9 +256,44 @@ if LOG_FILE:
         handlers.append(logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3))
     except Exception:
         pass
+class _ColorFormatter(logging.Formatter):
+    _GREY    = "\033[90m"
+    _GREEN   = "\033[32m"
+    _YELLOW  = "\033[33m"
+    _RED     = "\033[31m"
+    _BRED    = "\033[1;31m"
+    _CYAN    = "\033[36m"
+    _RESET   = "\033[0m"
+    _LEVEL   = {
+        "DEBUG":    "\033[36m",
+        "INFO":     "\033[32m",
+        "WARNING":  "\033[33m",
+        "ERROR":    "\033[31m",
+        "CRITICAL": "\033[1;31m",
+    }
+    def format(self, record):
+        # Let the base class assemble the full message, including exc_info/exc_text/stack_info
+        full  = super().format(record)
+        ts    = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
+        lvl   = record.levelname
+        lc    = self._LEVEL.get(lvl, "")
+        # The base formatter produces "ts | LEVEL | name | msg[\ntraceback]"
+        # We replace only the first line's header; any trailing traceback lines are kept as-is
+        first_line, *rest = full.splitlines()
+        header = (f"{self._GREY}{ts}{self._RESET} "
+                  f"{lc}| {lvl:<7} |{self._RESET} "
+                  f"{self._CYAN}{record.name}{self._RESET} | "
+                  f"{record.getMessage()}")
+        lines = [header] + rest
+        return "\n".join(lines)
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(_ColorFormatter())
+handlers_colored = [_console]
+if len(handlers) > 1:                         # file handler was added
+    handlers_colored.append(handlers[-1])     # keep rotating file handler (no colour)
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-                    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S", handlers=handlers)
+                    handlers=handlers_colored)
 log = logging.getLogger("doctor")
 
 # --------------------------------------------------------------------------- #
@@ -1317,9 +1362,14 @@ _wr_state = {
 }
 _wr_proc = None
 
-_RE_WR_PROCESSING = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] \[(\w+)\] \[DEBUG\] Processing: (.+)')
-_RE_WR_BROKEN     = re.compile(r'\[DEBUG\] .*(broken|missing|not found|unreachable)', re.IGNORECASE)
-_RE_WR_FIXED      = re.compile(r'\[(INFO|SUCCESS)\] .*(search|trigger|fix|repair|restor)', re.IGNORECASE)
+# repair.py prefixes every line with "[datetime] [mode]", e.g.:
+#   [2026-06-19 03:55:00.123456] [symlink] Running repair
+#   [2026-06-19 03:55:00.123456] [symlink] Title: Some Show
+#   [2026-06-19 03:55:00.123456] [symlink] Broken items:
+#   [2026-06-19 03:55:00.123456] [symlink] Searching for new files
+_RE_WR_PROCESSING = re.compile(r'\[[\d\- :\.]+\] \[(\w+)\] Title: (.+)')
+_RE_WR_BROKEN     = re.compile(r'Broken items:', re.IGNORECASE)
+_RE_WR_FIXED      = re.compile(r'Searching for new files|Re-monitoring|season.pack', re.IGNORECASE)
 _RE_WR_SLEEPING   = re.compile(r'[Ss]leeping for ([^\n]+)')
 _RE_WR_START      = re.compile(r'Running repair')
 
@@ -1331,8 +1381,8 @@ def _wr_parse_line(line):
         s["recent_log"].pop(0)
     m = _RE_WR_PROCESSING.search(line)
     if m:
-        s["current_item"] = m.group(3).strip()
-        s["current_mode"] = m.group(2)
+        s["current_mode"] = m.group(1).strip()
+        s["current_item"] = m.group(2).strip()
         s["items_processed"] += 1
         return
     if _RE_WR_BROKEN.search(line):
@@ -1398,33 +1448,297 @@ def check_westrepair():
         log.warning("[westrepair] repair.py not running (exit_code=%s)", s["exit_code"])
 
 
-def _wr_plex_rescan():
-    """Trigger a Plex library refresh for all sections. Returns (ok, message)."""
+# =========================================================================== #
+# missing_seasons - find monitored Sonarr seasons with no files and re-trigger
+# =========================================================================== #
+
+_ms_lock  = threading.Lock()
+_ms_state = {
+    "running": False, "pid": None,
+    "last_run_start": None, "next_run_in": None,
+    "triggered": 0, "skipped": 0,
+    "recent_log": [],
+    "exit_code": None,
+}
+_ms_proc = None
+
+_RE_MS_TRIGGERED = re.compile(r'\[missing_seasons\] \[SUCCESS\].*Triggered search', re.IGNORECASE)
+_RE_MS_SKIP      = re.compile(r'\[missing_seasons\] \[DEBUG\]\s+SKIP', re.IGNORECASE)
+_RE_MS_SLEEP     = re.compile(r'Sleeping for ([^\n]+)')
+_RE_MS_START     = re.compile(r'Starting missing-season scan')
+
+
+def _ms_parse_line(line):
+    s = _ms_state
+    s["recent_log"].append(line.rstrip())
+    if len(s["recent_log"]) > 20:
+        s["recent_log"].pop(0)
+    if _RE_MS_TRIGGERED.search(line):
+        s["triggered"] += 1; s["last_action"] = line.strip(); return
+    if _RE_MS_SKIP.search(line):
+        s["skipped"] += 1; return
+    m = _RE_MS_SLEEP.search(line)
+    if m:
+        s["next_run_in"] = m.group(1).strip(); return
+    if _RE_MS_START.search(line):
+        s["last_run_start"] = line.strip()
+        s["triggered"] = s["skipped"] = 0
+
+
+def missing_seasons_loop(stop):
+    """Run missing_seasons.py as a long-lived subprocess; restart on unexpected exit."""
+    global _ms_proc
+    if not os.path.exists(MS_SCRIPT):
+        log.error("[missing_seasons] script not found: %s", MS_SCRIPT)
+        return
+    log.info("[missing_seasons] starting %s | run_interval=%s search_interval=%s min_age=%sh",
+             MS_SCRIPT, MS_RUN_INTERVAL, MS_SEARCH_INTERVAL, MS_MIN_AGE_HOURS)
+    while not stop.is_set():
+        cmd = ["python", "-u", MS_SCRIPT, "--no-confirm",
+               "--run-interval", MS_RUN_INTERVAL,
+               "--search-interval", MS_SEARCH_INTERVAL,
+               "--min-age-hours", MS_MIN_AGE_HOURS]
+        try:
+            _ms_cwd = os.path.dirname(os.path.abspath(MS_SCRIPT)) or None
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, cwd=_ms_cwd)
+            _ms_proc = proc
+            with _ms_lock:
+                _ms_state.update({"running": True, "pid": proc.pid, "exit_code": None})
+            for line in proc.stdout:
+                log.info("[missing_seasons] %s", line.rstrip())
+                with _ms_lock:
+                    _ms_parse_line(line)
+                if stop.is_set():
+                    break
+            proc.wait()
+            with _ms_lock:
+                _ms_state.update({"running": False, "exit_code": proc.returncode})
+            if stop.is_set():
+                break
+            log.warning("[missing_seasons] exited (code %d), restarting in 30s", proc.returncode)
+            stop.wait(30)
+        except Exception as e:
+            log.error("[missing_seasons] error: %s", e)
+            stop.wait(30)
+    if _ms_proc and _ms_proc.poll() is None:
+        try: _ms_proc.terminate()
+        except Exception: pass
+    log.info("[missing_seasons] stopped")
+
+
+def check_missing_seasons():
+    """No-op periodic check — missing_seasons runs continuously in its own thread."""
+    with _ms_lock:
+        s = dict(_ms_state)
+    if s["running"]:
+        log.debug("[missing_seasons] running pid=%s triggered=%d skipped=%d",
+                  s["pid"], s["triggered"], s["skipped"])
+    else:
+        log.warning("[missing_seasons] not running (exit_code=%s)", s["exit_code"])
+
+
+# =========================================================================== #
+# CHECK: seerr (Overseerr / Jellyseerr / Seerr) - auto-retry FAILED requests
+#
+# seerr hands an approved request to Radarr/Sonarr with a fixed ~10s API timeout
+# and NO retry of its own. If the arr is briefly slow (heavy search load, host
+# contention) the add times out, the request is marked FAILED, and the title
+# silently never lands in the arr. We re-drive those FAILED requests each sweep
+# so a transient blip self-heals; an attempt cap stops us looping on a request
+# that fails for a real reason (dead tmdb id, removed title).
+# =========================================================================== #
+
+class Seerr:
+    def __init__(self, url, apikey):
+        self.base = url.rstrip("/") + "/api/v1"
+        self.apikey = apikey
+
+    def _req(self, method, path, data=None, t=None):
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
+        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+
+    def failed(self):
+        """Requests currently in the FAILED state (seerr could not hand them to the arr)."""
+        try:
+            d = json.load(self._req("GET", "/request?take=100&skip=0&filter=failed&sort=added", t=15))
+            return d.get("results", [])
+        except Exception as e:
+            log.warning("[seerr] failed-list fetch error: %s", str(e)[:80]); return None
+
+    def retry(self, rid):
+        self._req("POST", "/request/%d/retry" % int(rid), data=b"", t=30)
+
+def check_seerr():
+    if not SEERR_URL or not SEERR_APIKEY:
+        return
+    s = Seerr(SEERR_URL, SEERR_APIKEY)
+    reqs = s.failed()
+    if reqs is None:
+        log.error("[seerr] %s unreachable", SEERR_URL); return
+    if not reqs:
+        log.info("[seerr] no failed requests"); return
+    state = _load_state()
+    tries = state.setdefault("__seerr__", {})
+    log.warning("[seerr] %d failed request(s)", len(reqs))
+    acted = 0
+    for r in reqs:
+        if acted >= SEERR_MAX:
+            break
+        rid = r.get("id")
+        if rid is None:
+            continue
+        md = r.get("media") or {}
+        label = "%s tmdb=%s req#%s" % (md.get("mediaType", "?"), md.get("tmdbId", "?"), rid)
+        n = int(tries.get(str(rid), 0))
+        if SEERR_MAX_TRIES and n >= SEERR_MAX_TRIES:
+            log.error("[seerr] giving up on %s after %d retries (persistent failure)", label, n)
+            continue
+        if DRY_RUN:
+            log.info("[seerr] DRY-RUN would retry %s", label); acted += 1; continue
+        try:
+            s.retry(rid)
+            tries[str(rid)] = n + 1
+            acted += 1
+            log.info("[seerr] retried %s (attempt %d)", label, n + 1)
+        except Exception as e:
+            log.warning("[seerr] retry %s failed: %s", label, str(e)[:80])
+    live = set(str(r.get("id")) for r in reqs)
+    for k in [k for k in tries if k not in live]:
+        tries.pop(k, None)
+    _save_state(state)
+    if acted:
+        log.info("[seerr] re-drove %d failed request(s)", acted)
+
+
+def check_no_upgrade_profile():
+    """Find ended Sonarr series that are 100% complete and move them to the no-upgrade profile."""
+    if not EN_NO_UPGRADE_PROFILE:
+        return
+
+    sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
+    if not sonarr_instances:
+        log.warning("[no_upgrade_profile] no Sonarr instances configured")
+        return
+
+    for arr in sonarr_instances:
+        # Resolve target profile id per-instance — each Sonarr may have different profile IDs
+        target_id = NO_UPGRADE_PROFILE_ID
+        try:
+            if not target_id:
+                profiles = json.load(arr._req("GET", "/qualityprofile"))
+                match = next((p for p in profiles if p["name"] == NO_UPGRADE_PROFILE_NAME), None)
+                if not match:
+                    log.warning("[no_upgrade_profile:%s] profile %r not found — skipping", arr.name, NO_UPGRADE_PROFILE_NAME)
+                    continue
+                target_id = match["id"]
+                log.info("[no_upgrade_profile:%s] resolved profile %r -> id %d", arr.name, NO_UPGRADE_PROFILE_NAME, target_id)
+
+            # Fetch all series
+            all_series = json.load(arr._req("GET", "/series"))
+        except Exception as e:
+            log.warning("[no_upgrade_profile:%s] fetch failed: %s", arr.name, e)
+            continue
+
+        to_move = []
+        for s in all_series:
+            if s.get("status") != "ended":
+                continue
+            if s.get("qualityProfileId") == target_id:
+                continue
+            stats = s.get("statistics", {})
+            ep_count  = stats.get("episodeCount", 0)
+            pct       = stats.get("percentOfEpisodes", 0)
+            if ep_count > 0 and pct >= 100:
+                to_move.append(s)
+
+        if not to_move:
+            log.debug("[no_upgrade_profile:%s] no newly completed ended shows found", arr.name)
+            continue
+
+        log.info("[no_upgrade_profile:%s] moving %d completed ended show(s) to profile %d (%s)",
+                 arr.name, len(to_move), target_id, NO_UPGRADE_PROFILE_NAME)
+        moved, failed = 0, 0
+        for s in to_move:
+            try:
+                s["qualityProfileId"] = target_id
+                arr._req("PUT", "/series/%d" % s["id"], data=json.dumps(s).encode())
+                log.info("[no_upgrade_profile:%s] -> %s", arr.name, s["title"])
+                moved += 1
+            except Exception as e:
+                log.warning("[no_upgrade_profile:%s] failed to update %s: %s", arr.name, s["title"], e)
+                failed += 1
+
+        log.info("[no_upgrade_profile:%s] done — moved:%d failed:%d", arr.name, moved, failed)
+
+
+def _plex_sections():
+    """Return list of (key, title) for all Plex library sections. Raises on error."""
+    import xml.etree.ElementTree as ET
     plex_url   = os.environ.get("PLEX_URL", "").rstrip("/")
     plex_token = os.environ.get("PLEX_TOKEN", "")
     if not plex_url or not plex_token:
-        return False, "PLEX_URL or PLEX_TOKEN not set"
-    # Get library sections
-    sections_url = "%s/library/sections?X-Plex-Token=%s" % (plex_url, plex_token)
+        raise ValueError("PLEX_URL or PLEX_TOKEN not set")
+    with urllib.request.urlopen(
+            urllib.request.Request("%s/library/sections?X-Plex-Token=%s" % (plex_url, plex_token)),
+            timeout=10) as r:
+        root = ET.fromstring(r.read())
+    sections = [(d.get("key"), d.get("title", d.get("key")))
+                for d in root.findall("Directory") if d.get("key")]
+    if not sections:
+        raise ValueError("no library sections found")
+    return plex_url, plex_token, sections
+
+
+def _wr_plex_rescan():
+    """Trigger a Plex library scan (refresh) for all sections. Returns (ok, message)."""
     try:
-        with urllib.request.urlopen(urllib.request.Request(sections_url), timeout=10) as r:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(r.read())
+        plex_url, plex_token, sections = _plex_sections()
     except Exception as e:
-        return False, "could not fetch sections: %s" % str(e)[:80]
-    keys = [d.get("key") for d in root.findall(".//Directory") if d.get("key")]
-    if not keys:
-        return False, "no library sections found"
-    triggered = []
-    for key in keys:
-        scan_url = "%s/library/sections/%s/refresh?X-Plex-Token=%s" % (plex_url, key, plex_token)
+        return False, str(e)
+    ok, failed = [], []
+    for key, title in sections:
         try:
-            urllib.request.urlopen(urllib.request.Request(scan_url), timeout=10)
-            triggered.append(key)
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    "%s/library/sections/%s/refresh?X-Plex-Token=%s" % (plex_url, key, plex_token),
+                    method="GET"),
+                timeout=10)
+            ok.append(title)
         except Exception as e:
-            log.warning("[westrepair] plex scan section %s failed: %s", key, e)
-    log.info("[westrepair] triggered Plex rescan for %d section(s): %s", len(triggered), triggered)
-    return True, "triggered %d section(s)" % len(triggered)
+            log.warning("[plex] rescan section %s (%s) failed: %s", key, title, e)
+            failed.append(title)
+    msg = "rescanned %d section(s): %s" % (len(ok), ", ".join(ok))
+    if failed:
+        msg += " | failed: %s" % ", ".join(failed)
+    log.info("[plex] %s", msg)
+    return len(failed) == 0, msg
+
+
+def _plex_empty_trash():
+    """Empty trash in all Plex library sections. Returns (ok, message)."""
+    try:
+        plex_url, plex_token, sections = _plex_sections()
+    except Exception as e:
+        return False, str(e)
+    ok, failed = [], []
+    for key, title in sections:
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    "%s/library/sections/%s/emptyTrash?X-Plex-Token=%s" % (plex_url, key, plex_token),
+                    method="PUT"),
+                timeout=10)
+            ok.append(title)
+        except Exception as e:
+            log.warning("[plex] empty trash section %s (%s) failed: %s", key, title, e)
+            failed.append(title)
+    msg = "emptied trash for %d section(s): %s" % (len(ok), ", ".join(ok))
+    if failed:
+        msg += " | failed: %s" % ", ".join(failed)
+    log.info("[plex] %s", msg)
+    return len(failed) == 0, msg
 
 
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
@@ -1472,6 +1786,10 @@ UI_SCHEMA = [
               ("REPAIR_MIN_STRIKES", "3"), ("REPAIR_MAX_SCAN", "200"), ("REPAIR_MAX_ACTIONS", "5"),
               ("REPAIR_READ_TIMEOUT", "20"), ("REPAIR_RECHECK", "12h"), ("REPAIR_LOAD_MAX", "0"),
               ("REPAIR_FFPROBE", "false")]),
+    ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
+              ("NO_UPGRADE_PROFILE_ID", "0")]),
+    ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
+              ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
@@ -1480,8 +1798,6 @@ UI_SCHEMA = [
               ("WARMER_ONDECK", "true|false"), ("WARMER_MAX_PER_CYCLE", "40"), ("WARMER_NEXT_EPISODES", "1"),
               ("WARMER_COOLDOWN", "3600"), ("WARMER_LOAD_MAX", "0")]),
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
-    ("Seerr (failed-request retry)", [("SEERR_URL", "http://seerr:5055"), ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
-    ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"), ("NO_UPGRADE_PROFILE_ID", "0")]),
 ]
 UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
 
@@ -1538,6 +1854,13 @@ def _ui_westrepair():
         s = dict(_wr_state)
         s["recent_log"] = list(_wr_state["recent_log"])
     s["enabled"] = EN_WESTREPAIR
+    return s
+
+def _ui_missing_seasons():
+    with _ms_lock:
+        s = dict(_ms_state)
+        s["recent_log"] = list(_ms_state["recent_log"])
+    s["enabled"] = EN_MISSING_SEASONS
     return s
 
 def _ui_config():
@@ -1610,6 +1933,10 @@ pre{background:#010409;border:1px solid var(--bd);border-radius:8px;padding:12px
 <div id=dash>
  <div class=card><h3>Checks</h3><div class=grid id=checks></div></div>
  <div class=card><h3>Monitored services</h3><div id=health></div></div>
+ <div class=card id=plex-card style=display:none><h3>Plex</h3><div id=plex-btns style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+  <button class=act onclick=plexRescan(this)>&#x21bb; Rescan Libraries</button>
+  <button class=act onclick=plexEmptyTrash(this)>&#x1f5d1; Empty Trash</button>
+ </div><div id=plex-msg style="margin-top:8px;font-size:12px;color:var(--mut)"></div></div>
  <div class=card><h3>Warmer</h3><div id=warm></div></div>
  <div class=card id=wr-card style=display:none><h3>Westrepair</h3><div id=wr></div></div>
 </div>
@@ -1657,11 +1984,22 @@ function loadDash(){
   var logOpen=E('wr-log')&&E('wr-log').open;
   if(w.recent_log&&w.recent_log.length){h+='<details id=wr-log style="margin-top:8px"'+(logOpen?' open':'')+'><summary style="cursor:pointer;color:var(--mut);font-size:12px">recent log ('+w.recent_log.length+' lines)</summary>';
    h+='<pre id=wr-logpre style="margin-top:6px;max-height:340px;font-size:11px">'+esc(w.recent_log.join('\n'))+'</pre></details>'}
-  h+='<div style="margin-top:10px"><button class=act onclick=plexRescan()>Plex Rescan</button></div>';
   E('wr').innerHTML=h;
   var lp=E('wr-logpre');if(lp)lp.scrollTop=lp.scrollHeight;});
+ fetch(q('/api/health')).then(function(r){return r.json()}).then(function(a){
+  var plexUp=a.some(function(s){return s.name==='plex'&&s.up});
+  E('plex-card').style.display=plexUp?'':'none';});
 }
-function plexRescan(){fetch(q('/api/westrepair/rescan'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){toast(r.msg||'triggered')})}
+function plexRescan(btn){
+ btn.disabled=true;btn.textContent='Rescanning...';
+ fetch(q('/api/plex/rescan'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){
+  toast(r.msg||'done');E('plex-msg').textContent=r.msg||'';btn.disabled=false;btn.textContent='\u21bb Rescan Libraries';
+ }).catch(function(e){toast('error: '+e);btn.disabled=false;btn.textContent='\u21bb Rescan Libraries';})}
+function plexEmptyTrash(btn){
+ btn.disabled=true;btn.textContent='Emptying...';
+ fetch(q('/api/plex/emptytrash'),{method:'POST'}).then(function(r){return r.json()}).then(function(r){
+  toast(r.msg||'done');E('plex-msg').textContent=r.msg||'';btn.disabled=false;btn.textContent='\ud83d\uddd1 Empty Trash';
+ }).catch(function(e){toast('error: '+e);btn.disabled=false;btn.textContent='\ud83d\uddd1 Empty Trash';})}
 function loadConfig(){fetch(q('/api/config')).then(function(r){return r.json()}).then(function(c){
   var h='';for(var g=0;g<c.groups.length;g++){var grp=c.groups[g];h+='<div class=card><h3>'+esc(grp.group)+'</h3><div class=cfg>';
    for(var i=0;i<grp.rows.length;i++){var r=grp.rows[i];h+='<div><label>'+esc(r.key)+'</label>';
@@ -1708,8 +2046,9 @@ def _build_server(port):
             if path == "/api/status":  return self._send(200, "application/json", json.dumps(_ui_status()))
             if path == "/api/health":  return self._send(200, "application/json", json.dumps(_ui_health()))
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
-            if path == "/api/westrepair":  return self._send(200, "application/json", json.dumps(_ui_westrepair()))
-            if path == "/api/config":      return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/westrepair":       return self._send(200, "application/json", json.dumps(_ui_westrepair()))
+            if path == "/api/missing_seasons":  return self._send(200, "application/json", json.dumps(_ui_missing_seasons()))
+            if path == "/api/config":           return self._send(200, "application/json", json.dumps(_ui_config()))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300
@@ -1719,15 +2058,19 @@ def _build_server(port):
             path = urlparse(self.path).path
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
-            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan"):
+            if path in ("/api/config", "/api/restart", "/api/westrepair/rescan",
+                        "/api/plex/rescan", "/api/plex/emptytrash"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
                 if path == "/api/config":
                     ok, msg = _ui_save(body)
                     return self._send(200 if ok else 400, "application/json", json.dumps({"ok": ok, "msg": msg}))
-                if path == "/api/westrepair/rescan":
-                    threading.Thread(target=lambda: _wr_plex_rescan(), daemon=True).start()
-                    return self._send(200, "application/json", json.dumps({"ok": True, "msg": "Plex rescan triggered"}))
+                if path in ("/api/westrepair/rescan", "/api/plex/rescan"):
+                    threading.Thread(target=_wr_plex_rescan, daemon=True).start()
+                    return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex rescan started"}))
+                if path == "/api/plex/emptytrash":
+                    threading.Thread(target=_plex_empty_trash, daemon=True).start()
+                    return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex empty trash started"}))
                 self._send(200, "application/json", json.dumps({"ok": True, "msg": "restarting"}))
                 log.info("[ui] restart requested"); threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
                 return
@@ -1761,8 +2104,8 @@ def main():
         log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_PLEX_SCAN / "
                   "ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_REPAIR / ENABLE_WARMER / ENABLE_UI.")
         sys.exit(2)
-    log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
-             VERSION, MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
+    log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s", VERSION,
+             MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
              ", ".join(a.name for a in INSTANCES) or "-", DRY_RUN)
 
     stop = threading.Event()
@@ -1776,6 +2119,9 @@ def main():
 
     if EN_WESTREPAIR:
         threading.Thread(target=westrepair_loop, args=(stop,), daemon=True).start()
+
+    if EN_MISSING_SEASONS:
+        threading.Thread(target=missing_seasons_loop, args=(stop,), daemon=True).start()
 
     # http server(s): arr webhooks (event mode) and/or the web dashboard (ENABLE_UI)
     servers, wanted = [], {}
