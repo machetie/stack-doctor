@@ -218,7 +218,7 @@ JAN_LIBS      = [p.strip() for p in os.environ.get("JANITOR_LIBRARY_PATHS", "").
 JAN_LOG       = os.environ.get("JANITOR_DECYPHARR_LOG", "")         # log file path
 JAN_LOG_CMD   = os.environ.get("JANITOR_LOG_CMD", "")               # cmd printing the log, e.g. "journalctl -u decypharr -n 10000 --no-hostname"
 JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
-JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing").split(",")
+JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing,marked as bad").split(",")
 
 # repair: walk the library, probe media files for unreadable/0-byte/dead-symlink (a dead debrid link or
 # a usenet article gone). A file must fail REPAIR_MIN_STRIKES consecutive probes before it is acted on,
@@ -767,11 +767,18 @@ def check_janitor():
             data = open(JAN_LOG, errors="ignore").read()[-2_000_000:]
     except Exception as e:
         log.warning("[janitor] cannot read log: %s", e); return
-    pat = re.compile(r"Error streaming file: (.+?) error=\"([^\"]*)\"")
-    for m in pat.finditer(data):
+    # Pattern 1: [webdav] Error streaming file: <path> error="<msg>"
+    # Catches: ARTICLE_NOT_FOUND, still missing, marked as bad, etc.
+    pat_stream = re.compile(r"Error streaming file: (.+?) error=\"([^\"]*)\"")
+    for m in pat_stream.finditer(data):
         path, err = m.group(1), m.group(2)
         if any(p.strip() and p.strip() in err for p in JAN_PATTERNS):
             bad.add(path.strip().split("/")[0])
+    # Pattern 2: [link] Giving up on entry ... filename=<name> reason=empty_link
+    # Catches: empty_link / all re-insertion attempts exhausted (the only give-up lines that carry a filename)
+    pat_filename = re.compile(r"(?:Giving up on entry|empty_link).*?\bfilename=(\S+)")
+    for m in pat_filename.finditer(data):
+        bad.add(m.group(1).split("/")[0])
     if not bad:
         log.debug("[janitor] no dead releases in log tail"); return
     moved = 0
