@@ -29,9 +29,11 @@ container, everything configured by env vars.
 | **plexscan** | a Plex library scan wedged with no progress (usually a hung mount) | restarts the hung mount, cancels the stuck scan, last-resort `PLEX_RESTART_CMD` |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
-| **repair** | dead library files (debrid link / usenet article gone), unreadable or 0-byte | removes the dead file record + re-searches the owning *arr (strike-gated, mount-safe) |
+| **repair** | dead library files (debrid link / usenet article gone), unreadable or 0-byte; optionally MissingFromDisk history entries (usenet/direct downloads) | removes the dead file record + re-searches the owning *arr (strike-gated, mount-safe, SeasonSearch-first) |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
+| **missing_seasons** | monitored Sonarr seasons that have been around long enough but have zero episode files | triggers a `SeasonSearch` so Sonarr re-tries (cooldown-gated, action-capped) |
+| **no_upgrade_profile** | ended + fully-collected Sonarr series still on an upgrading quality profile | moves them to a no-upgrade profile so Sonarr stops searching for a better copy |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |
 
 Safe by design: risky actions (restart, drop_caches) are **opt-in**, the queue fixer only
@@ -205,6 +207,64 @@ real reason (dead TMDB id, removed title).
 | `SEERR_MAX_ATTEMPTS` | `5` | give up on a request after this many auto-retries (`0` = never give up) |
 
 Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
+
+### Repair (dead-file re-grab)
+
+`repair` walks your library on every sweep, probes each media file to confirm it is readable, and re-grabs anything that has failed `REPAIR_MIN_STRIKES` consecutive probes. A file must fail repeatedly before any action is taken — one hung read could be a transient mount hiccup. When many files fail at once (`REPAIR_SYSTEMIC_PCT`) or failures streak back-to-back (`REPAIR_ABORT_STREAK`) repair aborts and leaves recovery to the `decypharr`/`plexscan` checks, so it can never mass-delete during an outage.
+
+**Two detection modes** (both feed the same re-grab action):
+
+- **Filesystem probe** (always on when `ENABLE_REPAIR=true`): reads the first bytes of each file; catches dead debrid symlinks, gone usenet articles, 0-byte files, unreadable corrupt files.
+- **MissingFromDisk history** (`REPAIR_MISSING_FROM_DISK=true`): queries Sonarr/Radarr download history for items the arr knows are missing from disk (`reason=MissingFromDisk`). Catches files that were never symlinks (usenet direct downloads, files removed by an external tool). Useful when you want doctor to cover a standard usenet stack.
+
+**Re-search priority** (Sonarr): `SeasonSearch` first (gives Sonarr the chance to grab a season pack), then `EpisodeSearch`, then `SeriesSearch` as last resort.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_REPAIR` | `false` | turn the check on (needs `REPAIR_LIBRARY_PATHS`) |
+| `REPAIR_LIBRARY_PATHS` | *(none)* | comma-separated library roots to walk, e.g. `/mnt/library/movies,/mnt/library/tv` |
+| `REPAIR_MIN_STRIKES` | `3` | consecutive failed probes before a file is considered dead |
+| `REPAIR_MAX_SCAN` | `200` | files probed per sweep (rotates through the library) |
+| `REPAIR_MAX_ACTIONS` | `5` | re-grabs per sweep across all modes (filesystem + MissingFromDisk + season-pack) |
+| `REPAIR_READ_TIMEOUT` | `20` | seconds before abandoning a single file probe (hung-mount guard) |
+| `REPAIR_RECHECK` | `12h` | don't re-probe a known-good file more often than this |
+| `REPAIR_LOAD_MAX` | `0` | skip the sweep when host 1-min load exceeds this (`0` = off) |
+| `REPAIR_ABORT_STREAK` | `6` | consecutive probe failures → assume hung mount, abort sweep |
+| `REPAIR_SYSTEMIC_PCT` | `25` | if ≥ this % of probed files fail, treat as systemic and don't act |
+| `REPAIR_FFPROBE` | `false` | also ffprobe the stream (deeper corruption check; needs `ffprobe` in the image) |
+| `REPAIR_DEBRID_MOUNT` | *(none)* | debrid mount root (e.g. `/mnt/remote/realdebrid/__all__`); if set, skip the sweep when the mount is empty or missing (debrid-down guard) |
+| `REPAIR_ITEM_INTERVAL` | `0` | seconds to wait between each re-grab action (`0` = no delay) |
+| `REPAIR_SEASON_PACKS` | `false` | after the dead-file sweep, flag Sonarr seasons whose files span multiple directories (individual episode grabs instead of a season pack) and trigger a `SeasonSearch` |
+| `REPAIR_UNMONITORED` | `false` | include unmonitored series/movies in both the filesystem and MissingFromDisk sweeps |
+| `REPAIR_MISSING_FROM_DISK` | `false` | also scan *arr history for `MissingFromDisk` entries and re-search (usenet / direct-download mode) |
+| `REPAIR_MFD_RECHECK` | `24h` | cooldown before re-searching the same MissingFromDisk item |
+
+Honors `DOCTOR_DRY_RUN`.
+
+### Missing seasons
+
+`missing_seasons` walks all monitored Sonarr series and finds seasons that have been around long enough (`MISSING_SEASONS_MIN_AGE_HOURS`) but still have zero episode files. It triggers a `SeasonSearch` for each, with a per-season cooldown to avoid hammering the same season every sweep.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_MISSING_SEASONS` | `false` | turn the check on (needs a Sonarr instance) |
+| `MISSING_SEASONS_MIN_AGE_HOURS` | `1` | ignore seasons added less than this long ago (gives Sonarr time to grab normally) |
+| `MISSING_SEASONS_MAX_ACTIONS` | `5` | max `SeasonSearch` commands per sweep |
+| `MISSING_SEASONS_RECHECK` | `24h` | cooldown before re-searching the same season |
+
+Honors `DOCTOR_DRY_RUN`.
+
+### No-upgrade profile
+
+`no_upgrade_profile` moves ended Sonarr series that are fully collected (all monitored episodes have files) onto a no-upgrade quality profile so Sonarr stops burning indexer quota searching for a better copy that will never come.
+
+| var | default | meaning |
+|---|---|---|
+| `ENABLE_NO_UPGRADE_PROFILE` | `false` | turn the check on (needs a Sonarr instance) |
+| `NO_UPGRADE_PROFILE_NAME` | `WEB-1080p (No Upgrade)` | exact name of the quality profile to move qualifying series to (must already exist in Sonarr) |
+| `NO_UPGRADE_PROFILE_ID` | `0` | use the profile's numeric ID instead of its name (`0` = resolve by name) |
+
+Honors `DOCTOR_DRY_RUN`.
 
 ### Instances
 
