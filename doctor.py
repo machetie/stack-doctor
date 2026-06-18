@@ -1019,12 +1019,16 @@ def _sonarr_resolve(arr, series, fp, include_unmonitored=False):
     if not include_unmonitored and not ser.get("monitored", True):
         return None
     sid = ser.get("id")
+    all_eps = arr.episodes(sid)
     efid = next((ef.get("id") for ef in arr.episode_files(sid) if ef.get("path") == fp), None)
     if not efid:
         return None
-    epids = [e.get("id") for e in arr.episodes(sid)
-             if e.get("episodeFileId") == efid and (include_unmonitored or e.get("monitored", True))]
-    return (sid, efid, epids, (ser.get("title") or "")[:60])
+    matched_eps = [e for e in all_eps
+                   if e.get("episodeFileId") == efid and (include_unmonitored or e.get("monitored", True))]
+    epids = [e.get("id") for e in matched_eps]
+    # season number — all matched episodes belong to the same file, so take the first
+    season_number = matched_eps[0].get("seasonNumber") if matched_eps else None
+    return (sid, efid, epids, season_number, (ser.get("title") or "")[:60])
 
 def _sonarr_season_pack_check(arr, series):
     """Yield (series_title, season_number, arr) for any fully-available sonarr season whose episode
@@ -1080,12 +1084,15 @@ def _repair_one(fp, caches):
         elif arr.kind == "sonarr":
             hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp, REPAIR_UNMONITORED)
             if hit:
-                sid, efid, epids, title = hit
+                sid, efid, epids, season_number, title = hit
                 if DRY_RUN:
                     log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
                 if efid:
                     arr.delete_file(efid)
-                if epids:
+                # prefer SeasonSearch (finds a season pack if available) then fall back to EpisodeSearch
+                if season_number:
+                    arr.command("SeasonSearch", seriesId=sid, seasonNumber=season_number)
+                elif epids:
                     arr.command("EpisodeSearch", episodeIds=epids)
                 else:
                     arr.command("SeriesSearch", seriesId=sid)
