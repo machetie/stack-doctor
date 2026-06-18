@@ -132,6 +132,8 @@ services:
       # REPAIR_ITEM_INTERVAL: "0"    # seconds to wait between each re-grab (0 = no delay; gentle on providers)
       # REPAIR_SEASON_PACKS: "false" # flag sonarr seasons spread across multiple dirs and search for a season pack
       # REPAIR_UNMONITORED: "false"  # include unmonitored series/movies in the repair sweep
+      # REPAIR_MISSING_FROM_DISK: "false" # also scan *arr history for MissingFromDisk items and re-search (usenet/direct downloads)
+      # REPAIR_MFD_RECHECK: "24h"         # cooldown before re-searching the same MissingFromDisk item
 
       # ---------- missing_seasons (ENABLE_MISSING_SEASONS: find sonarr seasons with 0 files -> SeasonSearch) ----------
       # MISSING_SEASONS_MIN_AGE_HOURS: "1"  # ignore seasons added less than this long ago (avoid triggering on new shows)

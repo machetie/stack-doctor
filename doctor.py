@@ -245,6 +245,11 @@ REPAIR_DEBRID_MOUNT     = os.environ.get("REPAIR_DEBRID_MOUNT", "")  # debrid mo
 REPAIR_ITEM_INTERVAL    = _dur(os.environ.get("REPAIR_ITEM_INTERVAL", "0"), 0)  # seconds to wait between each re-grab (0=off)
 REPAIR_SEASON_PACKS     = _b("REPAIR_SEASON_PACKS", False)   # flag sonarr seasons spread across multiple dirs (non-season-pack)
 REPAIR_UNMONITORED      = _b("REPAIR_UNMONITORED", False)    # include unmonitored series/movies in the repair sweep
+# MissingFromDisk mode: query *arr download history for items Sonarr/Radarr knows are missing from disk
+# (reason=MissingFromDisk) and re-trigger a search. Complements the filesystem probe for usenet/direct
+# downloads where no symlink exists to probe. Shares REPAIR_MAX_ACTIONS budget with the symlink sweep.
+REPAIR_MISSING_FROM_DISK = _b("REPAIR_MISSING_FROM_DISK", False)  # enable history-based missing-file re-grab
+REPAIR_MFD_RECHECK       = _dur(os.environ.get("REPAIR_MFD_RECHECK", "24h"), 86400)  # cooldown per item before re-searching
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -458,6 +463,17 @@ class Arr:
             self._req("POST", "/command", data=json.dumps(body).encode()); return True
         except Exception as e:
             log.warning("[%s] command %s failed: %s", self.name, name, str(e)[:70]); return False
+
+    def history(self, media_id, page_size=100):
+        """Fetch download history for a specific series (sonarr) or movie (radarr).
+        Returns a list of history records, each with eventType, sourceTitle, data dict, etc."""
+        if self.kind == "sonarr":
+            path = "/history/series?seriesId=%d&pageSize=%d&includeSeries=false&includeEpisode=true" % (media_id, page_size)
+        elif self.kind == "radarr":
+            path = "/history/movie?movieId=%d&pageSize=%d" % (media_id, page_size)
+        else:
+            return []
+        return self._jget(path) or []
 
 def load_instances():
     out = []
@@ -1066,6 +1082,72 @@ def _sonarr_season_pack_check(arr, series):
             if len(parent_dirs) > 1:
                 yield title, sn, sid, arr
 
+def _missing_from_disk_check(state, acted, budget):
+    """Query *arr download history for items with reason=MissingFromDisk and re-trigger searches.
+    This catches files that Sonarr/Radarr knows are gone but which have no on-disk symlink to probe
+    (e.g. usenet direct downloads, or files cleaned up by an external tool). Shares the REPAIR_MAX_ACTIONS
+    budget with the filesystem sweep so the two modes together never exceed the cap in one sweep."""
+    mfd = state.setdefault("__repair_mfd__", {})
+    now = time.time()
+    for arr in INSTANCES:
+        if arr.kind not in ("sonarr", "radarr") or budget <= 0:
+            break
+        try:
+            all_media = arr.series() if arr.kind == "sonarr" else arr.movies()
+        except Exception as e:
+            log.warning("[repair:mfd:%s] failed to fetch media list: %s", arr.name, str(e)[:60]); continue
+        for item in all_media:
+            if budget <= 0:
+                break
+            if not item.get("monitored") and not REPAIR_UNMONITORED:
+                continue
+            mid = item.get("id")
+            title = (item.get("title") or "")[:60]
+            try:
+                records = arr.history(mid)
+            except Exception as e:
+                log.warning("[repair:mfd:%s] history fetch failed for %s: %s", arr.name, title, str(e)[:60]); continue
+            # sonarr returns a list directly; radarr wraps in {"records": [...]}
+            if isinstance(records, dict):
+                records = records.get("records") or []
+            # find the most recent grabbed record that is now MissingFromDisk
+            # group by season (sonarr) or movie so we only search once per parent
+            searched = set()
+            for rec in records:
+                if rec.get("eventType") != "grabbed":
+                    continue
+                data = rec.get("data") or {}
+                if data.get("reason") != "MissingFromDisk":
+                    continue
+                if arr.kind == "sonarr":
+                    ep = rec.get("episode") or {}
+                    season_number = ep.get("seasonNumber")
+                    series_id = ep.get("seriesId") or mid
+                    key = "%s:%d:s%s" % (arr.name, series_id, season_number)
+                else:
+                    key = "%s:%d" % (arr.name, mid)
+                if key in searched:
+                    continue
+                if now - mfd.get(key, 0) < REPAIR_MFD_RECHECK:
+                    continue                                  # searched recently, wait for cooldown
+                if budget <= 0:
+                    break
+                if DRY_RUN:
+                    log.info("[repair:mfd:%s] DRY-RUN would re-search MissingFromDisk: %s", arr.name, title)
+                    mfd[key] = now; searched.add(key); acted += 1; budget -= 1; continue
+                if arr.kind == "sonarr" and season_number is not None:
+                    arr.command("SeasonSearch", seriesId=series_id, seasonNumber=season_number)
+                    log.warning("[repair:mfd:%s] MissingFromDisk -> SeasonSearch: %s S%02d", arr.name, title, season_number)
+                elif arr.kind == "radarr":
+                    arr.command("MoviesSearch", movieIds=[mid])
+                    log.warning("[repair:mfd:%s] MissingFromDisk -> MoviesSearch: %s", arr.name, title)
+                else:
+                    continue
+                mfd[key] = now; searched.add(key); acted += 1; budget -= 1
+                if REPAIR_ITEM_INTERVAL > 0:
+                    time.sleep(REPAIR_ITEM_INTERVAL)
+    return acted
+
 def _repair_one(fp, caches):
     """Map a dead file to its *arr item, delete the (dead) file record, and trigger a fresh search.
     The blocklist/churn handling on the queue side then keeps it from re-grabbing the same dead release."""
@@ -1175,6 +1257,11 @@ def check_repair():
                     sp_budget -= 1
                     if REPAIR_ITEM_INTERVAL > 0:
                         time.sleep(REPAIR_ITEM_INTERVAL)
+    # MissingFromDisk check: query *arr history for items Sonarr/Radarr knows are gone from disk.
+    # Runs after the filesystem sweep so both modes share the REPAIR_MAX_ACTIONS budget.
+    if REPAIR_MISSING_FROM_DISK and acted < REPAIR_MAX_ACTIONS:
+        acted = _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
+        _save_state(state)
 
 # =========================================================================== #
 # WARMER: precache the head of likely-next media so playback starts instantly
@@ -1759,7 +1846,8 @@ UI_SCHEMA = [
               ("REPAIR_READ_TIMEOUT", "20"), ("REPAIR_RECHECK", "12h"), ("REPAIR_LOAD_MAX", "0"),
               ("REPAIR_FFPROBE", "false"), ("REPAIR_DEBRID_MOUNT", ""),
               ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
-              ("REPAIR_UNMONITORED", "false")]),
+              ("REPAIR_UNMONITORED", "false"),
+              ("REPAIR_MISSING_FROM_DISK", "false"), ("REPAIR_MFD_RECHECK", "24h")]),
     ("Missing Seasons", [("MISSING_SEASONS_MIN_AGE_HOURS", "1"), ("MISSING_SEASONS_MAX_ACTIONS", "5"),
               ("MISSING_SEASONS_RECHECK", "24h")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
