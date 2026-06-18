@@ -219,6 +219,8 @@ Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 
 **Re-search priority** (Sonarr): `SeasonSearch` first (gives Sonarr the chance to grab a season pack), then `EpisodeSearch`, then `SeriesSearch` as last resort.
 
+**Post-repair verification** (`REPAIR_VERIFY=true`): after each re-search, doctor stores the command ID and a timestamp. On the next sweep it polls the search command status, then checks *arr download history for a new `grabbed` event. When a grab is confirmed it logs the indexer and exact release name (`[repair:verify] GRABBED 'Show Name' via NZBgeek: Show.S01E01.1080p...`). If no grab appears within `REPAIR_VERIFY_DEADLINE` it logs a warning so you know the search stalled. This is sweep-based (checked once per `DOCTOR_INTERVAL`), not real-time.
+
 | var | default | meaning |
 |---|---|---|
 | `ENABLE_REPAIR` | `false` | turn the check on (needs `REPAIR_LIBRARY_PATHS`) |
@@ -238,6 +240,8 @@ Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 | `REPAIR_UNMONITORED` | `false` | include unmonitored series/movies in both the filesystem and MissingFromDisk sweeps |
 | `REPAIR_MISSING_FROM_DISK` | `false` | also scan *arr history for `MissingFromDisk` entries and re-search (usenet / direct-download mode) |
 | `REPAIR_MFD_RECHECK` | `24h` | cooldown before re-searching the same MissingFromDisk item |
+| `REPAIR_VERIFY` | `false` | after triggering a re-search, track the command ID and watch *arr history for a new `grabbed` event; logs the indexer name and release title when confirmed, or warns if no grab lands before the deadline |
+| `REPAIR_VERIFY_DEADLINE` | `4h` | give up waiting for a grab confirmation after this long |
 
 Honors `DOCTOR_DRY_RUN`.
 

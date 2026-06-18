@@ -250,6 +250,12 @@ REPAIR_UNMONITORED      = _b("REPAIR_UNMONITORED", False)    # include unmonitor
 # downloads where no symlink exists to probe. Shares REPAIR_MAX_ACTIONS budget with the symlink sweep.
 REPAIR_MISSING_FROM_DISK = _b("REPAIR_MISSING_FROM_DISK", False)  # enable history-based missing-file re-grab
 REPAIR_MFD_RECHECK       = _dur(os.environ.get("REPAIR_MFD_RECHECK", "24h"), 86400)  # cooldown per item before re-searching
+# Post-repair verification: after triggering a search, track the command ID and watch *arr history
+# for a new 'grabbed' event to confirm the re-search actually produced a new grab. Results are logged
+# so you can tell whether re-searches are landing. Verification state lives in __repair_verify__ in
+# state.json and is checked at the start of each repair sweep (sweep-based, not real-time).
+REPAIR_VERIFY            = _b("REPAIR_VERIFY", False)              # enable post-repair grab verification
+REPAIR_VERIFY_DEADLINE   = _dur(os.environ.get("REPAIR_VERIFY_DEADLINE", "4h"), 14400)  # give up after this long
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -458,11 +464,39 @@ class Arr:
             log.warning("[%s] delete file %s failed: %s", self.name, file_id, str(e)[:70]); return False
 
     def command(self, name, **kw):
+        """POST /command and return the command ID (int) on success, or None on failure."""
         body = {"name": name}; body.update(kw)
         try:
-            self._req("POST", "/command", data=json.dumps(body).encode()); return True
+            resp = json.load(self._req("POST", "/command", data=json.dumps(body).encode()))
+            return resp.get("id") or True          # return id if present, else True for compat
         except Exception as e:
-            log.warning("[%s] command %s failed: %s", self.name, name, str(e)[:70]); return False
+            log.warning("[%s] command %s failed: %s", self.name, name, str(e)[:70]); return None
+
+    def command_status(self, command_id):
+        """Poll GET /command/{id}. Returns the status string, or None on error."""
+        try:
+            resp = json.load(self._req("GET", "/command/%d" % command_id))
+            return resp.get("status")
+        except Exception:
+            return None
+
+    def history_grabbed(self, media_id, since_ts, entity_ids=None):
+        """Return the most recent 'grabbed' history record for media_id posted after since_ts.
+        For sonarr, optionally filter to specific episode IDs. Returns None if nothing found."""
+        records = self.history(media_id, page_size=50)
+        if isinstance(records, dict):
+            records = records.get("records") or []
+        for rec in records:
+            if rec.get("eventType") != "grabbed":
+                continue
+            # history dates are ISO8601; string compare works for 'after' check
+            if rec.get("date", "") <= since_ts:
+                continue
+            if entity_ids and self.kind == "sonarr":
+                if rec.get("episodeId") not in entity_ids:
+                    continue
+            return rec
+        return None
 
     def history(self, media_id, page_size=100):
         """Fetch download history for a specific series (sonarr) or movie (radarr).
@@ -1148,7 +1182,77 @@ def _missing_from_disk_check(state, acted, budget):
                     time.sleep(REPAIR_ITEM_INTERVAL)
     return acted
 
-def _repair_one(fp, caches):
+def _repair_verify_pending(state):
+    """Check any in-flight repair searches from previous sweeps.
+    State entry per pending item (keyed by '<arr_name>:<title_slug>'):
+      {cmd_id, media_id, entity_ids, kind, title, search_ts, arr_name}
+    Flow per item each sweep:
+      1. If command_id present, poll /command/{id} — log when done/failed.
+      2. Poll /history for a new 'grabbed' event after search_ts.
+      3. On confirmed grab: log indexer + sourceTitle, remove from pending.
+      4. On deadline exceeded without grab: log warning, remove from pending.
+    """
+    pv = state.setdefault("__repair_verify__", {})
+    if not pv:
+        return
+    now = time.time()
+    arr_map = {a.name: a for a in INSTANCES}
+    expired = []
+    for key, v in list(pv.items()):
+        arr = arr_map.get(v.get("arr_name"))
+        if not arr:
+            expired.append(key); continue
+        title    = v.get("title", key)
+        search_ts = v.get("search_ts", "")
+        deadline  = v.get("deadline", 0)
+        cmd_id    = v.get("cmd_id")
+        media_id  = v.get("media_id")
+        entity_ids = v.get("entity_ids") or []
+
+        # step 1: poll command status if we haven't confirmed it finished yet
+        if cmd_id and not v.get("cmd_done"):
+            status = arr.command_status(cmd_id)
+            if status in ("completed", "failed", "aborted"):
+                log.info("[repair:verify:%s] search command %s: %s", arr.name, cmd_id, status)
+                v["cmd_done"] = True
+            elif status is None:
+                v["cmd_done"] = True          # endpoint gone, assume finished
+
+        # step 2: check history for a new grab
+        if media_id:
+            rec = arr.history_grabbed(media_id, search_ts, entity_ids if arr.kind == "sonarr" else None)
+            if rec:
+                src     = rec.get("sourceTitle") or "?"
+                indexer = (rec.get("data") or {}).get("indexer") or "?"
+                log.warning("[repair:verify:%s] GRABBED '%s' via %s: %s", arr.name, title, indexer, src)
+                expired.append(key); continue
+
+        # step 3: deadline check
+        if now > deadline:
+            log.warning("[repair:verify:%s] no grab confirmed for '%s' within deadline — search may have stalled",
+                        arr.name, title)
+            expired.append(key)
+
+    for key in expired:
+        pv.pop(key, None)
+
+def _repair_record_verify(state, arr, title, cmd_id, media_id, entity_ids):
+    """Store a pending verification entry so the next sweep can check if the grab landed."""
+    import datetime
+    pv = state.setdefault("__repair_verify__", {})
+    # key is stable across sweeps; title slug + arr name
+    key = "%s:%s" % (arr.name, re.sub(r"[^a-z0-9]+", "_", title.lower())[:40])
+    pv[key] = {
+        "arr_name":  arr.name,
+        "title":     title,
+        "cmd_id":    cmd_id if isinstance(cmd_id, int) else None,
+        "media_id":  media_id,
+        "entity_ids": entity_ids or [],
+        "search_ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S") + "Z",
+        "deadline":  time.time() + REPAIR_VERIFY_DEADLINE,
+    }
+
+def _repair_one(fp, caches, state=None):
     """Map a dead file to its *arr item, delete the (dead) file record, and trigger a fresh search.
     The blocklist/churn handling on the queue side then keeps it from re-grabbing the same dead release."""
     for arr in INSTANCES:
@@ -1160,8 +1264,10 @@ def _repair_one(fp, caches):
                     log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
                 if mfid:
                     arr.delete_file(mfid)
-                arr.command("MoviesSearch", movieIds=[mid])
+                cmd_id = arr.command("MoviesSearch", movieIds=[mid])
                 log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
+                if REPAIR_VERIFY and state is not None:
+                    _repair_record_verify(state, arr, title, cmd_id, mid, [mid])
                 return True
         elif arr.kind == "sonarr":
             hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp, REPAIR_UNMONITORED)
@@ -1173,12 +1279,14 @@ def _repair_one(fp, caches):
                     arr.delete_file(efid)
                 # prefer SeasonSearch (finds a season pack if available) then fall back to EpisodeSearch
                 if season_number:
-                    arr.command("SeasonSearch", seriesId=sid, seasonNumber=season_number)
+                    cmd_id = arr.command("SeasonSearch", seriesId=sid, seasonNumber=season_number)
                 elif epids:
-                    arr.command("EpisodeSearch", episodeIds=epids)
+                    cmd_id = arr.command("EpisodeSearch", episodeIds=epids)
                 else:
-                    arr.command("SeriesSearch", seriesId=sid)
+                    cmd_id = arr.command("SeriesSearch", seriesId=sid)
                 log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
+                if REPAIR_VERIFY and state is not None:
+                    _repair_record_verify(state, arr, title, cmd_id, sid, epids)
                 return True
     log.info("[repair] dead file not matched to any *arr (left in place): %s", os.path.basename(fp))
     return False
@@ -1191,6 +1299,10 @@ def check_repair():
     if not _debrid_mount_ok():
         return
     state = _load_state(); rs = state.setdefault("__repair__", {})
+    # verify pending searches from previous sweeps before starting a new one
+    if REPAIR_VERIFY:
+        _repair_verify_pending(state)
+        _save_state(state)
     now = time.time(); checked = 0; failed = 0; streak = 0; broken = []; aborted = False
     for libp in REPAIR_LIBS:
         if aborted:
@@ -1224,7 +1336,7 @@ def check_repair():
         for fp in broken:
             if acted >= REPAIR_MAX_ACTIONS:
                 break
-            if _repair_one(fp, caches):
+            if _repair_one(fp, caches, state):
                 rs.pop(fp, None); acted += 1
                 if REPAIR_ITEM_INTERVAL > 0:
                     time.sleep(REPAIR_ITEM_INTERVAL)
@@ -1847,7 +1959,8 @@ UI_SCHEMA = [
               ("REPAIR_FFPROBE", "false"), ("REPAIR_DEBRID_MOUNT", ""),
               ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
               ("REPAIR_UNMONITORED", "false"),
-              ("REPAIR_MISSING_FROM_DISK", "false"), ("REPAIR_MFD_RECHECK", "24h")]),
+              ("REPAIR_MISSING_FROM_DISK", "false"), ("REPAIR_MFD_RECHECK", "24h"),
+              ("REPAIR_VERIFY", "false"), ("REPAIR_VERIFY_DEADLINE", "4h")]),
     ("Missing Seasons", [("MISSING_SEASONS_MIN_AGE_HOURS", "1"), ("MISSING_SEASONS_MAX_ACTIONS", "5"),
               ("MISSING_SEASONS_RECHECK", "24h")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),

@@ -134,6 +134,8 @@ services:
       # REPAIR_UNMONITORED: "false"  # include unmonitored series/movies in the repair sweep
       # REPAIR_MISSING_FROM_DISK: "false" # also scan *arr history for MissingFromDisk items and re-search (usenet/direct downloads)
       # REPAIR_MFD_RECHECK: "24h"         # cooldown before re-searching the same MissingFromDisk item
+      # REPAIR_VERIFY: "false"            # track re-searches and log confirmed grabs (indexer + release name)
+      # REPAIR_VERIFY_DEADLINE: "4h"      # give up waiting for a grab confirmation after this long
 
       # ---------- missing_seasons (ENABLE_MISSING_SEASONS: find sonarr seasons with 0 files -> SeasonSearch) ----------
       # MISSING_SEASONS_MIN_AGE_HOURS: "1"  # ignore seasons added less than this long ago (avoid triggering on new shows)
