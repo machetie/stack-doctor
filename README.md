@@ -26,8 +26,10 @@ container, everything configured by env vars.
 | **providers** | failed indexers / download clients (sonarr/radarr/**prowlarr**) | runs the **Test** on them to re-validate + clear the failure |
 | **decypharr** | hung FUSE mount (read-test) + API down | runs your restart hook (`DECYPHARR_RESTART_CMD`) |
 | **plex** | Plex unresponsive | alerts (optional library refresh) |
+| **plexscan** | a Plex library scan wedged with no progress (usually a hung mount) | restarts the hung mount, cancels the stuck scan, last-resort `PLEX_RESTART_CMD` |
 | **resources** | host load / low memory / swap pressure | reports; optional `drop_caches` relief |
 | **janitor** | permanently-dead usenet releases (from decypharr's log) | quarantines those library symlinks (reversible) |
+| **repair** | dead library files (debrid link / usenet article gone), unreadable or 0-byte | removes the dead file record + re-searches the owning *arr (strike-gated, mount-safe) |
 | **bazarr** | Bazarr unreachable | alerts |
 | **seerr** | Overseerr/Jellyseerr/Seerr requests stuck **FAILED** (the arr add timed out under load) | re-drives them so a transient blip self-heals (attempt-capped) |
 | **warmer** | what a viewer is about to watch (Plex On Deck + next episode) | precaches the file head so playback starts instantly |

@@ -9,9 +9,13 @@ Modular checks, each toggled and configured by environment variables:
   providers  *arr/prowlarr providers    - auto-Test failed indexers/download clients to clear them
   decypharr  decypharr mount + API      - detect a hung FUSE mount -> run a restart hook
   plex       Plex Media Server          - detect unresponsive Plex (+ optional library scan)
+  plexscan   Plex library scans         - detect a scan wedged with no progress -> fix the hung
+                                           mount, cancel the stuck scan, last-resort restart Plex
   resources  host load / memory / swap  - report pressure, optional drop_caches relief
   janitor    usenet dead files          - quarantine library symlinks for permanently-dead
                                            releases (reversible) from a decypharr log file
+  repair     library integrity          - probe media files for unreadable/dead (decypharr link or
+                                           usenet article gone) -> remove + re-search the owning *arr
   bazarr     Bazarr                     - reachability check
   seerr      Overseerr/Jellyseerr/Seerr - auto-retry FAILED requests (arr add timed out under load)
   warmer     Plex-driven precache       - read the head of likely-next media so playback starts
@@ -108,6 +112,8 @@ EN_PROVIDERS  = _b("ENABLE_PROVIDERS", False)   # auto-test failed indexers/down
 EN_BAZARR     = _b("ENABLE_BAZARR", False)      # Bazarr reachability
 EN_SEERR      = _b("ENABLE_SEERR", False)       # Overseerr/Jellyseerr/Seerr: auto-retry FAILED requests
 EN_WESTREPAIR = _b("ENABLE_WESTREPAIR", False)  # symlink repair via repair.py subprocess
+EN_PLEX_SCAN  = _b("ENABLE_PLEX_SCAN", False)   # detect + recover a wedged Plex library scan
+EN_REPAIR     = _b("ENABLE_REPAIR", False)      # probe library for dead files -> remove + re-search
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -166,6 +172,13 @@ PLEX_URL   = os.environ.get("PLEX_URL", "")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
 
+# plexscan: a library scan that makes no progress for a while is wedged (almost always Plex's scanner
+# blocking on a hung decypharr mount / unreadable file). Recover: fix the mount, cancel the scan, then
+# (last resort) restart Plex. Reuses DECYPHARR_MOUNT_TEST / DECYPHARR_RESTART_CMD for the mount fix.
+PLEX_SCAN_STUCK  = _dur(os.environ.get("PLEX_SCAN_STUCK_AFTER", "30m"), 1800)  # no-progress time before "stuck"
+PLEX_SCAN_CANCEL = _b("PLEX_SCAN_CANCEL", True)                                # cancel the wedged scan via the activities API
+PLEX_RESTART_CMD = os.environ.get("PLEX_RESTART_CMD", "")                      # last-resort hook if the scan stays wedged
+
 # warmer (Plex-driven precache of the heads of likely-next media -> instant playback start)
 EN_WARMER         = _b("ENABLE_WARMER", False)
 WARM_HEAD_MB      = _i("WARMER_PRECACHE_MB", 64)        # how much of the file head to pull into cache
@@ -200,6 +213,25 @@ JAN_LOG       = os.environ.get("JANITOR_DECYPHARR_LOG", "")         # log file p
 JAN_LOG_CMD   = os.environ.get("JANITOR_LOG_CMD", "")               # cmd printing the log, e.g. "journalctl -u decypharr -n 10000 --no-hostname"
 JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing").split(",")
+
+# repair: walk the library, probe media files for unreadable/0-byte/dead-symlink (a dead debrid link or
+# a usenet article gone). A file must fail REPAIR_MIN_STRIKES consecutive probes before it is acted on,
+# so a transient mount hiccup never triggers a delete. When a SYSTEMIC failure is detected (the mount is
+# hung -> many files failing at once) repair backs off entirely and leaves recovery to the decypharr/
+# plexscan checks, so it can never mass-delete + mass-regrab during an outage. Gentle by design:
+# load-guarded, per-file read timeout, capped probes + actions per sweep, slow rotation through the lib.
+MEDIA_EXTS         = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".m2ts", ".mpg", ".flv")
+REPAIR_LIBS        = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
+                      os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
+REPAIR_MIN_STRIKES = _i("REPAIR_MIN_STRIKES", 3)        # consecutive failed probes before a file is "dead"
+REPAIR_MAX_SCAN    = _i("REPAIR_MAX_SCAN", 200)         # media files probed per sweep (rotates through the library)
+REPAIR_MAX_ACTIONS = _i("REPAIR_MAX_ACTIONS", 5)        # re-grabs per sweep (keep gentle on the providers)
+REPAIR_READ_TIMEOUT= _i("REPAIR_READ_TIMEOUT", 20)      # abandon a single file probe after this long (hung-mount guard)
+REPAIR_RECHECK     = _dur(os.environ.get("REPAIR_RECHECK", "12h"), 43200)  # don't re-probe a known-good file more often than this
+REPAIR_LOAD_MAX    = _f("REPAIR_LOAD_MAX", 0)           # skip the whole repair sweep above this host 1-min load (0=off)
+REPAIR_ABORT_STREAK= _i("REPAIR_ABORT_STREAK", 6)       # this many probe failures in a row -> assume hung mount, abort sweep
+REPAIR_SYSTEMIC_PCT= _f("REPAIR_SYSTEMIC_PCT", 25)      # if >= this %% of probed files fail, treat as systemic -> don't act
+REPAIR_FFPROBE     = _b("REPAIR_FFPROBE", False)        # also ffprobe the stream (deeper corruption check; needs ffprobe)
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -344,6 +376,40 @@ class Arr:
     def queue_target_id(self, rec):
         """Stable id of what a queue record is FOR (episode for sonarr, movie for radarr)."""
         return rec.get("episodeId") if self.kind == "sonarr" else rec.get("movieId") if self.kind == "radarr" else None
+
+    # ---- repair helpers (map a dead library file -> *arr item, then remove + re-search) ----
+    def _jget(self, path, t=30):
+        try:
+            return json.load(self._req("GET", path, t=t))
+        except Exception as e:
+            log.warning("[%s] GET %s failed: %s", self.name, path, str(e)[:70]); return None
+
+    def movies(self):
+        return self._jget("/movie") or []                       # radarr: each has movieFile.path
+
+    def series(self):
+        return self._jget("/series") or []                      # sonarr
+
+    def episode_files(self, sid):
+        return self._jget("/episodefile?seriesId=%d" % sid) or []
+
+    def episodes(self, sid):
+        return self._jget("/episode?seriesId=%d" % sid) or []
+
+    def delete_file(self, file_id):
+        """Delete a movieFile/episodeFile record (removes the dead library symlink so it can be re-grabbed)."""
+        ep = "/moviefile/%d" % file_id if self.kind == "radarr" else "/episodefile/%d" % file_id
+        try:
+            self._req("DELETE", ep); return True
+        except Exception as e:
+            log.warning("[%s] delete file %s failed: %s", self.name, file_id, str(e)[:70]); return False
+
+    def command(self, name, **kw):
+        body = {"name": name}; body.update(kw)
+        try:
+            self._req("POST", "/command", data=json.dumps(body).encode()); return True
+        except Exception as e:
+            log.warning("[%s] command %s failed: %s", self.name, name, str(e)[:70]); return False
 
 def load_instances():
     out = []
@@ -495,6 +561,19 @@ def _read_test(path, timeout):
 
 _decy_last_restart = [0.0]
 
+def _decy_restart(reason=""):
+    """Run the decypharr restart hook to recover a hung mount, rate-limited to once / 5 min.
+    Shared by the decypharr check and the plexscan check. Returns True if the hook ran."""
+    tag = (" (%s)" % reason) if reason else ""
+    if DRY_RUN or not DECY_RESTART_CMD:
+        log.error("[decypharr] hung but no restart cmd set (or dry-run) -> alert only%s", tag); return False
+    if time.time() - _decy_last_restart[0] < 300:
+        log.warning("[decypharr] restarted <5m ago, holding off%s", tag); return False
+    log.error("[decypharr] running restart hook%s: %s", tag, DECY_RESTART_CMD)
+    rc = run_cmd(DECY_RESTART_CMD); _decy_last_restart[0] = time.time()
+    log.error("[decypharr] restart hook rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
+    return True
+
 def check_decypharr():
     if DECY_URL:
         c = http_code(DECY_URL, t=10)
@@ -507,13 +586,7 @@ def check_decypharr():
     if ok:
         log.info("[decypharr] mount %s read OK", DECY_MOUNT_TEST); return
     log.error("[decypharr] mount %s READ HUNG (FUSE stall)", DECY_MOUNT_TEST)
-    if DRY_RUN or not DECY_RESTART_CMD:
-        log.error("[decypharr] no restart cmd set (or dry-run) -> alert only"); return
-    if time.time() - _decy_last_restart[0] < 300:
-        log.warning("[decypharr] restarted <5m ago, holding off"); return
-    log.error("[decypharr] running restart hook: %s", DECY_RESTART_CMD)
-    rc = run_cmd(DECY_RESTART_CMD); _decy_last_restart[0] = time.time()
-    log.error("[decypharr] restart hook rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
+    _decy_restart()
 
 # =========================================================================== #
 # CHECK: plex
@@ -535,6 +608,73 @@ def check_plex():
             log.info("[plex] triggered library refresh")
         except Exception as e:
             log.debug("[plex] refresh failed: %s", e)
+
+# =========================================================================== #
+# CHECK: plexscan (a Plex library scan wedged with no progress -> recover)
+# =========================================================================== #
+
+_scan_seen = {}              # activity uuid -> {first, prog, prog_ts, title, acted_ts}
+_plex_last_restart = [0.0]
+
+def _is_scan_activity(a):
+    t = (a.get("type") or "").lower()
+    txt = ((a.get("title") or "") + " " + (a.get("subtitle") or "")).lower()
+    if "scan" in txt:
+        return True
+    return t.startswith("library.update") or t.startswith("library.refresh")
+
+def check_plex_scan():
+    if not (PLEX_URL and PLEX_TOKEN):
+        return
+    plex = Plex(PLEX_URL, PLEX_TOKEN)
+    acts = plex.activities()
+    now = time.time(); cur = set(); stuck = []
+    for a in acts:
+        if not _is_scan_activity(a):
+            continue
+        uuid = a.get("uuid") or ""
+        if not uuid:
+            continue
+        cur.add(uuid)
+        try: prog = int(float(a.get("progress") or 0))
+        except Exception: prog = 0
+        title = (a.get("title") or a.get("subtitle") or "library scan")[:80]
+        s = _scan_seen.setdefault(uuid, {"first": now, "prog": -1, "prog_ts": now, "title": title, "acted_ts": 0})
+        if prog > s["prog"]:
+            s["prog"] = prog; s["prog_ts"] = now           # progress advanced -> not stuck, reset the clock
+        s["title"] = title
+        if now - s["prog_ts"] >= PLEX_SCAN_STUCK:
+            stuck.append((uuid, a, s))
+    for u in list(_scan_seen):                              # forget scans that finished / disappeared
+        if u not in cur:
+            _scan_seen.pop(u, None)
+    if not stuck:
+        if cur:
+            log.info("[plexscan] %d scan(s) running, progressing", len(cur))
+        return
+    for uuid, a, s in stuck:
+        if now - s.get("acted_ts", 0) < PLEX_SCAN_STUCK:   # one recovery attempt per stuck-window; don't hammer
+            continue
+        s["acted_ts"] = now
+        mins = int((now - s["prog_ts"]) / 60)
+        log.error("[plexscan] STUCK scan '%s' (no progress for %dm, stalled at %d%%)", s["title"], mins, max(s["prog"], 0))
+        if DRY_RUN:
+            log.info("[plexscan] DRY-RUN: would fix mount + cancel scan"); continue
+        # 1) root cause: a hung decypharr mount blocks the scanner on I/O
+        if DECY_MOUNT_TEST and _read_test(DECY_MOUNT_TEST, DECY_READ_TIMEOUT) is False:
+            log.error("[plexscan] decypharr mount is hung -> restarting it (the usual cause of a wedged scan)")
+            _decy_restart("plex scan wedged on hung mount")
+        # 2) cancel the wedged scan so Plex stops blocking on the bad item
+        if PLEX_SCAN_CANCEL and (a.get("cancellable") in ("1", "true", None)):
+            if plex.cancel_activity(uuid):
+                log.warning("[plexscan] cancelled stuck scan '%s'", s["title"])
+            else:
+                log.warning("[plexscan] cancel failed for '%s'", s["title"])
+        # 3) last resort: restart Plex if a scan stays wedged well past the threshold
+        if PLEX_RESTART_CMD and now - s["first"] >= PLEX_SCAN_STUCK * 2 and now - _plex_last_restart[0] > 1800:
+            log.error("[plexscan] scan still wedged -> restarting Plex: %s", PLEX_RESTART_CMD)
+            rc = run_cmd(PLEX_RESTART_CMD); _plex_last_restart[0] = time.time()
+            log.error("[plexscan] Plex restart rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
 
 # =========================================================================== #
 # CHECK: resources
@@ -732,6 +872,166 @@ def check_seerr():
         log.info("[seerr] re-drove %d failed request(s)", acted)
 
 # =========================================================================== #
+# CHECK: repair (probe library for dead files -> remove + re-search the owning *arr)
+# =========================================================================== #
+
+def _iter_media(root):
+    """Yield media file paths under root WITHOUT following symlinks, so a hung mount can never
+    stall the directory walk itself (only the per-file probe touches the mount, and that is
+    timeout-protected). Recurses into real dirs only."""
+    try:
+        with os.scandir(root) as it:
+            entries = list(it)
+    except Exception:
+        return
+    for e in entries:
+        try:
+            if e.is_dir(follow_symlinks=False):
+                for x in _iter_media(e.path):
+                    yield x
+            elif e.name.lower().endswith(MEDIA_EXTS):
+                yield e.path
+        except Exception:
+            continue
+
+def _probe_file(fp, timeout):
+    """True if fp is a live, non-empty file whose head reads within timeout. All filesystem ops run
+    inside the worker thread so a hung FUSE path (stat/open/read) can't block the caller; a hang or
+    any error returns False."""
+    res = {"v": False}
+    def _do():
+        try:
+            if os.path.islink(fp) and not os.path.exists(fp):    # dead symlink (debrid link gone)
+                return
+            if os.path.getsize(fp) <= 0:                         # 0-byte / placeholder
+                return
+            with open(fp, "rb", buffering=0) as fh:
+                fh.read(131072)
+            res["v"] = True
+        except Exception:
+            res["v"] = False
+    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
+    return False if th.is_alive() else res["v"]
+
+def _ffprobe_ok(fp, timeout):
+    try:
+        p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_type", "-of", "csv=p=0", fp],
+                           capture_output=True, text=True, timeout=timeout)
+        return p.returncode == 0 and "video" in (p.stdout or "")
+    except Exception:
+        return False
+
+def _file_ok(fp):
+    if not _probe_file(fp, REPAIR_READ_TIMEOUT):
+        return False
+    if REPAIR_FFPROBE and not _ffprobe_ok(fp, REPAIR_READ_TIMEOUT):
+        return False
+    return True
+
+def _radarr_resolve(movies, fp):
+    for m in movies:
+        mf = m.get("movieFile") or {}
+        if mf.get("path") == fp:
+            return (m.get("id"), mf.get("id"), (m.get("title") or "")[:70])
+    return None
+
+def _sonarr_resolve(arr, series, fp):
+    ser = next((s for s in series
+                if (s.get("path") or "").rstrip("/") and
+                   (fp == (s.get("path") or "").rstrip("/") or fp.startswith((s.get("path") or "").rstrip("/") + "/"))), None)
+    if not ser:
+        return None
+    sid = ser.get("id")
+    efid = next((ef.get("id") for ef in arr.episode_files(sid) if ef.get("path") == fp), None)
+    if not efid:
+        return None
+    epids = [e.get("id") for e in arr.episodes(sid) if e.get("episodeFileId") == efid]
+    return (sid, efid, epids, (ser.get("title") or "")[:60])
+
+def _repair_one(fp, caches):
+    """Map a dead file to its *arr item, delete the (dead) file record, and trigger a fresh search.
+    The blocklist/churn handling on the queue side then keeps it from re-grabbing the same dead release."""
+    for arr in INSTANCES:
+        if arr.kind == "radarr":
+            hit = _radarr_resolve(caches.setdefault(arr.name, arr.movies()), fp)
+            if hit:
+                mid, mfid, title = hit
+                if DRY_RUN:
+                    log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
+                if mfid:
+                    arr.delete_file(mfid)
+                arr.command("MoviesSearch", movieIds=[mid])
+                log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
+                return True
+        elif arr.kind == "sonarr":
+            hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp)
+            if hit:
+                sid, efid, epids, title = hit
+                if DRY_RUN:
+                    log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
+                if efid:
+                    arr.delete_file(efid)
+                if epids:
+                    arr.command("EpisodeSearch", episodeIds=epids)
+                else:
+                    arr.command("SeriesSearch", seriesId=sid)
+                log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
+                return True
+    log.info("[repair] dead file not matched to any *arr (left in place): %s", os.path.basename(fp))
+    return False
+
+def check_repair():
+    if not (REPAIR_LIBS and INSTANCES):
+        log.debug("[repair] need REPAIR_LIBRARY_PATHS (or JANITOR_LIBRARY_PATHS) + a sonarr/radarr instance"); return
+    if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
+        log.info("[repair] host load > %.0f -> skip sweep", REPAIR_LOAD_MAX); return
+    state = _load_state(); rs = state.setdefault("__repair__", {})
+    now = time.time(); checked = 0; failed = 0; streak = 0; broken = []; aborted = False
+    for libp in REPAIR_LIBS:
+        if aborted:
+            break
+        for fp in _iter_media(libp):
+            meta = rs.get(fp)
+            if meta and meta.get("strikes", 0) == 0 and now - meta.get("last", 0) < REPAIR_RECHECK:
+                continue                                        # recently confirmed good -> skip (rotate slowly)
+            if checked >= REPAIR_MAX_SCAN:
+                aborted = True; break
+            checked += 1
+            if _file_ok(fp):
+                rs[fp] = {"strikes": 0, "last": now}; streak = 0
+                continue
+            failed += 1; streak += 1
+            m = rs.get(fp) or {"strikes": 0}
+            m["strikes"] = m.get("strikes", 0) + 1; m["last"] = now; rs[fp] = m
+            if m["strikes"] >= REPAIR_MIN_STRIKES:
+                broken.append(fp)
+            if streak >= REPAIR_ABORT_STREAK:                   # many failures in a row -> mount likely hung, bail
+                log.warning("[repair] %d failed probes in a row -> hung mount? aborting sweep, deferring to decypharr/plexscan", streak)
+                aborted = True; broken = []; break
+    # systemic guard: a big fraction failing means the mount is sick, not individual dead files -> don't act
+    if broken and checked >= 8 and (failed * 100.0 / checked) >= REPAIR_SYSTEMIC_PCT:
+        log.warning("[repair] %d/%d probes failed (>= %.0f%%) -> systemic (hung mount?), NOT re-grabbing this sweep",
+                    failed, checked, REPAIR_SYSTEMIC_PCT)
+        broken = []
+    acted = 0
+    if broken:
+        caches = {}
+        for fp in broken:
+            if acted >= REPAIR_MAX_ACTIONS:
+                break
+            if _repair_one(fp, caches):
+                rs.pop(fp, None); acted += 1
+    if checked:                                                 # prune state for files that no longer exist (lstat, no mount touch)
+        for p in list(rs):
+            if not os.path.lexists(p):
+                rs.pop(p, None)
+    _save_state(state)
+    if checked or broken:
+        log.info("[repair] probed %d (%d failed), %d dead (>= %d strikes), %d re-grabbed",
+                 checked, failed, len(broken), REPAIR_MIN_STRIKES, acted)
+
+# =========================================================================== #
 # WARMER: precache the head of likely-next media so playback starts instantly
 #
 # On a usenet/debrid FUSE mount the slow part of pressing Play is decypharr
@@ -793,6 +1093,18 @@ class Plex:
                     out += list(ra.iter("Video"))[:n]
         except Exception: pass
         return out
+
+    def activities(self):
+        """Running background activities (library scans, analysis...). Used by the plexscan check."""
+        try: return list(self._get("/activities").iter("Activity"))
+        except Exception: return []
+
+    def cancel_activity(self, uuid):
+        try:
+            req = urllib.request.Request(self.url + "/activities/" + uuid + "?X-Plex-Token=" + self.token, method="DELETE")
+            urllib.request.urlopen(req, timeout=10); return True
+        except Exception:
+            return False
 
 _warm_state = {}            # host_path -> last_warm_ts
 _warm_lock = threading.Lock()
@@ -1117,9 +1429,12 @@ def _wr_plex_rescan():
 
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
+          ("plexscan", EN_PLEX_SCAN, check_plex_scan),
           ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
-          ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
-          ("westrepair", EN_WESTREPAIR, check_westrepair)]
+          ("repair", EN_REPAIR, check_repair), ("bazarr", EN_BAZARR, check_bazarr),
+          ("seerr", EN_SEERR, check_seerr), ("westrepair", EN_WESTREPAIR, check_westrepair),
+          ("missing_seasons", EN_MISSING_SEASONS, check_missing_seasons),
+          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile)]
 
 _lock = threading.Lock()
 
@@ -1148,8 +1463,15 @@ UI_SCHEMA = [
     ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
-              ("ENABLE_PLEX", ""), ("ENABLE_RESOURCES", ""), ("ENABLE_JANITOR", ""),
-              ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", "")]),
+              ("ENABLE_PLEX", ""), ("ENABLE_PLEX_SCAN", ""), ("ENABLE_RESOURCES", ""),
+              ("ENABLE_JANITOR", ""), ("ENABLE_REPAIR", ""), ("ENABLE_BAZARR", ""),
+              ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", ""),
+              ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", "")]),
+    ("Plex scan recovery", [("PLEX_SCAN_STUCK_AFTER", "30m"), ("PLEX_SCAN_CANCEL", "true|false")]),
+    ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
+              ("REPAIR_MIN_STRIKES", "3"), ("REPAIR_MAX_SCAN", "200"), ("REPAIR_MAX_ACTIONS", "5"),
+              ("REPAIR_READ_TIMEOUT", "20"), ("REPAIR_RECHECK", "12h"), ("REPAIR_LOAD_MAX", "0"),
+              ("REPAIR_FFPROBE", "false")]),
     ("Westrepair", [("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py"),
               ("WESTREPAIR_RUN_INTERVAL", "6h"), ("WESTREPAIR_REPAIR_INTERVAL", "1m")]),
     ("Queue / churn brake", [("DOCTOR_MIN_STRIKES", "2"), ("DOCTOR_MAX_ACTIONS", "20"), ("DOCTOR_BLOCKLIST", "true"),
@@ -1159,6 +1481,7 @@ UI_SCHEMA = [
               ("WARMER_COOLDOWN", "3600"), ("WARMER_LOAD_MAX", "0")]),
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://seerr:5055"), ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
+    ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"), ("NO_UPGRADE_PROFILE_ID", "0")]),
 ]
 UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
 
@@ -1435,7 +1758,8 @@ def main():
         log.error("queue check enabled but no instances. Set INSTANCE_1_URL / _APIKEY / _TYPE.")
         sys.exit(2)
     if not enabled and not warmer_on and not EN_UI:
-        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_WARMER / ENABLE_UI.")
+        log.error("nothing enabled. Set ENABLE_QUEUE / ENABLE_DECYPHARR / ENABLE_PLEX / ENABLE_PLEX_SCAN / "
+                  "ENABLE_RESOURCES / ENABLE_JANITOR / ENABLE_REPAIR / ENABLE_WARMER / ENABLE_UI.")
         sys.exit(2)
     log.info("stack-doctor v%s | mode=%s | checks=[%s]%s%s | instances=%s | dry_run=%s",
              VERSION, MODE, ",".join(enabled), " +warmer" if warmer_on else "", " +ui" if EN_UI else "",
