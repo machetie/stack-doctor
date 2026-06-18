@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import concurrent.futures
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -764,13 +765,16 @@ def check_plex_scan():
             log.error("[plexscan] decypharr mount is hung -> restarting it (the usual cause of a wedged scan)")
             _decy_restart("plex scan wedged on hung mount")
         # 2) cancel the wedged scan so Plex stops blocking on the bad item
+        cancelled = False
         if PLEX_SCAN_CANCEL and (a.get("cancellable") in ("1", "true", None)):
             if plex.cancel_activity(uuid):
                 log.warning("[plexscan] cancelled stuck scan '%s'", s["title"])
+                cancelled = True
             else:
                 log.warning("[plexscan] cancel failed for '%s'", s["title"])
-        # 3) last resort: restart Plex if a scan stays wedged well past the threshold
-        if PLEX_RESTART_CMD and now - s["first"] >= PLEX_SCAN_STUCK * 2 and now - _plex_last_restart[0] > 1800:
+        # 3) last resort: restart Plex if a scan stays wedged well past the threshold AND cancellation didn't succeed
+        if (PLEX_RESTART_CMD and now - s["first"] >= PLEX_SCAN_STUCK * 2 and 
+            now - _plex_last_restart[0] > 1800 and not cancelled):
             log.error("[plexscan] scan still wedged -> restarting Plex: %s", PLEX_RESTART_CMD)
             rc = run_cmd(PLEX_RESTART_CMD); _plex_last_restart[0] = time.time()
             log.error("[plexscan] Plex restart rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")
@@ -1004,20 +1008,26 @@ def _probe_file(fp, timeout):
     """True if fp is a live, non-empty file whose head reads within timeout. All filesystem ops run
     inside the worker thread so a hung FUSE path (stat/open/read) can't block the caller; a hang or
     any error returns False."""
-    res = {"v": False}
     def _do():
         try:
             if os.path.islink(fp) and not os.path.exists(fp):    # dead symlink (debrid link gone)
-                return
+                return False
             if os.path.getsize(fp) <= 0:                         # 0-byte / placeholder
-                return
+                return False
             with open(fp, "rb", buffering=0) as fh:
                 fh.read(131072)
-            res["v"] = True
+            return True
         except Exception:
-            res["v"] = False
-    th = threading.Thread(target=_do, daemon=True); th.start(); th.join(timeout)
-    return False if th.is_alive() else res["v"]
+            return False
+    
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do)
+            return future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return False
+    except Exception:
+        return False
 
 def _ffprobe_ok(fp, timeout):
     try:
