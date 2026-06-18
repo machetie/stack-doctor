@@ -128,6 +128,10 @@ services:
       REPAIR_RECHECK: "12h"          # don't re-probe a known-good file more often than this
       REPAIR_LOAD_MAX: "0"           # skip the repair sweep above this host 1-min load (0 = off)
       # REPAIR_FFPROBE: "false"      # also ffprobe the stream (deeper corruption check; needs ffprobe in the image)
+      # REPAIR_DEBRID_MOUNT: /mnt/remote/realdebrid/__all__  # skip sweep if mount is empty/missing (debrid down guard)
+      # REPAIR_ITEM_INTERVAL: "0"    # seconds to wait between each re-grab (0 = no delay; gentle on providers)
+      # REPAIR_SEASON_PACKS: "false" # flag sonarr seasons spread across multiple dirs and search for a season pack
+      # REPAIR_UNMONITORED: "false"  # include unmonitored series/movies in the repair sweep
 
     volumes:
       - ./data:/data                                 # state + file log + quarantine manifests

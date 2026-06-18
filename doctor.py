@@ -224,18 +224,25 @@ JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still
 # hung -> many files failing at once) repair backs off entirely and leaves recovery to the decypharr/
 # plexscan checks, so it can never mass-delete + mass-regrab during an outage. Gentle by design:
 # load-guarded, per-file read timeout, capped probes + actions per sweep, slow rotation through the lib.
-MEDIA_EXTS         = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".m2ts", ".mpg", ".flv")
-REPAIR_LIBS        = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
-                      os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
-REPAIR_MIN_STRIKES = _i("REPAIR_MIN_STRIKES", 3)        # consecutive failed probes before a file is "dead"
-REPAIR_MAX_SCAN    = _i("REPAIR_MAX_SCAN", 200)         # media files probed per sweep (rotates through the library)
-REPAIR_MAX_ACTIONS = _i("REPAIR_MAX_ACTIONS", 5)        # re-grabs per sweep (keep gentle on the providers)
-REPAIR_READ_TIMEOUT= _i("REPAIR_READ_TIMEOUT", 20)      # abandon a single file probe after this long (hung-mount guard)
-REPAIR_RECHECK     = _dur(os.environ.get("REPAIR_RECHECK", "12h"), 43200)  # don't re-probe a known-good file more often than this
-REPAIR_LOAD_MAX    = _f("REPAIR_LOAD_MAX", 0)           # skip the whole repair sweep above this host 1-min load (0=off)
-REPAIR_ABORT_STREAK= _i("REPAIR_ABORT_STREAK", 6)       # this many probe failures in a row -> assume hung mount, abort sweep
-REPAIR_SYSTEMIC_PCT= _f("REPAIR_SYSTEMIC_PCT", 25)      # if >= this %% of probed files fail, treat as systemic -> don't act
-REPAIR_FFPROBE     = _b("REPAIR_FFPROBE", False)        # also ffprobe the stream (deeper corruption check; needs ffprobe)
+# REPAIR_DEBRID_MOUNT: optional path to the debrid mount root (e.g. /mnt/remote/realdebrid/__all__).
+# If set, repair checks that the mount is non-empty before every sweep. An empty/missing mount means
+# the debrid service is down or the mount is unmounted -> skip the sweep entirely to prevent mass-regrab.
+MEDIA_EXTS              = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".m2ts", ".mpg", ".flv")
+REPAIR_LIBS             = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
+                           os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
+REPAIR_MIN_STRIKES      = _i("REPAIR_MIN_STRIKES", 3)        # consecutive failed probes before a file is "dead"
+REPAIR_MAX_SCAN         = _i("REPAIR_MAX_SCAN", 200)         # media files probed per sweep (rotates through the library)
+REPAIR_MAX_ACTIONS      = _i("REPAIR_MAX_ACTIONS", 5)        # re-grabs per sweep (keep gentle on the providers)
+REPAIR_READ_TIMEOUT     = _i("REPAIR_READ_TIMEOUT", 20)      # abandon a single file probe after this long (hung-mount guard)
+REPAIR_RECHECK          = _dur(os.environ.get("REPAIR_RECHECK", "12h"), 43200)  # don't re-probe a known-good file more often than this
+REPAIR_LOAD_MAX         = _f("REPAIR_LOAD_MAX", 0)           # skip the whole repair sweep above this host 1-min load (0=off)
+REPAIR_ABORT_STREAK     = _i("REPAIR_ABORT_STREAK", 6)       # this many probe failures in a row -> assume hung mount, abort sweep
+REPAIR_SYSTEMIC_PCT     = _f("REPAIR_SYSTEMIC_PCT", 25)      # if >= this %% of probed files fail, treat as systemic -> don't act
+REPAIR_FFPROBE          = _b("REPAIR_FFPROBE", False)        # also ffprobe the stream (deeper corruption check; needs ffprobe)
+REPAIR_DEBRID_MOUNT     = os.environ.get("REPAIR_DEBRID_MOUNT", "")  # debrid mount root; non-empty means "check it's live before sweep"
+REPAIR_ITEM_INTERVAL    = _dur(os.environ.get("REPAIR_ITEM_INTERVAL", "0"), 0)  # seconds to wait between each re-grab (0=off)
+REPAIR_SEASON_PACKS     = _b("REPAIR_SEASON_PACKS", False)   # flag sonarr seasons spread across multiple dirs (non-season-pack)
+REPAIR_UNMONITORED      = _b("REPAIR_UNMONITORED", False)    # include unmonitored series/movies in the repair sweep
 
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
@@ -968,32 +975,90 @@ def _file_ok(fp):
         return False
     return True
 
-def _radarr_resolve(movies, fp):
+def _debrid_mount_ok():
+    """Return True if the debrid mount looks live (path exists and has at least one child entry).
+    An empty or missing mount means the debrid service is down or the FUSE mount dropped — we must
+    not run repair in that state or we'd mass-delete + mass-regrab every file in the library."""
+    p = REPAIR_DEBRID_MOUNT
+    if not p:
+        return True                                              # not configured -> no check, proceed
+    try:
+        children = os.listdir(p)
+        if children:
+            return True
+        log.warning("[repair] debrid mount %s exists but is empty -> service down? skipping sweep", p)
+        return False
+    except Exception as e:
+        log.warning("[repair] debrid mount %s not accessible (%s) -> skipping sweep", p, str(e)[:60])
+        return False
+
+def _radarr_resolve(movies, fp, include_unmonitored=False):
     for m in movies:
+        if not include_unmonitored and not m.get("monitored", True):
+            continue
         mf = m.get("movieFile") or {}
         if mf.get("path") == fp:
             return (m.get("id"), mf.get("id"), (m.get("title") or "")[:70])
     return None
 
-def _sonarr_resolve(arr, series, fp):
+def _sonarr_resolve(arr, series, fp, include_unmonitored=False):
     ser = next((s for s in series
                 if (s.get("path") or "").rstrip("/") and
                    (fp == (s.get("path") or "").rstrip("/") or fp.startswith((s.get("path") or "").rstrip("/") + "/"))), None)
     if not ser:
         return None
+    if not include_unmonitored and not ser.get("monitored", True):
+        return None
     sid = ser.get("id")
     efid = next((ef.get("id") for ef in arr.episode_files(sid) if ef.get("path") == fp), None)
     if not efid:
         return None
-    epids = [e.get("id") for e in arr.episodes(sid) if e.get("episodeFileId") == efid]
+    epids = [e.get("id") for e in arr.episodes(sid)
+             if e.get("episodeFileId") == efid and (include_unmonitored or e.get("monitored", True))]
     return (sid, efid, epids, (ser.get("title") or "")[:60])
+
+def _sonarr_season_pack_check(arr, series):
+    """Yield (series_title, season_number, arr) for any fully-available sonarr season whose episode
+    files are spread across more than one parent directory — a sign that individual episode grabs
+    replaced what should be a season pack. Only emits seasons where every episode is monitored."""
+    for ser in series:
+        if not ser.get("monitored", True):
+            continue
+        sid = ser.get("id")
+        title = (ser.get("title") or "")[:60]
+        try:
+            seasons = {s["seasonNumber"]: s for s in (ser.get("seasons") or []) if s.get("seasonNumber", 0) > 0}
+            efiles = arr.episode_files(sid)
+            eps    = arr.episodes(sid)
+        except Exception:
+            continue
+        # group episode files by season
+        ef_by_season = {}
+        for ef in efiles:
+            sn = ef.get("seasonNumber")
+            if sn:
+                ef_by_season.setdefault(sn, []).append(ef)
+        ep_by_season = {}
+        for ep in eps:
+            sn = ep.get("seasonNumber")
+            if sn:
+                ep_by_season.setdefault(sn, []).append(ep)
+        for sn, efs in ef_by_season.items():
+            season_meta = seasons.get(sn, {})
+            stats = season_meta.get("statistics") or {}
+            # only act when the season is fully downloaded
+            if stats.get("episodeFileCount", 0) < stats.get("totalEpisodeCount", 1):
+                continue
+            parent_dirs = set(os.path.dirname(ef.get("path", "")) for ef in efs if ef.get("path"))
+            if len(parent_dirs) > 1:
+                yield title, sn, sid, arr
 
 def _repair_one(fp, caches):
     """Map a dead file to its *arr item, delete the (dead) file record, and trigger a fresh search.
     The blocklist/churn handling on the queue side then keeps it from re-grabbing the same dead release."""
     for arr in INSTANCES:
         if arr.kind == "radarr":
-            hit = _radarr_resolve(caches.setdefault(arr.name, arr.movies()), fp)
+            hit = _radarr_resolve(caches.setdefault(arr.name, arr.movies()), fp, REPAIR_UNMONITORED)
             if hit:
                 mid, mfid, title = hit
                 if DRY_RUN:
@@ -1004,7 +1069,7 @@ def _repair_one(fp, caches):
                 log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
                 return True
         elif arr.kind == "sonarr":
-            hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp)
+            hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp, REPAIR_UNMONITORED)
             if hit:
                 sid, efid, epids, title = hit
                 if DRY_RUN:
@@ -1025,6 +1090,8 @@ def check_repair():
         log.debug("[repair] need REPAIR_LIBRARY_PATHS (or JANITOR_LIBRARY_PATHS) + a sonarr/radarr instance"); return
     if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
         log.info("[repair] host load > %.0f -> skip sweep", REPAIR_LOAD_MAX); return
+    if not _debrid_mount_ok():
+        return
     state = _load_state(); rs = state.setdefault("__repair__", {})
     now = time.time(); checked = 0; failed = 0; streak = 0; broken = []; aborted = False
     for libp in REPAIR_LIBS:
@@ -1061,6 +1128,8 @@ def check_repair():
                 break
             if _repair_one(fp, caches):
                 rs.pop(fp, None); acted += 1
+                if REPAIR_ITEM_INTERVAL > 0:
+                    time.sleep(REPAIR_ITEM_INTERVAL)
     if checked:                                                 # prune state for files that no longer exist (lstat, no mount touch)
         for p in list(rs):
             if not os.path.lexists(p):
@@ -1069,6 +1138,27 @@ def check_repair():
     if checked or broken:
         log.info("[repair] probed %d (%d failed), %d dead (>= %d strikes), %d re-grabbed",
                  checked, failed, len(broken), REPAIR_MIN_STRIKES, acted)
+    # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
+    # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
+    if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:
+        sp_budget = REPAIR_MAX_ACTIONS - acted
+        for arr in INSTANCES:
+            if arr.kind != "sonarr" or sp_budget <= 0:
+                break
+            try:
+                series = arr.series()
+            except Exception:
+                continue
+            for title, sn, sid, a in _sonarr_season_pack_check(arr, series):
+                if sp_budget <= 0:
+                    break
+                if DRY_RUN:
+                    log.info("[repair:season_pack] DRY-RUN would search season pack: %s S%02d", title, sn); sp_budget -= 1; continue
+                if a.command("SeasonSearch", seriesId=sid, seasonNumber=sn):
+                    log.warning("[repair:season_pack] non-season-pack detected -> searching season pack: %s S%02d", title, sn)
+                    sp_budget -= 1
+                    if REPAIR_ITEM_INTERVAL > 0:
+                        time.sleep(REPAIR_ITEM_INTERVAL)
 
 # =========================================================================== #
 # WARMER: precache the head of likely-next media so playback starts instantly
@@ -1678,7 +1768,9 @@ UI_SCHEMA = [
     ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
               ("REPAIR_MIN_STRIKES", "3"), ("REPAIR_MAX_SCAN", "200"), ("REPAIR_MAX_ACTIONS", "5"),
               ("REPAIR_READ_TIMEOUT", "20"), ("REPAIR_RECHECK", "12h"), ("REPAIR_LOAD_MAX", "0"),
-              ("REPAIR_FFPROBE", "false")]),
+              ("REPAIR_FFPROBE", "false"), ("REPAIR_DEBRID_MOUNT", ""),
+              ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
+              ("REPAIR_UNMONITORED", "false")]),
     ("No-Upgrade Profile", [("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)"),
               ("NO_UPGRADE_PROFILE_ID", "0")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://overseerr:5055"), ("SEERR_APIKEY", ""),
