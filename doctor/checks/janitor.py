@@ -140,7 +140,7 @@ def check_janitor():
                     tgt = os.readlink(fp)
                 except Exception:
                     continue
-                mm = re.search(r"/__all__/([^/]+)(?:/|$)", tgt)
+                mm = re.search(r"/(?:__all__|complete)/([^/]+)(?:/|$)", tgt)
                 if not mm or mm.group(1) not in bad:
                     continue
                 if DRY_RUN:
