@@ -1,18 +1,8 @@
 """Scheduler: per-check intervals, bounded concurrency, and the full sweep."""
-import os
-import sys
-import json
-import re
 import time
-import signal
-import subprocess
 import threading
 import logging
-import logging.handlers
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from typing import Optional, Callable, Any
 from .config import *
 from .checks import *  # check_* functions referenced by CHECKS
 
@@ -31,20 +21,24 @@ CHECKS = [("queue", EN_QUEUE, check_queue, "fast"),
 _check_locks = {cid: threading.Lock() for cid, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()
-def sweep(only=None):
+def sweep(only: Optional[Any] = None) -> None:
     if not _lock.acquire(blocking=False):
         log.debug("sweep already running"); return
+    log.info("[sweep] starting initial sweep of %d enabled check(s)", sum(1 for _, e, _, _ in CHECKS if e))
     try:
         for cid, en, fn, _ in CHECKS:
             if not en:
                 continue
+            log.info("[sweep] running %s", cid)
             try:
                 fn(only) if cid == "queue" else fn()
             except Exception as e:
                 log.error("[%s] check error: %s", cid, e)
+            log.info("[sweep] finished %s", cid)
     finally:
         _lock.release()
-def _run_scheduled_check(cid, fn):
+        log.info("[sweep] initial sweep complete")
+def _run_scheduled_check(cid: str, fn: Callable[[], None]) -> None:
     """Run a single scheduled check with per-check locking and bounded concurrency."""
     lock = _check_locks.get(cid)
     if lock and not lock.acquire(blocking=False):
@@ -53,19 +47,20 @@ def _run_scheduled_check(cid, fn):
     acquired = False
     try:
         if not _scheduler_sem.acquire(blocking=False):
-            log.debug("[%s] scheduler concurrency full, deferring", cid)
+            log.info("[%s] scheduler concurrency full, deferring", cid)
             return
         acquired = True
-        log.debug("[%s] running scheduled check", cid)
+        log.info("[%s] running scheduled check", cid)
         fn()
     except Exception as e:
         log.error("[%s] scheduled check error: %s", cid, e)
     finally:
         if acquired:
+            log.info("[%s] scheduled check finished", cid)
             _scheduler_sem.release()
         if lock:
             lock.release()
-def scheduler_loop(stop):
+def scheduler_loop(stop: threading.Event) -> None:
     """Background loop that runs each enabled check on its own interval.
     An initial full sweep runs on startup, then checks are dispatched independently
     so fast checks (queue, providers, plex, ...) run every few minutes while slow
@@ -83,4 +78,5 @@ def scheduler_loop(stop):
             interval = _check_interval(cid, speed)
             if now - last_run.get(cid, 0) >= interval:
                 last_run[cid] = now
+                log.info("[scheduler] dispatching %s (interval=%s, last=%.0fs ago)", cid, _human(interval), now - last_run.get(cid, 0))
                 threading.Thread(target=_run_scheduled_check, args=(cid, fn), daemon=True).start()

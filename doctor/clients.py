@@ -11,21 +11,52 @@ import logging
 import logging.handlers
 import urllib.request
 import urllib.error
+import socket
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any
 from .config import *
 
 class Arr:
-    def __init__(self, name, kind, url, apikey):
+    def __init__(self, name: str, kind: str, url: str, apikey: str):
         self.name, self.kind = name, kind                       # sonarr | radarr | prowlarr
         self.base = url.rstrip("/") + ("/api/v1" if kind == "prowlarr" else "/api/v3")
         self.apikey = apikey
         self.unknown = "includeUnknownSeriesItems=true" if kind == "sonarr" else "includeUnknownMovieItems=true"
 
-    def _req(self, method, path, data=None, t=None):
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
-        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+    def _req(self, method: str, path: str, data: Optional[bytes] = None,
+             t: Optional[float] = None, retries: int = 3):
+        """Make an HTTP request with retry/backoff for transient failures.
+
+        Retries on: 5xx, 429, timeout, connection reset.
+        Does not retry on: 4xx (except 429), 2xx/3xx responses.
+        """
+        t = t or TIMEOUT
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request(self.base + path, data=data, method=method,
+                                             headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
+                return urllib.request.urlopen(req, timeout=t)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 502, 503, 504) and attempt < retries:
+                    wait = 2 ** attempt + (0.5 if e.code == 429 else 0)
+                    log.debug("[%s] %s %s -> %d, retrying in %.1fs (attempt %d/%d)",
+                              self.name, method, path, e.code, wait, attempt + 1, retries)
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
+                raise
+            except (socket.timeout, urllib.error.URLError, ConnectionResetError, BrokenPipeError) as e:
+                if attempt < retries:
+                    wait = 2 ** attempt
+                    log.debug("[%s] %s %s -> %s, retrying in %.1fs (attempt %d/%d)",
+                              self.name, method, path, str(e)[:50], wait, attempt + 1, retries)
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
+                raise
+        raise last_exc
 
     def queue(self):
         if self.kind == "prowlarr":
@@ -225,10 +256,39 @@ class Seerr:
         self.base = url.rstrip("/") + "/api/v1"
         self.apikey = apikey
 
-    def _req(self, method, path, data=None, t=None):
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
-        return urllib.request.urlopen(req, timeout=t or TIMEOUT)
+    def _req(self, method: str, path: str, data: Optional[bytes] = None,
+             t: Optional[float] = None, retries: int = 3):
+        """Make an HTTP request with retry/backoff for transient failures.
+
+        Retries on: 5xx, 429, timeout, connection reset.
+        Does not retry on: 4xx (except 429), 2xx/3xx responses.
+        """
+        t = t or TIMEOUT
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request(self.base + path, data=data, method=method,
+                                             headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
+                return urllib.request.urlopen(req, timeout=t)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 502, 503, 504) and attempt < retries:
+                    wait = 2 ** attempt + (0.5 if e.code == 429 else 0)
+                    log.debug("[%s] %s %s -> %d, retrying in %.1fs (attempt %d/%d)",
+                              self.name, method, path, e.code, wait, attempt + 1, retries)
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
+                raise
+            except (socket.timeout, urllib.error.URLError, ConnectionResetError, BrokenPipeError) as e:
+                if attempt < retries:
+                    wait = 2 ** attempt
+                    log.debug("[%s] %s %s -> %s, retrying in %.1fs (attempt %d/%d)",
+                              self.name, method, path, str(e)[:50], wait, attempt + 1, retries)
+                    time.sleep(wait)
+                    last_exc = e
+                    continue
+                raise
+        raise last_exc
 
     def failed(self):
         """Requests currently in the FAILED state (seerr could not hand them to the arr)."""

@@ -15,19 +15,19 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 VERSION = "0.3"
-def _b(name, default=False):
+def _b(name: str, default: bool = False) -> bool:
     return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
-def _i(name, default):
+def _i(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
-def _f(name, default):
+def _f(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
-def _dur(tok, default=0):
+def _dur(tok, default: int = 0) -> int:
     """Parse a duration token: 30s / 10m / 2h / 1d, or a bare number of seconds."""
     t = str(tok).strip().lower()
     if not t:
@@ -37,7 +37,7 @@ def _dur(tok, default=0):
         return int(float(t[:-1]) * mult[t[-1]]) if t[-1] in mult else int(float(t))
     except (ValueError, KeyError):
         return default
-def _human(sec):
+def _human(sec: int) -> str:
     sec = int(sec)
     for size, suf in ((86400, "d"), (3600, "h"), (60, "m")):
         if sec >= size and sec % size == 0:
@@ -61,6 +61,8 @@ EN_UI       = _b("ENABLE_UI", False)
 UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional ?token= / X-Doctor-Token gate
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
+# Respect NO_COLOR and add explicit opt-out. Default to colored output for humans.
+LOG_COLORS  = _b("DOCTOR_LOG_COLORS", True) and not _b("NO_COLOR", False)
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
 DRY_RUN     = _b("DOCTOR_DRY_RUN", False)
 FAST_INTERVAL        = _dur(os.environ.get("DOCTOR_FAST_INTERVAL", "180s"), 180)     # 3 min
@@ -174,6 +176,7 @@ REPAIR_MISSING_FROM_DISK = _b("REPAIR_MISSING_FROM_DISK", False)  # enable histo
 REPAIR_MFD_RECHECK       = _dur(os.environ.get("REPAIR_MFD_RECHECK", "24h"), 86400)  # cooldown per item before re-searching
 REPAIR_VERIFY            = _b("REPAIR_VERIFY", False)              # enable post-repair grab verification
 REPAIR_VERIFY_DEADLINE   = _dur(os.environ.get("REPAIR_VERIFY_DEADLINE", "4h"), 14400)  # give up after this long
+REPAIR_ORPHAN_SCAN      = _b("REPAIR_ORPHAN_SCAN", True)             # report dead symlinks not tracked by *arr
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
 handlers = [logging.StreamHandler(sys.stdout)]
@@ -214,7 +217,10 @@ class _ColorFormatter(logging.Formatter):
         lines = [header] + rest
         return "\n".join(lines)
 _console = logging.StreamHandler(sys.stdout)
-_console.setFormatter(_ColorFormatter())
+if LOG_COLORS:
+    _console.setFormatter(_ColorFormatter())
+else:
+    _console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"))
 handlers_colored = [_console]
 if len(handlers) > 1:                         # file handler was added
     handlers_colored.append(handlers[-1])     # keep rotating file handler (no colour)

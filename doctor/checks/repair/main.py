@@ -1,0 +1,92 @@
+"""Main repair check orchestrator."""
+import logging
+from ...config import *
+from ...clients import *
+from ...state import *
+from .common import _debrid_mount_ok
+from .dead_symlinks import _radarr_dead_files, _sonarr_dead_files, _repair_radarr_movie, _repair_sonarr_season
+from .season_pack import _sonarr_season_pack_check
+from .missing_from_disk import _missing_from_disk_check
+from .verify import _repair_verify_pending
+from .orphan import _orphan_dead_symlink_scan
+
+def check_repair():
+    if not INSTANCES:
+        log.warning("[repair] no Sonarr/Radarr instances configured"); return
+    if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
+        log.info("[repair] host load > %.0f -> skip sweep", REPAIR_LOAD_MAX); return
+    if not _debrid_mount_ok():
+        return
+    with state_transaction() as state:
+        # verify pending searches from previous sweeps before starting a new one
+        if REPAIR_VERIFY:
+            _repair_verify_pending(state)
+        acted = 0          # search commands issued (groups)
+        symlinks = 0       # total dead symlinks deleted
+        cap_hit = None
+        for arr in INSTANCES:
+            if arr.kind not in ("sonarr", "radarr"):
+                continue
+            if acted >= REPAIR_MAX_ACTIONS or symlinks >= REPAIR_MAX_SYMLINKS:
+                break
+            try:
+                if arr.kind == "sonarr":
+                    series = arr.series()
+                    for sid, title, sn, efids in _sonarr_dead_files(arr, series):
+                        if acted >= REPAIR_MAX_ACTIONS:
+                            cap_hit = "REPAIR_MAX_ACTIONS"; break
+                        if symlinks >= REPAIR_MAX_SYMLINKS:
+                            cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        count = len(efids)
+                        if symlinks + count > REPAIR_MAX_SYMLINKS:
+                            cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        if _repair_sonarr_season(arr, sid, title, sn, efids, state):
+                            acted += 1
+                            symlinks += count
+                            if REPAIR_ITEM_INTERVAL > 0:
+                                time.sleep(REPAIR_ITEM_INTERVAL)
+                else:
+                    movies = arr.movies()
+                    for mid, title, mfid in _radarr_dead_files(movies):
+                        if acted >= REPAIR_MAX_ACTIONS:
+                            cap_hit = "REPAIR_MAX_ACTIONS"; break
+                        if symlinks >= REPAIR_MAX_SYMLINKS:
+                            cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        if _repair_radarr_movie(arr, mid, title, mfid, state):
+                            acted += 1
+                            symlinks += 1
+                            if REPAIR_ITEM_INTERVAL > 0:
+                                time.sleep(REPAIR_ITEM_INTERVAL)
+            except Exception as e:
+                log.warning("[repair:%s] sweep error: %s", arr.name, str(e)[:70])
+        if acted or symlinks:
+            log.info("[repair] symlink sweep: %d season(s)/movie(s), %d dead symlink(s) re-grabbed%s",
+                     acted, symlinks, " (capped by %s)" % cap_hit if cap_hit else "")
+        # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
+        # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
+        if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:
+            sp_budget = REPAIR_MAX_ACTIONS - acted
+            for arr in INSTANCES:
+                if arr.kind != "sonarr" or sp_budget <= 0:
+                    break
+                try:
+                    series = arr.series()
+                except Exception:
+                    continue
+                for title, sn, sid, a in _sonarr_season_pack_check(arr, series):
+                    if sp_budget <= 0:
+                        break
+                    if DRY_RUN:
+                        log.info("[repair:season_pack] DRY-RUN would search season pack: %s S%02d", title, sn); sp_budget -= 1; continue
+                    if a.command("SeasonSearch", seriesId=sid, seasonNumber=sn):
+                        log.warning("[repair:season_pack] non-season-pack detected -> searching season pack: %s S%02d", title, sn)
+                        sp_budget -= 1
+                        if REPAIR_ITEM_INTERVAL > 0:
+                            time.sleep(REPAIR_ITEM_INTERVAL)
+        # MissingFromDisk check: query *arr history for items Sonarr/Radarr knows are gone from disk.
+        # Runs after the symlink sweep so both modes share the REPAIR_MAX_ACTIONS budget.
+        if REPAIR_MISSING_FROM_DISK and acted < REPAIR_MAX_ACTIONS:
+            _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
+        # Orphan scan: filesystem-only dead symlinks that *arr no longer tracks.
+        if REPAIR_ORPHAN_SCAN:
+            _orphan_dead_symlink_scan()
