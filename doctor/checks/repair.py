@@ -313,7 +313,7 @@ def _repair_sonarr_season(arr, sid, title, season_number, efids, state=None):
     return True
 def check_repair():
     if not INSTANCES:
-        log.debug("[repair] need at least one sonarr/radarr instance"); return
+        log.warning("[repair] no Sonarr/Radarr instances configured"); return
     if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
         log.info("[repair] host load > %.0f -> skip sweep", REPAIR_LOAD_MAX); return
     if not _debrid_mount_ok():

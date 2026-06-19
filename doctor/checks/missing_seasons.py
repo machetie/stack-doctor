@@ -43,7 +43,7 @@ def check_missing_seasons():
     hammer the same season every sweep."""
     sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
     if not sonarr_instances:
-        log.debug("[missing_seasons] no sonarr instances configured"); return
+        log.warning("[missing_seasons] no Sonarr instances configured"); return
     with state_transaction() as state:
         ms = state.setdefault("__missing_seasons__", {})
         now = time.time(); acted = 0; skipped = 0; airing = 0
