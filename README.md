@@ -225,7 +225,8 @@ Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 |---|---|---|
 | `ENABLE_REPAIR` | `false` | turn the check on (needs a Sonarr/Radarr instance) |
 | `REPAIR_LIBRARY_PATHS` | *(none)* | optional comma-separated library roots to limit which *arr file records are checked, e.g. `/mnt/library/movies,/mnt/library/tv` |
-| `REPAIR_MAX_ACTIONS` | `5` | re-grabs per sweep across all modes (symlink + MissingFromDisk + season-pack) |
+| `REPAIR_MAX_ACTIONS` | `20` | max search commands (seasons/movies) re-grabbed per sweep; caps indexer load |
+| `REPAIR_MAX_SYMLINKS` | `100` | max total dead symlinks processed per sweep; caps the actual file-deletion workload |
 | `REPAIR_LOAD_MAX` | `0` | skip the sweep when host 1-min load exceeds this (`0` = off) |
 | `REPAIR_DEBRID_MOUNT` | *(none)* | debrid mount root (e.g. `/mnt/remote/realdebrid/__all__`); if set, only symlinks pointing here are checked, and the sweep is skipped when the mount is empty or missing (debrid-down guard) |
 | `REPAIR_ITEM_INTERVAL` | `0` | seconds to wait between each re-grab action (`0` = no delay) |

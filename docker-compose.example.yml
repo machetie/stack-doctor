@@ -121,7 +121,8 @@ services:
 
       # ---------- repair (ENABLE_REPAIR: API-first dead-symlink detection -> remove + re-search) ----------
       # REPAIR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies   # optional: only check *arr file records under these roots
-      REPAIR_MAX_ACTIONS: "5"        # re-grabs per sweep across all modes (symlink + MissingFromDisk + season-pack)
+      REPAIR_MAX_ACTIONS: "20"      # max search commands (seasons/movies) re-grabbed per sweep
+      REPAIR_MAX_SYMLINKS: "100"      # max total dead symlinks processed per sweep
       REPAIR_LOAD_MAX: "0"           # skip the repair sweep above this host 1-min load (0 = off)
       # REPAIR_DEBRID_MOUNT: /mnt/remote/realdebrid/__all__  # only check symlinks pointing here; skip if mount empty/missing
       # REPAIR_ITEM_INTERVAL: "0"    # seconds to wait between each re-grab (0 = no delay; gentle on providers)

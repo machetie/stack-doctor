@@ -231,7 +231,11 @@ JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still
 # before every sweep (empty/missing -> debrid down -> skip to prevent mass-regrab).
 REPAIR_LIBS             = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
                            os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
-REPAIR_MAX_ACTIONS      = _i("REPAIR_MAX_ACTIONS", 5)        # re-grabs per sweep (keep gentle on the providers)
+# Two independent caps on the symlink sweep:
+#   REPAIR_MAX_ACTIONS  = max search commands (one per season/movie) to stay gentle on indexers
+#   REPAIR_MAX_SYMLINKS = max total dead symlinks to process, so one big season doesn't consume the whole budget
+REPAIR_MAX_ACTIONS      = _i("REPAIR_MAX_ACTIONS", 20)       # re-grab/search commands per sweep
+REPAIR_MAX_SYMLINKS     = _i("REPAIR_MAX_SYMLINKS", 100)     # dead symlinks processed per sweep
 REPAIR_LOAD_MAX         = _f("REPAIR_LOAD_MAX", 0)           # skip the whole repair sweep above this host 1-min load (0=off)
 REPAIR_DEBRID_MOUNT     = os.environ.get("REPAIR_DEBRID_MOUNT", "")  # debrid mount root; non-empty means "check it's live before sweep"
 REPAIR_ITEM_INTERVAL    = _dur(os.environ.get("REPAIR_ITEM_INTERVAL", "0"), 0)  # seconds to wait between each re-grab (0=off)
@@ -1290,35 +1294,47 @@ def check_repair():
     # verify pending searches from previous sweeps before starting a new one
     if REPAIR_VERIFY:
         _repair_verify_pending(state)
-    acted = 0
+    acted = 0          # search commands issued (groups)
+    symlinks = 0       # total dead symlinks deleted
+    cap_hit = None
     for arr in INSTANCES:
         if arr.kind not in ("sonarr", "radarr"):
             continue
-        if acted >= REPAIR_MAX_ACTIONS:
+        if acted >= REPAIR_MAX_ACTIONS or symlinks >= REPAIR_MAX_SYMLINKS:
             break
         try:
             if arr.kind == "sonarr":
                 series = arr.series()
                 for sid, title, sn, efids in _sonarr_dead_files(arr, series):
                     if acted >= REPAIR_MAX_ACTIONS:
-                        break
+                        cap_hit = "REPAIR_MAX_ACTIONS"; break
+                    if symlinks >= REPAIR_MAX_SYMLINKS:
+                        cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                    count = len(efids)
+                    if symlinks + count > REPAIR_MAX_SYMLINKS:
+                        cap_hit = "REPAIR_MAX_SYMLINKS"; break
                     if _repair_sonarr_season(arr, sid, title, sn, efids, state):
                         acted += 1
+                        symlinks += count
                         if REPAIR_ITEM_INTERVAL > 0:
                             time.sleep(REPAIR_ITEM_INTERVAL)
             else:
                 movies = arr.movies()
                 for mid, title, mfid in _radarr_dead_files(movies):
                     if acted >= REPAIR_MAX_ACTIONS:
-                        break
+                        cap_hit = "REPAIR_MAX_ACTIONS"; break
+                    if symlinks >= REPAIR_MAX_SYMLINKS:
+                        cap_hit = "REPAIR_MAX_SYMLINKS"; break
                     if _repair_radarr_movie(arr, mid, title, mfid, state):
                         acted += 1
+                        symlinks += 1
                         if REPAIR_ITEM_INTERVAL > 0:
                             time.sleep(REPAIR_ITEM_INTERVAL)
         except Exception as e:
             log.warning("[repair:%s] sweep error: %s", arr.name, str(e)[:70])
-    if acted:
-        log.info("[repair] symlink sweep re-grabbed %d season(s)/movie(s)", acted)
+    if acted or symlinks:
+        log.info("[repair] symlink sweep: %d season(s)/movie(s), %d dead symlink(s) re-grabbed%s",
+                 acted, symlinks, " (capped by %s)" % cap_hit if cap_hit else "")
     # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
     # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
     if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:
@@ -1956,7 +1972,7 @@ UI_SCHEMA = [
               ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", "")]),
     ("Plex scan recovery", [("PLEX_SCAN_STUCK_AFTER", "30m"), ("PLEX_SCAN_CANCEL", "true|false")]),
     ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
-              ("REPAIR_MAX_ACTIONS", "5"), ("REPAIR_LOAD_MAX", "0"),
+              ("REPAIR_MAX_ACTIONS", "20"), ("REPAIR_MAX_SYMLINKS", "100"), ("REPAIR_LOAD_MAX", "0"),
               ("REPAIR_DEBRID_MOUNT", ""),
               ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
               ("REPAIR_UNMONITORED", "false"),
