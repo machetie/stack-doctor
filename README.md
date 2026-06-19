@@ -55,7 +55,7 @@ stack-doctor scales to the access it's given:
   janitor (`JANITOR_LOG_CMD=journalctl -u decypharr ...`), and touches the library directly,
   no container-to-host bridge needed. The *arr/Plex instances are still reached over the LAN.
 
-Same `doctor.py`, same env vars; you just enable more checks where it has more power.
+Same `python -m doctor`, same env vars; you just enable more checks where it has more power.
 
 ---
 
@@ -402,7 +402,7 @@ own concurrency lane, even during playback.
 
 ## Extending
 
-Conditions are just predicates in `doctor.py` (`CONDITIONS` dict). Adding a new
+Conditions are just predicates in `doctor/checks/queue.py` (`CONDITIONS` dict). Adding a new
 detect/fix rule is a couple of lines. PRs welcome.
 
 ## License
