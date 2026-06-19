@@ -95,7 +95,7 @@ def _load_overrides():
 _load_overrides()
 
 MODE        = os.environ.get("DOCTOR_MODE", "cron").strip().lower()   # cron | event
-INTERVAL    = _i("DOCTOR_INTERVAL", 900)
+INTERVAL    = _i("DOCTOR_INTERVAL", 900)                              # default/fallback interval; kept for compatibility
 PORT        = _i("DOCTOR_PORT", 8088)                                 # webhook port (event mode)
 UI_PORT     = _i("DOCTOR_UI_PORT", 12345)                            # web dashboard port
 EN_UI       = _b("ENABLE_UI", False)
@@ -104,6 +104,19 @@ LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
 DRY_RUN     = _b("DOCTOR_DRY_RUN", False)
+
+# scheduler: each check runs on its own interval. Fast checks run every DOCTOR_FAST_INTERVAL,
+# slow checks every DOCTOR_SLOW_INTERVAL. A check can override with <CHECK_NAME>_INTERVAL.
+FAST_INTERVAL        = _dur(os.environ.get("DOCTOR_FAST_INTERVAL", "180s"), 180)     # 3 min
+SLOW_INTERVAL        = _dur(os.environ.get("DOCTOR_SLOW_INTERVAL", "1800s"), 1800)   # 30 min
+SCHEDULER_TICK       = _dur(os.environ.get("DOCTOR_SCHEDULER_TICK", "30s"), 30)      # how often scheduler wakes
+SCHEDULER_CONCURRENCY = _i("DOCTOR_SCHEDULER_CONCURRENCY", 3)                          # max parallel scheduled checks
+
+def _check_interval(cid, speed):
+    per = os.environ.get("%s_INTERVAL" % cid.upper())
+    if per:
+        return _dur(per, INTERVAL)
+    return FAST_INTERVAL if speed == "fast" else SLOW_INTERVAL
 
 # which checks are on
 EN_QUEUE      = _b("ENABLE_QUEUE", True)
@@ -1930,14 +1943,22 @@ def _plex_empty_trash():
     return len(failed) == 0, msg
 
 
-CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
-          ("decypharr", EN_DECYPHARR, check_decypharr), ("plex", EN_PLEX, check_plex),
-          ("plexscan", EN_PLEX_SCAN, check_plex_scan),
-          ("resources", EN_RESOURCES, check_resources), ("janitor", EN_JANITOR, check_janitor),
-          ("repair", EN_REPAIR, check_repair), ("bazarr", EN_BAZARR, check_bazarr),
-          ("seerr", EN_SEERR, check_seerr),
-          ("missing_seasons", EN_MISSING_SEASONS, check_missing_seasons),
-          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile)]
+CHECKS = [("queue", EN_QUEUE, check_queue, "fast"),
+          ("providers", EN_PROVIDERS, check_providers, "fast"),
+          ("decypharr", EN_DECYPHARR, check_decypharr, "fast"),
+          ("plex", EN_PLEX, check_plex, "fast"),
+          ("plexscan", EN_PLEX_SCAN, check_plex_scan, "fast"),
+          ("resources", EN_RESOURCES, check_resources, "fast"),
+          ("janitor", EN_JANITOR, check_janitor, "slow"),
+          ("repair", EN_REPAIR, check_repair, "slow"),
+          ("bazarr", EN_BAZARR, check_bazarr, "fast"),
+          ("seerr", EN_SEERR, check_seerr, "fast"),
+          ("missing_seasons", EN_MISSING_SEASONS, check_missing_seasons, "slow"),
+          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow")]
+
+# per-check locks so a scheduled check never overlaps with itself or an in-progress sweep
+_check_locks = {cid: threading.Lock() for cid, _, _, _ in CHECKS}
+_scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 
 _lock = threading.Lock()
 
@@ -1945,7 +1966,7 @@ def sweep(only=None):
     if not _lock.acquire(blocking=False):
         log.debug("sweep already running"); return
     try:
-        for cid, en, fn in CHECKS:
+        for cid, en, fn, _ in CHECKS:
             if not en:
                 continue
             try:
@@ -1954,6 +1975,48 @@ def sweep(only=None):
                 log.error("[%s] check error: %s", cid, e)
     finally:
         _lock.release()
+
+def _run_scheduled_check(cid, fn):
+    """Run a single scheduled check with per-check locking and bounded concurrency."""
+    lock = _check_locks.get(cid)
+    if lock and not lock.acquire(blocking=False):
+        log.debug("[%s] already running, skipping scheduled run", cid)
+        return
+    acquired = False
+    try:
+        if not _scheduler_sem.acquire(blocking=False):
+            log.debug("[%s] scheduler concurrency full, deferring", cid)
+            return
+        acquired = True
+        log.debug("[%s] running scheduled check", cid)
+        fn() if cid != "queue" else fn()
+    except Exception as e:
+        log.error("[%s] scheduled check error: %s", cid, e)
+    finally:
+        if acquired:
+            _scheduler_sem.release()
+        if lock:
+            lock.release()
+
+def scheduler_loop(stop):
+    """Background loop that runs each enabled check on its own interval.
+    An initial full sweep runs on startup, then checks are dispatched independently
+    so fast checks (queue, providers, plex, ...) run every few minutes while slow
+    checks (repair, janitor, missing_seasons, no_upgrade_profile) run every 30 min."""
+    log.info("[scheduler] fast=%s, slow=%s, tick=%s, concurrency=%d",
+             _human(FAST_INTERVAL), _human(SLOW_INTERVAL), _human(SCHEDULER_TICK), SCHEDULER_CONCURRENCY)
+    sweep()
+    now = time.time()
+    last_run = {cid: now for cid, en, _, _ in CHECKS if en}
+    while not stop.wait(SCHEDULER_TICK):
+        now = time.time()
+        for cid, en, fn, speed in CHECKS:
+            if not en:
+                continue
+            interval = _check_interval(cid, speed)
+            if now - last_run.get(cid, 0) >= interval:
+                last_run[cid] = now
+                threading.Thread(target=_run_scheduled_check, args=(cid, fn), daemon=True).start()
 
 # =========================================================================== #
 # web dashboard (optional, no dependencies): status + per-service health +
@@ -1964,6 +2027,8 @@ _SECRET_HINT = ("APIKEY", "API_KEY", "TOKEN", "PASSWORD", "PASS", "SECRET")
 
 UI_SCHEMA = [
     ("Mode", [("DOCTOR_MODE", "cron|event"), ("DOCTOR_INTERVAL", "900"),
+              ("DOCTOR_FAST_INTERVAL", "180s"), ("DOCTOR_SLOW_INTERVAL", "1800s"),
+              ("DOCTOR_SCHEDULER_TICK", "30s"), ("DOCTOR_SCHEDULER_CONCURRENCY", "3"),
               ("DOCTOR_DRY_RUN", "false"), ("DOCTOR_LOG_LEVEL", "INFO")]),
     ("Checks (on/off)", [("ENABLE_QUEUE", ""), ("ENABLE_PROVIDERS", ""), ("ENABLE_DECYPHARR", ""),
               ("ENABLE_PLEX", ""), ("ENABLE_PLEX_SCAN", ""), ("ENABLE_RESOURCES", ""),
@@ -2031,7 +2096,7 @@ def _ui_health():
     return [r for r in out if r]
 
 def _ui_status():
-    checks = [{"name": n, "on": bool(e)} for n, e, _ in CHECKS]
+    checks = [{"name": n, "on": bool(e)} for n, e, _, _ in CHECKS]
     checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
     return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
@@ -2223,7 +2288,7 @@ def _build_server(port):
             length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(length) if length else b""
             if path in ("/api/config", "/api/restart",
-                        "/api/plex/rescan", "/api/plex/emptytrash"):
+                        "/api/plex/rescan", "/api/plex/emptytrash", "/api/sweep") or path.startswith("/api/check/"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
                 if path == "/api/config":
@@ -2235,6 +2300,16 @@ def _build_server(port):
                 if path == "/api/plex/emptytrash":
                     threading.Thread(target=_plex_empty_trash, daemon=True).start()
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "Plex empty trash started"}))
+                if path == "/api/sweep":
+                    threading.Thread(target=sweep, daemon=True).start()
+                    return self._send(202, "application/json", json.dumps({"ok": True, "msg": "sweep started"}))
+                if path.startswith("/api/check/"):
+                    cid = path.split("/api/check/", 1)[1]
+                    for name, en, fn, _ in CHECKS:
+                        if name == cid and en:
+                            threading.Thread(target=_run_scheduled_check, args=(cid, fn), daemon=True).start()
+                            return self._send(202, "application/json", json.dumps({"ok": True, "msg": "check %s started" % cid}))
+                    return self._send(400, "application/json", json.dumps({"ok": False, "msg": "unknown or disabled check"}))
                 self._send(200, "application/json", json.dumps({"ok": True, "msg": "restarting"}))
                 log.info("[ui] restart requested"); threading.Thread(target=lambda: (time.sleep(0.4), os._exit(0)), daemon=True).start()
                 return
@@ -2257,7 +2332,7 @@ def _build_server(port):
 def main():
     global INSTANCES
     INSTANCES = load_instances()
-    enabled = [c for c, e, _ in CHECKS if e]
+    enabled = [c for c, e, _, _ in CHECKS if e]
     warmer_on = EN_WARMER and bool(PLEX_URL)
     if EN_WARMER and not PLEX_URL:
         log.warning("ENABLE_WARMER set but PLEX_URL is empty -> warmer disabled")
@@ -2295,10 +2370,7 @@ def main():
         except Exception as e:
             log.error("http bind :%d failed: %s", pnum, e)
 
-    sweep()
-    interval = max(INTERVAL, 1800) if MODE == "event" else INTERVAL
-    while not stop.wait(interval):
-        sweep()
+    scheduler_loop(stop)
     for s in servers:
         try: s.shutdown()
         except Exception: pass

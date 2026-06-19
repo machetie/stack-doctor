@@ -7,7 +7,11 @@ services:
     environment:
       # ---------- mode ----------
       DOCTOR_MODE: cron            # cron | event
-      DOCTOR_INTERVAL: "900"       # cron: seconds between sweeps
+      DOCTOR_INTERVAL: "900"       # fallback/default interval
+      DOCTOR_FAST_INTERVAL: "180s"  # queue, providers, plex, plexscan, resources, bazarr, seerr
+      DOCTOR_SLOW_INTERVAL: "1800s" # repair, janitor, missing_seasons, no_upgrade_profile
+      DOCTOR_SCHEDULER_TICK: "30s"  # how often the scheduler wakes
+      DOCTOR_SCHEDULER_CONCURRENCY: "3"  # max parallel scheduled checks
       DOCTOR_DRY_RUN: "false"      # true = log only, change nothing
       DOCTOR_LOG_LEVEL: INFO
       DOCTOR_LOG_FILE: /data/doctor.log   # rotating file log (also logs to stdout)

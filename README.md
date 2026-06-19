@@ -9,9 +9,10 @@ the failure modes: downloads that finish but never import, dead grabs stuck as
 hung decypharr FUSE mount that takes Plex down, memory/load pressure that OOMs your arrs.
 You only notice when something's "missing" or the family complains.
 
-stack-doctor runs a set of **modular checks** on an interval (or on Sonarr/Radarr webhooks),
-detects these, and fixes the safe ones automatically. No third-party dependencies, one small
-container, everything configured by env vars.
+stack-doctor runs a set of **modular checks** on independent schedules (or on Sonarr/Radarr webhooks),
+detects these, and fixes the safe ones automatically. Fast checks like queue and providers run every
+few minutes; slow checks like repair and missing_seasons run every 30 minutes. No third-party
+dependencies, one small container, everything configured by env vars.
 
 > Born out of a long night of hand-fixing exactly these problems on a usenet *arr stack.
 > Now it's a daemon so you never have to do it by hand again.
@@ -89,7 +90,9 @@ services:
     restart: unless-stopped
     environment:
       DOCTOR_MODE: cron               # cron | event
-      DOCTOR_INTERVAL: "900"
+      DOCTOR_INTERVAL: "900"         # fallback/default interval (kept for compatibility)
+      DOCTOR_FAST_INTERVAL: "180s"    # queue, providers, plex, plexscan, resources, bazarr, seerr
+      DOCTOR_SLOW_INTERVAL: "1800s"   # repair, janitor, missing_seasons, no_upgrade_profile
       DOCTOR_DRY_RUN: "true"          # start safe: log only, change nothing. flip to false when happy
       ENABLE_UI: "true"              # web dashboard on :12345 (status, per-service health, warmer, config, logs)
 
@@ -167,8 +170,13 @@ LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the da
 
 | var | default | meaning |
 |---|---|---|
-| `DOCTOR_MODE` | `cron` | `cron` (interval sweeps) or `event` (Sonarr/Radarr webhook) |
-| `DOCTOR_INTERVAL` | `900` | cron: seconds between sweeps |
+| `DOCTOR_MODE` | `cron` | `cron` (scheduled checks) or `event` (Sonarr/Radarr webhook + scheduled checks) |
+| `DOCTOR_INTERVAL` | `900` | fallback interval used when a check has no explicit interval set |
+| `DOCTOR_FAST_INTERVAL` | `180s` | interval for fast checks: queue, providers, decypharr, plex, plexscan, resources, bazarr, seerr |
+| `DOCTOR_SLOW_INTERVAL` | `1800s` | interval for slow checks: repair, janitor, missing_seasons, no_upgrade_profile |
+| `DOCTOR_SCHEDULER_TICK` | `30s` | how often the scheduler wakes to check which checks are due |
+| `DOCTOR_SCHEDULER_CONCURRENCY` | `3` | max parallel scheduled checks |
+| `<CHECK>_INTERVAL` | *(none)* | override a specific check's interval, e.g. `QUEUE_INTERVAL=60s` or `REPAIR_INTERVAL=1h` |
 | `DOCTOR_MIN_STRIKES` | `2` | item must be stuck this many consecutive checks before action (ignores transient blips like a download-client restart) |
 | `DOCTOR_MAX_ACTIONS` | `20` | max removals per sweep (rate limit, keeps re-searches gentle) |
 | `DOCTOR_BLOCKLIST` | `true` | blocklist removed grabs so a *different* release is fetched |
@@ -178,7 +186,7 @@ LAN isn't trusted. In event mode the webhook listener (`DOCTOR_PORT`) and the da
 | `DOCTOR_REMOVE_FROM_CLIENT` | `true` | also remove from the download client |
 | `DOCTOR_DRY_RUN` | `false` | `true` = log only, change nothing |
 | `DOCTOR_CONDITIONS` | *all* | comma list of conditions to act on (see table above) |
-| `DOCTOR_LOAD_MAX` | `0` | if > 0, skip a sweep when host 1-min load exceeds it (mount `/proc/loadavg:ro`) |
+| `DOCTOR_LOAD_MAX` | `0` | if > 0, skip a scheduled check when host 1-min load exceeds it (mount `/proc/loadavg:ro`) |
 | `DOCTOR_HEALTH_REPORT` | `true` | log *arr `/health` warnings at debug level |
 | `DOCTOR_STATE_FILE` | `/data/state.json` | where strike counts persist |
 | `DOCTOR_PORT` | `8088` | webhook port (event mode) |
@@ -219,7 +227,7 @@ Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 
 **Re-search priority** (Sonarr): `SeasonSearch` is used for every affected season so Sonarr has the chance to grab a season pack.
 
-**Post-repair verification** (`REPAIR_VERIFY=true`): after each re-search, doctor stores the command ID and a timestamp. On the next sweep it polls the search command status, then checks *arr download history for a new `grabbed` event. When a grab is confirmed it logs the indexer and exact release name (`[repair:verify] GRABBED 'Show Name' via NZBgeek: Show.S01E01.1080p...`). If no grab appears within `REPAIR_VERIFY_DEADLINE` it logs a warning so you know the search stalled. This is sweep-based (checked once per `DOCTOR_INTERVAL`), not real-time.
+**Post-repair verification** (`REPAIR_VERIFY=true`): after each re-search, doctor stores the command ID and a timestamp. On the next repair check it polls the search command status, then checks *arr download history for a new `grabbed` event. When a grab is confirmed it logs the indexer and exact release name (`[repair:verify] GRABBED 'Show Name' via NZBgeek: Show.S01E01.1080p...`). If no grab appears within `REPAIR_VERIFY_DEADLINE` it logs a warning so you know the search stalled. This is interval-based (checked once per `REPAIR_INTERVAL` or `DOCTOR_SLOW_INTERVAL`), not real-time.
 
 | var | default | meaning |
 |---|---|---|
@@ -230,7 +238,7 @@ Honors `DOCTOR_DRY_RUN` (logs what it would retry, changes nothing).
 | `REPAIR_LOAD_MAX` | `0` | skip the sweep when host 1-min load exceeds this (`0` = off) |
 | `REPAIR_DEBRID_MOUNT` | *(none)* | debrid mount root (e.g. `/mnt/remote/realdebrid/__all__`); if set, only symlinks pointing here are checked, and the sweep is skipped when the mount is empty or missing (debrid-down guard) |
 | `REPAIR_ITEM_INTERVAL` | `0` | seconds to wait between each re-grab action (`0` = no delay) |
-| `REPAIR_SEASON_PACKS` | `false` | after the dead-file sweep, flag Sonarr seasons whose files span multiple directories (individual episode grabs instead of a season pack) and trigger a `SeasonSearch` |
+| `REPAIR_SEASON_PACKS` | `false` | after the symlink check, flag Sonarr seasons whose files span multiple directories (individual episode grabs instead of a season pack) and trigger a `SeasonSearch` |
 | `REPAIR_UNMONITORED` | `false` | include unmonitored series/movies in both the symlink and MissingFromDisk sweeps |
 | `REPAIR_MISSING_FROM_DISK` | `false` | also scan *arr history for `MissingFromDisk` entries and re-search (usenet / direct-download mode) |
 | `REPAIR_MFD_RECHECK` | `24h` | cooldown before re-searching the same MissingFromDisk item |
@@ -279,14 +287,24 @@ Add as many as you want, numbered from 1:
 
 ## Cron vs Event mode
 
-**Cron** (default): a daemon that sweeps every `DOCTOR_INTERVAL` seconds. Simple, reliable,
-catches everything within ~`INTERVAL × MIN_STRIKES`.
+**Cron** (default): the scheduler runs each enabled check on its own interval.
+Fast checks run every `DOCTOR_FAST_INTERVAL`; slow checks run every `DOCTOR_SLOW_INTERVAL`.
+You can override any check with `<CHECK>_INTERVAL`, e.g. `QUEUE_INTERVAL=60s`.
 
-**Event**: stack-doctor runs a tiny webhook server. Point each *arr at it
+**Event**: stack-doctor also runs a tiny webhook server. Point each *arr at it
 (*Settings → Connect → Webhook*, URL `http://stack-doctor:8088`, enable **On Grab / On Import / On Manual Interaction Required**) and it sweeps the moment the *arr reports trouble.
-A slow safety-net sweep still runs in the background in case a webhook is missed. In event
+The scheduler still runs in the background so nothing is missed if a webhook is lost. In event
 mode you'll usually set `DOCTOR_MIN_STRIKES: "1"` to act immediately, the event already
 confirms the item is stuck.
+
+### Manual triggers (UI / HTTP)
+
+If `ENABLE_UI=true`, the dashboard can trigger checks on demand:
+
+- `POST /api/sweep` — run all enabled checks immediately
+- `POST /api/check/<name>` — run a specific check (e.g. `/api/check/queue`) immediately
+
+Both require the same authentication as the dashboard (`DOCTOR_UI_TOKEN`).
 
 ---
 
