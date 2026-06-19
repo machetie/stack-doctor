@@ -97,10 +97,10 @@ def _ui_status():
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
     return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
 def _ui_warmer():
-    rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warm_recent)]
+    rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warmer._warm_recent)]
     return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
             "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
-            "total": _warm_count[0], "recent": rec[:40]}
+            "total": _warmer._warm_count[0], "recent": rec[:40]}
 def _ui_config():
     groups = []
     for g, items in UI_SCHEMA:
