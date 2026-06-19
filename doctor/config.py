@@ -84,8 +84,14 @@ EN_PLEX_SCAN  = _b("ENABLE_PLEX_SCAN", False)   # detect + recover a wedged Plex
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # probe library for dead files -> remove + re-search
 EN_MISSING_SEASONS    = _b("ENABLE_MISSING_SEASONS", False)
 MS_MIN_AGE_HOURS      = _f("MISSING_SEASONS_MIN_AGE_HOURS", 1)   # ignore seasons added less than this long ago
-MS_MAX_ACTIONS        = _i("MISSING_SEASONS_MAX_ACTIONS", 5)      # SeasonSearches per sweep
-MS_RECHECK            = _dur(os.environ.get("MISSING_SEASONS_RECHECK", "24h"), 86400)  # cooldown between re-searching same season
+MS_MAX_ACTIONS        = _i("MISSING_SEASONS_MAX_ACTIONS", 25)     # SeasonSearches per sweep
+MS_RECHECK            = _dur(os.environ.get("MISSING_SEASONS_RECHECK", "6h"), 21600)  # cooldown between re-searching same season
+MS_SORT_BY            = os.environ.get("MISSING_SEASONS_SORT_BY", "mixed").strip().lower()  # mixed | added | episodes
+MS_BACKFILL_BATCH     = _i("MISSING_SEASONS_BACKFILL_BATCH", 50)  # sleep after this many SeasonSearches in backfill mode
+MS_BACKFILL_DELAY     = _f("MISSING_SEASONS_BACKFILL_DELAY", 0)   # seconds to pause between backfill batches
+# Run missing_seasons more frequently than other slow checks by default.
+if not os.environ.get("MISSING_SEASONS_INTERVAL"):
+    os.environ["MISSING_SEASONS_INTERVAL"] = "15m"
 EN_NO_UPGRADE_PROFILE   = _b("ENABLE_NO_UPGRADE_PROFILE", False)
 NO_UPGRADE_PROFILE_ID   = _i("NO_UPGRADE_PROFILE_ID", 0)   # target quality profile id in Sonarr
 NO_UPGRADE_PROFILE_NAME = os.environ.get("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)")

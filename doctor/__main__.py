@@ -23,6 +23,9 @@ from .webui import _build_server
 def main():
     import doctor.clients as _clients
     _clients.INSTANCES[:] = load_instances()
+    if "--backfill-missing-seasons" in sys.argv:
+        sys.argv.remove("--backfill-missing-seasons")
+        backfill_missing_seasons()
     enabled = [c for c, e, _, _ in CHECKS if e]
     warmer_on = EN_WARMER and bool(PLEX_URL)
     if EN_WARMER and not PLEX_URL:
