@@ -14,8 +14,8 @@ Modular checks, each toggled and configured by environment variables:
   resources  host load / memory / swap  - report pressure, optional drop_caches relief
   janitor    usenet dead files          - quarantine library symlinks for permanently-dead
                                            releases (reversible) from a decypharr log file
-  repair     library integrity          - probe media files for unreadable/dead (decypharr link or
-                                           usenet article gone) -> remove + re-search the owning *arr
+  repair     library integrity          - API-first dead-symlink check via *arr file records
+                                           (debrid link gone) -> remove + re-search the owning *arr
   bazarr     Bazarr                     - reachability check
   seerr      Overseerr/Jellyseerr/Seerr - auto-retry FAILED requests (arr add timed out under load)
   warmer     Plex-driven precache       - read the head of likely-next media so playback starts
@@ -36,7 +36,6 @@ import subprocess
 import sys
 import threading
 import time
-import concurrent.futures
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -222,33 +221,24 @@ JAN_LOG_CMD   = os.environ.get("JANITOR_LOG_CMD", "")               # cmd printi
 JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing,marked as bad").split(",")
 
-# repair: walk the library, probe media files for unreadable/0-byte/dead-symlink (a dead debrid link or
-# a usenet article gone). A file must fail REPAIR_MIN_STRIKES consecutive probes before it is acted on,
-# so a transient mount hiccup never triggers a delete. When a SYSTEMIC failure is detected (the mount is
-# hung -> many files failing at once) repair backs off entirely and leaves recovery to the decypharr/
-# plexscan checks, so it can never mass-delete + mass-regrab during an outage. Gentle by design:
-# load-guarded, per-file read timeout, capped probes + actions per sweep, slow rotation through the lib.
+# repair: API-first dead-symlink detection. Query *arr for file records, then check each symlink's
+# readlink target via os.path.exists() (fast, no FUSE read). Group dead files by season/movie,
+# delete the *arr file records, toggle the season/movie monitor off+on, and trigger a search.
+# This avoids the slow/fragile filesystem walk + read-probe approach (no sampling, strikes, or abort logic).
+# REPAIR_LIBRARY_PATHS is optional: if set, only file records under these roots are considered.
 # REPAIR_DEBRID_MOUNT: optional path to the debrid mount root (e.g. /mnt/remote/realdebrid/__all__).
-# If set, repair checks that the mount is non-empty before every sweep. An empty/missing mount means
-# the debrid service is down or the mount is unmounted -> skip the sweep entirely to prevent mass-regrab.
-MEDIA_EXTS              = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".m2ts", ".mpg", ".flv")
+# If set, only symlinks whose target starts with this path are checked, and the mount must be non-empty
+# before every sweep (empty/missing -> debrid down -> skip to prevent mass-regrab).
 REPAIR_LIBS             = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
                            os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
-REPAIR_MIN_STRIKES      = _i("REPAIR_MIN_STRIKES", 3)        # consecutive failed probes before a file is "dead"
-REPAIR_MAX_SCAN         = _i("REPAIR_MAX_SCAN", 200)         # media files probed per sweep (rotates through the library)
 REPAIR_MAX_ACTIONS      = _i("REPAIR_MAX_ACTIONS", 5)        # re-grabs per sweep (keep gentle on the providers)
-REPAIR_READ_TIMEOUT     = _i("REPAIR_READ_TIMEOUT", 20)      # abandon a single file probe after this long (hung-mount guard)
-REPAIR_RECHECK          = _dur(os.environ.get("REPAIR_RECHECK", "12h"), 43200)  # don't re-probe a known-good file more often than this
 REPAIR_LOAD_MAX         = _f("REPAIR_LOAD_MAX", 0)           # skip the whole repair sweep above this host 1-min load (0=off)
-REPAIR_ABORT_STREAK     = _i("REPAIR_ABORT_STREAK", 6)       # this many probe failures in a row -> assume hung mount, abort sweep
-REPAIR_SYSTEMIC_PCT     = _f("REPAIR_SYSTEMIC_PCT", 25)      # if >= this %% of probed files fail, treat as systemic -> don't act
-REPAIR_FFPROBE          = _b("REPAIR_FFPROBE", False)        # also ffprobe the stream (deeper corruption check; needs ffprobe)
 REPAIR_DEBRID_MOUNT     = os.environ.get("REPAIR_DEBRID_MOUNT", "")  # debrid mount root; non-empty means "check it's live before sweep"
 REPAIR_ITEM_INTERVAL    = _dur(os.environ.get("REPAIR_ITEM_INTERVAL", "0"), 0)  # seconds to wait between each re-grab (0=off)
 REPAIR_SEASON_PACKS     = _b("REPAIR_SEASON_PACKS", False)   # flag sonarr seasons spread across multiple dirs (non-season-pack)
 REPAIR_UNMONITORED      = _b("REPAIR_UNMONITORED", False)    # include unmonitored series/movies in the repair sweep
 # MissingFromDisk mode: query *arr download history for items Sonarr/Radarr knows are missing from disk
-# (reason=MissingFromDisk) and re-trigger a search. Complements the filesystem probe for usenet/direct
+# (reason=MissingFromDisk) and re-trigger a search. Complements the symlink check for usenet/direct
 # downloads where no symlink exists to probe. Shares REPAIR_MAX_ACTIONS budget with the symlink sweep.
 REPAIR_MISSING_FROM_DISK = _b("REPAIR_MISSING_FROM_DISK", False)  # enable history-based missing-file re-grab
 REPAIR_MFD_RECHECK       = _dur(os.environ.get("REPAIR_MFD_RECHECK", "24h"), 86400)  # cooldown per item before re-searching
@@ -982,68 +972,8 @@ def check_seerr():
         log.info("[seerr] re-drove %d failed request(s)", acted)
 
 # =========================================================================== #
-# CHECK: repair (probe library for dead files -> remove + re-search the owning *arr)
+# CHECK: repair (API-first dead-symlink detection -> remove + re-search the owning *arr)
 # =========================================================================== #
-
-def _iter_media(root):
-    """Yield media file paths under root WITHOUT following symlinks, so a hung mount can never
-    stall the directory walk itself (only the per-file probe touches the mount, and that is
-    timeout-protected). Recurses into real dirs only."""
-    try:
-        with os.scandir(root) as it:
-            entries = list(it)
-    except Exception:
-        return
-    for e in entries:
-        try:
-            if e.is_dir(follow_symlinks=False):
-                for x in _iter_media(e.path):
-                    yield x
-            elif e.name.lower().endswith(MEDIA_EXTS):
-                yield e.path
-        except Exception:
-            continue
-
-def _probe_file(fp, timeout):
-    """True if fp is a live, non-empty file whose head reads within timeout. All filesystem ops run
-    inside the worker thread so a hung FUSE path (stat/open/read) can't block the caller; a hang or
-    any error returns False."""
-    def _do():
-        try:
-            if os.path.islink(fp) and not os.path.exists(fp):    # dead symlink (debrid link gone)
-                return False
-            if os.path.getsize(fp) <= 0:                         # 0-byte / placeholder
-                return False
-            with open(fp, "rb", buffering=0) as fh:
-                fh.read(131072)
-            return True
-        except Exception:
-            return False
-    
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_do)
-            return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        return False
-    except Exception:
-        return False
-
-def _ffprobe_ok(fp, timeout):
-    try:
-        p = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                            "-show_entries", "stream=codec_type", "-of", "csv=p=0", fp],
-                           capture_output=True, text=True, timeout=timeout)
-        return p.returncode == 0 and "video" in (p.stdout or "")
-    except Exception:
-        return False
-
-def _file_ok(fp):
-    if not _probe_file(fp, REPAIR_READ_TIMEOUT):
-        return False
-    if REPAIR_FFPROBE and not _ffprobe_ok(fp, REPAIR_READ_TIMEOUT):
-        return False
-    return True
 
 def _debrid_mount_ok():
     """Return True if the debrid mount looks live (path exists and has at least one child entry).
@@ -1062,34 +992,75 @@ def _debrid_mount_ok():
         log.warning("[repair] debrid mount %s not accessible (%s) -> skipping sweep", p, str(e)[:60])
         return False
 
-def _radarr_resolve(movies, fp, include_unmonitored=False):
-    for m in movies:
-        if not include_unmonitored and not m.get("monitored", True):
-            continue
-        mf = m.get("movieFile") or {}
-        if mf.get("path") == fp:
-            return (m.get("id"), mf.get("id"), (m.get("title") or "")[:70])
-    return None
+def _dead_symlink(fp):
+    """True if fp is a symlink whose target no longer exists. If REPAIR_DEBRID_MOUNT is set, only
+    symlinks whose target lives under that root are considered (avoids acting on local files)."""
+    try:
+        if not os.path.islink(fp):
+            return False
+        target = os.readlink(fp)
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(fp), target)
+        if REPAIR_DEBRID_MOUNT and not target.startswith(REPAIR_DEBRID_MOUNT):
+            return False
+        return not os.path.exists(target)
+    except Exception:
+        return False
 
-def _sonarr_resolve(arr, series, fp, include_unmonitored=False):
-    ser = next((s for s in series
-                if (s.get("path") or "").rstrip("/") and
-                   (fp == (s.get("path") or "").rstrip("/") or fp.startswith((s.get("path") or "").rstrip("/") + "/"))), None)
-    if not ser:
-        return None
-    if not include_unmonitored and not ser.get("monitored", True):
-        return None
-    sid = ser.get("id")
-    all_eps = arr.episodes(sid)
-    efid = next((ef.get("id") for ef in arr.episode_files(sid) if ef.get("path") == fp), None)
-    if not efid:
-        return None
-    matched_eps = [e for e in all_eps
-                   if e.get("episodeFileId") == efid and (include_unmonitored or e.get("monitored", True))]
-    epids = [e.get("id") for e in matched_eps]
-    # season number — all matched episodes belong to the same file, so take the first
-    season_number = matched_eps[0].get("seasonNumber") if matched_eps else None
-    return (sid, efid, epids, season_number, (ser.get("title") or "")[:60])
+def _radarr_dead_files(movies):
+    """Yield (movie_id, title, movie_file_id) for monitored movies whose on-disk symlink is dead.
+    Skips unmonitored movies unless REPAIR_UNMONITORED."""
+    for m in movies:
+        if not m.get("monitored", True) and not REPAIR_UNMONITORED:
+            continue
+        mid = m.get("id")
+        mf = m.get("movieFile") or {}
+        fp = mf.get("path")
+        if not mid or not fp:
+            continue
+        if REPAIR_LIBS and not any(fp.startswith(p) for p in REPAIR_LIBS):
+            continue
+        if _dead_symlink(fp):
+            yield mid, (m.get("title") or "")[:70], mf.get("id")
+
+def _sonarr_dead_files(arr, series):
+    """Yield (series_id, title, season_number, [episode_file_ids]) per season that has dead symlinks.
+    Skips unmonitored series unless REPAIR_UNMONITORED."""
+    for ser in series:
+        if not ser.get("monitored", True) and not REPAIR_UNMONITORED:
+            continue
+        sid = ser.get("id")
+        if not sid:
+            continue
+        title = (ser.get("title") or "")[:70]
+        try:
+            efiles = arr.episode_files(sid)
+            eps = arr.episodes(sid)
+        except Exception:
+            continue
+        # episodeFile objects may not include seasonNumber, so cross-reference with episodes
+        efid_to_season = {}
+        for ep in eps:
+            if ep.get("episodeFileId"):
+                efid_to_season[ep["episodeFileId"]] = ep.get("seasonNumber")
+        dead_by_season = {}
+        for ef in efiles:
+            fp = ef.get("path")
+            if not fp:
+                continue
+            if REPAIR_LIBS and not any(fp.startswith(p) for p in REPAIR_LIBS):
+                continue
+            if not _dead_symlink(fp):
+                continue
+            efid = ef.get("id")
+            if not efid:
+                continue
+            sn = ef.get("seasonNumber") if ef.get("seasonNumber") is not None else efid_to_season.get(efid)
+            if sn is None:
+                continue
+            dead_by_season.setdefault(sn, []).append(efid)
+        for sn, efids in dead_by_season.items():
+            yield sid, title, sn, efids
 
 def _sonarr_season_pack_check(arr, series):
     """Yield (series_title, season_number, arr) for any fully-available sonarr season whose episode
@@ -1263,102 +1234,91 @@ def _repair_record_verify(state, arr, title, cmd_id, media_id, entity_ids):
         "deadline":  time.time() + REPAIR_VERIFY_DEADLINE,
     }
 
-def _repair_one(fp, caches, state=None):
-    """Map a dead file to its *arr item, delete the (dead) file record, and trigger a fresh search.
-    The blocklist/churn handling on the queue side then keeps it from re-grabbing the same dead release."""
-    for arr in INSTANCES:
-        if arr.kind == "radarr":
-            hit = _radarr_resolve(caches.setdefault(arr.name, arr.movies()), fp, REPAIR_UNMONITORED)
-            if hit:
-                mid, mfid, title = hit
-                if DRY_RUN:
-                    log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
-                if mfid:
-                    arr.delete_file(mfid)
-                cmd_id = arr.command("MoviesSearch", movieIds=[mid])
-                log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
-                if REPAIR_VERIFY and state is not None:
-                    _repair_record_verify(state, arr, title, cmd_id, mid, [mid])
-                return True
-        elif arr.kind == "sonarr":
-            hit = _sonarr_resolve(arr, caches.setdefault(arr.name, arr.series()), fp, REPAIR_UNMONITORED)
-            if hit:
-                sid, efid, epids, season_number, title = hit
-                if DRY_RUN:
-                    log.info("[repair:%s] DRY-RUN would remove + re-search: %s", arr.name, title); return True
-                if efid:
-                    arr.delete_file(efid)
-                # prefer SeasonSearch (finds a season pack if available) then fall back to EpisodeSearch
-                if season_number:
-                    cmd_id = arr.command("SeasonSearch", seriesId=sid, seasonNumber=season_number)
-                elif epids:
-                    cmd_id = arr.command("EpisodeSearch", episodeIds=epids)
-                else:
-                    cmd_id = arr.command("SeriesSearch", seriesId=sid)
-                log.warning("[repair:%s] dead file -> removed record + re-searching: %s", arr.name, title)
-                if REPAIR_VERIFY and state is not None:
-                    _repair_record_verify(state, arr, title, cmd_id, sid, epids)
-                return True
-    log.info("[repair] dead file not matched to any *arr (left in place): %s", os.path.basename(fp))
-    return False
+def _repair_radarr_movie(arr, mid, title, mfid, state=None):
+    """Delete a dead movie file record, toggle the movie monitor off+on, and re-search."""
+    if DRY_RUN:
+        log.info("[repair:%s] DRY-RUN would delete dead file + re-search movie: %s", arr.name, title)
+        return True
+    if mfid:
+        arr.delete_file(mfid)
+    # toggle monitor off+on to force the arr to refresh the title's availability state
+    try:
+        arr.set_monitored([mid], False)
+        arr.set_monitored([mid], True)
+    except Exception as e:
+        log.warning("[repair:%s] monitor toggle failed for movie %s: %s", arr.name, title, str(e)[:70])
+    cmd_id = arr.command("MoviesSearch", movieIds=[mid])
+    log.warning("[repair:%s] dead symlink -> deleted file + re-searching movie: %s", arr.name, title)
+    if REPAIR_VERIFY and state is not None:
+        _repair_record_verify(state, arr, title, cmd_id, mid, [mid])
+    return True
+
+def _repair_sonarr_season(arr, sid, title, season_number, efids, state=None):
+    """Delete all dead episode file records for a season, toggle the season's episodes off+on, and
+    trigger a SeasonSearch so the whole season is treated as a unit."""
+    if DRY_RUN:
+        log.info("[repair:%s] DRY-RUN would delete %d dead file(s) + re-search season: %s S%02d",
+                 arr.name, len(efids), title, season_number)
+        return True
+    for efid in efids:
+        arr.delete_file(efid)
+    # toggle every episode in this season off then on to force a fresh availability state
+    epids = []
+    try:
+        eps = arr.episodes(sid)
+        epids = [e.get("id") for e in eps if e.get("seasonNumber") == season_number and e.get("id")]
+        if epids:
+            arr.set_monitored(epids, False)
+            arr.set_monitored(epids, True)
+    except Exception as e:
+        log.warning("[repair:%s] monitor toggle failed for %s S%02d: %s", arr.name, title, season_number, str(e)[:70])
+    cmd_id = arr.command("SeasonSearch", seriesId=sid, seasonNumber=season_number)
+    log.warning("[repair:%s] dead symlinks -> deleted %d file(s) + re-searching season: %s S%02d",
+                arr.name, len(efids), title, season_number)
+    if REPAIR_VERIFY and state is not None:
+        _repair_record_verify(state, arr, title, cmd_id, sid, epids)
+    return True
 
 def check_repair():
-    if not (REPAIR_LIBS and INSTANCES):
-        log.debug("[repair] need REPAIR_LIBRARY_PATHS (or JANITOR_LIBRARY_PATHS) + a sonarr/radarr instance"); return
+    if not INSTANCES:
+        log.debug("[repair] need at least one sonarr/radarr instance"); return
     if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
         log.info("[repair] host load > %.0f -> skip sweep", REPAIR_LOAD_MAX); return
     if not _debrid_mount_ok():
         return
-    state = _load_state(); rs = state.setdefault("__repair__", {})
+    state = _load_state()
     # verify pending searches from previous sweeps before starting a new one
     if REPAIR_VERIFY:
         _repair_verify_pending(state)
-        _save_state(state)
-    now = time.time(); checked = 0; failed = 0; streak = 0; broken = []; aborted = False
-    for libp in REPAIR_LIBS:
-        if aborted:
-            break
-        for fp in _iter_media(libp):
-            meta = rs.get(fp)
-            if meta and meta.get("strikes", 0) == 0 and now - meta.get("last", 0) < REPAIR_RECHECK:
-                continue                                        # recently confirmed good -> skip (rotate slowly)
-            if checked >= REPAIR_MAX_SCAN:
-                aborted = True; break
-            checked += 1
-            if _file_ok(fp):
-                rs[fp] = {"strikes": 0, "last": now}; streak = 0
-                continue
-            failed += 1; streak += 1
-            m = rs.get(fp) or {"strikes": 0}
-            m["strikes"] = m.get("strikes", 0) + 1; m["last"] = now; rs[fp] = m
-            if m["strikes"] >= REPAIR_MIN_STRIKES:
-                broken.append(fp)
-            if streak >= REPAIR_ABORT_STREAK:                   # many failures in a row -> mount likely hung, bail
-                log.warning("[repair] %d failed probes in a row -> hung mount? aborting sweep, deferring to decypharr/plexscan", streak)
-                aborted = True; broken = []; break
-    # systemic guard: a big fraction failing means the mount is sick, not individual dead files -> don't act
-    if broken and checked >= 8 and (failed * 100.0 / checked) >= REPAIR_SYSTEMIC_PCT:
-        log.warning("[repair] %d/%d probes failed (>= %.0f%%) -> systemic (hung mount?), NOT re-grabbing this sweep",
-                    failed, checked, REPAIR_SYSTEMIC_PCT)
-        broken = []
     acted = 0
-    if broken:
-        caches = {}
-        for fp in broken:
-            if acted >= REPAIR_MAX_ACTIONS:
-                break
-            if _repair_one(fp, caches, state):
-                rs.pop(fp, None); acted += 1
-                if REPAIR_ITEM_INTERVAL > 0:
-                    time.sleep(REPAIR_ITEM_INTERVAL)
-    if checked:                                                 # prune state for files that no longer exist (lstat, no mount touch)
-        for p in list(rs):
-            if not os.path.lexists(p):
-                rs.pop(p, None)
-    _save_state(state)
-    if checked or broken:
-        log.info("[repair] probed %d (%d failed), %d dead (>= %d strikes), %d re-grabbed",
-                 checked, failed, len(broken), REPAIR_MIN_STRIKES, acted)
+    for arr in INSTANCES:
+        if arr.kind not in ("sonarr", "radarr"):
+            continue
+        if acted >= REPAIR_MAX_ACTIONS:
+            break
+        try:
+            if arr.kind == "sonarr":
+                series = arr.series()
+                for sid, title, sn, efids in _sonarr_dead_files(arr, series):
+                    if acted >= REPAIR_MAX_ACTIONS:
+                        break
+                    if _repair_sonarr_season(arr, sid, title, sn, efids, state):
+                        acted += 1
+                        if REPAIR_ITEM_INTERVAL > 0:
+                            time.sleep(REPAIR_ITEM_INTERVAL)
+            else:
+                movies = arr.movies()
+                for mid, title, mfid in _radarr_dead_files(movies):
+                    if acted >= REPAIR_MAX_ACTIONS:
+                        break
+                    if _repair_radarr_movie(arr, mid, title, mfid, state):
+                        acted += 1
+                        if REPAIR_ITEM_INTERVAL > 0:
+                            time.sleep(REPAIR_ITEM_INTERVAL)
+        except Exception as e:
+            log.warning("[repair:%s] sweep error: %s", arr.name, str(e)[:70])
+    if acted:
+        log.info("[repair] symlink sweep re-grabbed %d season(s)/movie(s)", acted)
     # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
     # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
     if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:
@@ -1381,10 +1341,10 @@ def check_repair():
                     if REPAIR_ITEM_INTERVAL > 0:
                         time.sleep(REPAIR_ITEM_INTERVAL)
     # MissingFromDisk check: query *arr history for items Sonarr/Radarr knows are gone from disk.
-    # Runs after the filesystem sweep so both modes share the REPAIR_MAX_ACTIONS budget.
+    # Runs after the symlink sweep so both modes share the REPAIR_MAX_ACTIONS budget.
     if REPAIR_MISSING_FROM_DISK and acted < REPAIR_MAX_ACTIONS:
         acted = _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
-        _save_state(state)
+    _save_state(state)
 
 # =========================================================================== #
 # WARMER: precache the head of likely-next media so playback starts instantly
@@ -1996,9 +1956,8 @@ UI_SCHEMA = [
               ("ENABLE_MISSING_SEASONS", ""), ("ENABLE_NO_UPGRADE_PROFILE", "")]),
     ("Plex scan recovery", [("PLEX_SCAN_STUCK_AFTER", "30m"), ("PLEX_SCAN_CANCEL", "true|false")]),
     ("Repair (dead-file re-grab)", [("REPAIR_LIBRARY_PATHS", "/mnt/library/movies,/mnt/library/tv"),
-              ("REPAIR_MIN_STRIKES", "3"), ("REPAIR_MAX_SCAN", "200"), ("REPAIR_MAX_ACTIONS", "5"),
-              ("REPAIR_READ_TIMEOUT", "20"), ("REPAIR_RECHECK", "12h"), ("REPAIR_LOAD_MAX", "0"),
-              ("REPAIR_FFPROBE", "false"), ("REPAIR_DEBRID_MOUNT", ""),
+              ("REPAIR_MAX_ACTIONS", "5"), ("REPAIR_LOAD_MAX", "0"),
+              ("REPAIR_DEBRID_MOUNT", ""),
               ("REPAIR_ITEM_INTERVAL", "0"), ("REPAIR_SEASON_PACKS", "false"),
               ("REPAIR_UNMONITORED", "false"),
               ("REPAIR_MISSING_FROM_DISK", "false"), ("REPAIR_MFD_RECHECK", "24h"),

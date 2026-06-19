@@ -119,16 +119,11 @@ services:
       JANITOR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies
       JANITOR_DECYPHARR_LOG: /logs/decypharr.log     # mount decypharr's error log here
 
-      # ---------- repair (ENABLE_REPAIR: probe library for dead files -> remove + re-search) ----------
-      REPAIR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies   # defaults to JANITOR_LIBRARY_PATHS if unset
-      REPAIR_MIN_STRIKES: "3"        # consecutive failed probes before a file is treated as dead (ignores blips)
-      REPAIR_MAX_SCAN: "200"         # media files probed per sweep (rotates through the library over time)
-      REPAIR_MAX_ACTIONS: "5"        # re-grabs per sweep (stay gentle on the providers)
-      REPAIR_READ_TIMEOUT: "20"      # abandon a single file probe after this long (set above decypharr's read timeout)
-      REPAIR_RECHECK: "12h"          # don't re-probe a known-good file more often than this
+      # ---------- repair (ENABLE_REPAIR: API-first dead-symlink detection -> remove + re-search) ----------
+      # REPAIR_LIBRARY_PATHS: /mnt/library/tv,/mnt/library/movies   # optional: only check *arr file records under these roots
+      REPAIR_MAX_ACTIONS: "5"        # re-grabs per sweep across all modes (symlink + MissingFromDisk + season-pack)
       REPAIR_LOAD_MAX: "0"           # skip the repair sweep above this host 1-min load (0 = off)
-      # REPAIR_FFPROBE: "false"      # also ffprobe the stream (deeper corruption check; needs ffprobe in the image)
-      # REPAIR_DEBRID_MOUNT: /mnt/remote/realdebrid/__all__  # skip sweep if mount is empty/missing (debrid down guard)
+      # REPAIR_DEBRID_MOUNT: /mnt/remote/realdebrid/__all__  # only check symlinks pointing here; skip if mount empty/missing
       # REPAIR_ITEM_INTERVAL: "0"    # seconds to wait between each re-grab (0 = no delay; gentle on providers)
       # REPAIR_SEASON_PACKS: "false" # flag sonarr seasons spread across multiple dirs and search for a season pack
       # REPAIR_UNMONITORED: "false"  # include unmonitored series/movies in the repair sweep
