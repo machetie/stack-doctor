@@ -156,6 +156,11 @@ JAN_LOG       = os.environ.get("JANITOR_DECYPHARR_LOG", "")         # log file p
 JAN_LOG_CMD   = os.environ.get("JANITOR_LOG_CMD", "")               # cmd printing the log, e.g. "journalctl -u decypharr -n 10000 --no-hostname"
 JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing,marked as bad").split(",")
+JAN_ERROR_PATTERNS = [p.strip() for p in os.environ.get(
+    "JANITOR_ERROR_PATTERNS",
+    "panic,fatal,runtime error,rate limit,rate limited,too many requests,429,cloudflare,cf-ray,blocked,403,unauthorized,token expired,401,context deadline exceeded,connection refused,timeout,i/o timeout"
+).split(",") if p.strip()]
+JAN_ALERT_COOLDOWN = _dur(os.environ.get("JANITOR_ALERT_COOLDOWN", "5m"), 300)
 REPAIR_LIBS             = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",
                            os.environ.get("JANITOR_LIBRARY_PATHS", "")).split(",") if p.strip()]
 REPAIR_MAX_ACTIONS      = _i("REPAIR_MAX_ACTIONS", 20)       # re-grab/search commands per sweep
