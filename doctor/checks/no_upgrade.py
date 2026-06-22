@@ -32,7 +32,7 @@ def check_no_upgrade_profile():
         target_id = NO_UPGRADE_PROFILE_ID
         try:
             if not target_id:
-                profiles = json.load(arr._req("GET", "/qualityprofile"))
+                profiles = arr.quality_profiles()
                 match = next((p for p in profiles if p["name"] == NO_UPGRADE_PROFILE_NAME), None)
                 if not match:
                     log.warning("[no_upgrade_profile:%s] profile %r not found — skipping", arr.name, NO_UPGRADE_PROFILE_NAME)
@@ -41,7 +41,7 @@ def check_no_upgrade_profile():
                 log.info("[no_upgrade_profile:%s] resolved profile %r -> id %d", arr.name, NO_UPGRADE_PROFILE_NAME, target_id)
 
             # Fetch all series
-            all_series = json.load(arr._req("GET", "/series"))
+            all_series = arr.series()
         except Exception as e:
             log.warning("[no_upgrade_profile:%s] fetch failed: %s", arr.name, e)
             continue
@@ -74,7 +74,7 @@ def check_no_upgrade_profile():
         for s in to_move:
             try:
                 s["qualityProfileId"] = target_id
-                arr._req("PUT", "/series/%d" % s["id"], data=json.dumps(s).encode())
+                arr.update_series(s)
                 log.info("[no_upgrade_profile:%s] -> %s", arr.name, s["title"])
                 moved += 1
             except Exception as e:

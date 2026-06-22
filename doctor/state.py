@@ -14,8 +14,6 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-import time
-import threading
 from .config import *
 from .clients import *
 

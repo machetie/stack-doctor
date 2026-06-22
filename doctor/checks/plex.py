@@ -35,9 +35,8 @@ def check_plex():
             log.debug("[plex] refresh failed: %s", e)
 def _plex_sections():
     """Return list of (key, title) for all Plex library sections. Raises on error."""
-    import xml.etree.ElementTree as ET
-    plex_url   = os.environ.get("PLEX_URL", "").rstrip("/")
-    plex_token = os.environ.get("PLEX_TOKEN", "")
+    plex_url   = PLEX_URL
+    plex_token = PLEX_TOKEN
     if not plex_url or not plex_token:
         raise ValueError("PLEX_URL or PLEX_TOKEN not set")
     with urllib.request.urlopen(

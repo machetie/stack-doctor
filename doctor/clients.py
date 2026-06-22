@@ -118,6 +118,14 @@ class Arr:
     def series(self):
         return self._jget("/series") or []                      # sonarr
 
+    def quality_profiles(self):
+        return self._jget("/qualityprofile") or []              # sonarr/radarr
+
+    def update_series(self, series_dict):
+        """PUT the full series dict back (used to change qualityProfileId etc.)."""
+        return self._req("PUT", "/series/%d" % series_dict["id"],
+                         data=json.dumps(series_dict).encode())
+
     def episode_files(self, sid):
         return self._jget("/episodefile?seriesId=%d" % sid) or []
 

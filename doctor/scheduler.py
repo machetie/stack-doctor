@@ -2,28 +2,37 @@
 import time
 import threading
 import logging
+from collections import namedtuple
 from typing import Optional, Callable, Any
 from .config import *
 from .checks import *  # check_* functions referenced by CHECKS
 
-# Each entry: (check_id, enabled, fn, speed, default_interval_override)
-# speed controls which of FAST_INTERVAL / SLOW_INTERVAL applies when no env var is set.
-# default_interval_override (optional int seconds) takes precedence over speed but can still
-# be overridden by a <CHECK_ID>_INTERVAL env var.  Use it for checks that need a tighter
-# default than the generic slow interval without a module-level os.environ mutation.
-CHECKS = [("queue",              EN_QUEUE,              check_queue,              "fast", None),
-          ("providers",          EN_PROVIDERS,          check_providers,          "fast", None),
-          ("decypharr",          EN_DECYPHARR,          check_decypharr,          "fast", None),
-          ("plex",               EN_PLEX,               check_plex,               "fast", None),
-          ("plexscan",           EN_PLEX_SCAN,          check_plex_scan,          "fast", None),
-          ("resources",          EN_RESOURCES,          check_resources,          "fast", None),
-          ("janitor",            EN_JANITOR,            check_janitor,            "slow", None),
-          ("repair",             EN_REPAIR,             check_repair,             "slow", None),
-          ("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None),
-          ("seerr",              EN_SEERR,              check_seerr,              "fast", None),
-          ("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900),   # 15 min default
-          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow", None),
-          ("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None)]
+# Descriptor for a scheduled check.
+# Fields:
+#   cid         – unique string id; used for logging and env-var lookup (<CID>_INTERVAL)
+#   enabled     – bool from config (EN_* constant); False means the check never runs
+#   fn          – the check_* function to call each cycle
+#   speed       – "fast" or "slow"; selects FAST_INTERVAL / SLOW_INTERVAL when no override
+#   default_iv  – optional int (seconds) that overrides speed without touching os.environ;
+#                 still overrideable by a <CID>_INTERVAL env var
+#
+# Using a namedtuple makes field access self-documenting and turns wrong-width table
+# edits into a TypeError at import time rather than a ValueError mid-sweep.
+CheckEntry = namedtuple("CheckEntry", ["cid", "enabled", "fn", "speed", "default_iv"])
+
+CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,              "fast", None),
+          CheckEntry("providers",          EN_PROVIDERS,          check_providers,          "fast", None),
+          CheckEntry("decypharr",          EN_DECYPHARR,          check_decypharr,          "fast", None),
+          CheckEntry("plex",               EN_PLEX,               check_plex,               "fast", None),
+          CheckEntry("plexscan",           EN_PLEX_SCAN,          check_plex_scan,          "fast", None),
+          CheckEntry("resources",          EN_RESOURCES,          check_resources,          "fast", None),
+          CheckEntry("janitor",            EN_JANITOR,            check_janitor,            "slow", None),
+          CheckEntry("repair",             EN_REPAIR,             check_repair,             "slow", None),
+          CheckEntry("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None),
+          CheckEntry("seerr",              EN_SEERR,              check_seerr,              "fast", None),
+          CheckEntry("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900),   # 15 min default
+          CheckEntry("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow", None),
+          CheckEntry("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None)]
 _check_locks = {cid: threading.Lock() for cid, _, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()
