@@ -5,12 +5,9 @@ import json
 import re
 import time
 import signal
-import subprocess
 import threading
 import logging
 import logging.handlers
-import urllib.request
-import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -245,34 +242,7 @@ if len(handlers) > 1:                         # file handler was added
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     handlers=handlers_colored)
 log = logging.getLogger("doctor")
-def http_code(url, headers=None, t=10):
-    try:
-        r = urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=t)
-        return r.status
-    except urllib.error.HTTPError as e:
-        return e.code
-    except Exception:
-        return 0
-def run_cmd(cmd):
-    if not cmd:
-        return None
-    try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-        return (p.returncode, (p.stdout + p.stderr).strip()[:300])
-    except Exception as e:
-        return (1, "cmd error: " + str(e)[:120])
-def run_output(cmd, t=120):
-    try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t)
-        return p.stdout
-    except Exception as e:
-        log.warning("log cmd failed: %s", str(e)[:80])
-        return ""
-def host_load():
-    try:
-        with open("/proc/loadavg") as f:
-            return float(f.read().split()[0])
-    except Exception:
-        return 0.0
+
+from doctor.utils import http_code, run_cmd, run_output, host_load  # noqa: E402
 
 __all__ = [n for n in dir() if not n.startswith("__") and not isinstance(globals()[n], type(os))]
