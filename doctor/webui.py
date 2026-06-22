@@ -92,7 +92,7 @@ def _ui_health():
     for t in ths: t.join(7)
     return [r for r in out if r]
 def _ui_status():
-    checks = [{"name": n, "on": bool(e)} for n, e, _, _, _ in CHECKS]
+    checks = [{"name": n, "on": bool(e)} for n, e, _, _, _, _ in CHECKS]
     checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
     checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
     return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
@@ -192,7 +192,7 @@ def _build_server(port):
                     return self._send(202, "application/json", json.dumps({"ok": True, "msg": "sweep started"}))
                 if path.startswith("/api/check/"):
                     cid = path.split("/api/check/", 1)[1]
-                    for name, en, fn, _, _ in CHECKS:
+                    for name, en, fn, _, _, _ in CHECKS:
                         if name == cid and en:
                             threading.Thread(target=_run_scheduled_check, args=(cid, fn), daemon=True).start()
                             return self._send(202, "application/json", json.dumps({"ok": True, "msg": "check %s started" % cid}))

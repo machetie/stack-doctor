@@ -18,30 +18,30 @@ from .checks import *  # check_* functions referenced by CHECKS
 #
 # Using a namedtuple makes field access self-documenting and turns wrong-width table
 # edits into a TypeError at import time rather than a ValueError mid-sweep.
-CheckEntry = namedtuple("CheckEntry", ["cid", "enabled", "fn", "speed", "default_iv"])
+CheckEntry = namedtuple("CheckEntry", ["cid", "enabled", "fn", "speed", "default_iv", "needs_instances"])
 
-CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,              "fast", None),
-          CheckEntry("providers",          EN_PROVIDERS,          check_providers,          "fast", None),
-          CheckEntry("decypharr",          EN_DECYPHARR,          check_decypharr,          "fast", None),
-          CheckEntry("plex",               EN_PLEX,               check_plex,               "fast", None),
-          CheckEntry("plexscan",           EN_PLEX_SCAN,          check_plex_scan,          "fast", None),
-          CheckEntry("resources",          EN_RESOURCES,          check_resources,          "fast", None),
-          CheckEntry("janitor",            EN_JANITOR,            check_janitor,            "slow", None),
-          CheckEntry("repair",             EN_REPAIR,             check_repair,             "slow", None),
-          CheckEntry("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None),
-          CheckEntry("seerr",              EN_SEERR,              check_seerr,              "fast", None),
-          CheckEntry("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900),   # 15 min default
-          CheckEntry("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow", None),
-          CheckEntry("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None)]
-_check_locks = {cid: threading.Lock() for cid, _, _, _, _ in CHECKS}
+CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,              "fast", None, True),
+          CheckEntry("providers",          EN_PROVIDERS,          check_providers,          "fast", None, True),
+          CheckEntry("decypharr",          EN_DECYPHARR,          check_decypharr,          "fast", None, False),
+          CheckEntry("plex",               EN_PLEX,               check_plex,               "fast", None, False),
+          CheckEntry("plexscan",           EN_PLEX_SCAN,          check_plex_scan,          "fast", None, False),
+          CheckEntry("resources",          EN_RESOURCES,          check_resources,          "fast", None, False),
+          CheckEntry("janitor",            EN_JANITOR,            check_janitor,            "slow", None, False),
+          CheckEntry("repair",             EN_REPAIR,             check_repair,             "slow", None, True),
+          CheckEntry("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None, False),
+          CheckEntry("seerr",              EN_SEERR,              check_seerr,              "fast", None, False),
+          CheckEntry("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900,   True),   # 15 min default
+          CheckEntry("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow", None, True),
+          CheckEntry("multipack",          MULTIPACK_ENABLED,     check_multipack,          "slow", None, True)]
+_check_locks = {cid: threading.Lock() for cid, _, _, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()
 def sweep(only: Optional[Any] = None) -> None:
     if not _lock.acquire(blocking=False):
         log.debug("sweep already running"); return
-    log.info("[sweep] starting initial sweep of %d enabled check(s)", sum(1 for _, e, _, _, _ in CHECKS if e))
+    log.info("[sweep] starting initial sweep of %d enabled check(s)", sum(1 for _, e, _, _, _, _ in CHECKS if e))
     try:
-        for cid, en, fn, _, _ in CHECKS:
+        for cid, en, fn, _, _, _ in CHECKS:
             if not en:
                 continue
             log.info("[sweep] running %s", cid)
@@ -84,10 +84,10 @@ def scheduler_loop(stop: threading.Event) -> None:
              _human(FAST_INTERVAL), _human(SLOW_INTERVAL), _human(SCHEDULER_TICK), SCHEDULER_CONCURRENCY)
     sweep()
     now = time.time()
-    last_run = {cid: now for cid, en, _, _, _ in CHECKS if en}
+    last_run = {cid: now for cid, en, _, _, _, _ in CHECKS if en}
     while not stop.wait(SCHEDULER_TICK):
         now = time.time()
-        for cid, en, fn, speed, default_iv in CHECKS:
+        for cid, en, fn, speed, default_iv, _ in CHECKS:
             if not en:
                 continue
             interval = _check_interval(cid, speed, default_iv)

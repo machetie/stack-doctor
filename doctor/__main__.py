@@ -26,16 +26,11 @@ def main():
     if "--backfill-missing-seasons" in sys.argv:
         sys.argv.remove("--backfill-missing-seasons")
         backfill_missing_seasons()
-    enabled = [c for c, e, _, _, _ in CHECKS if e]
+    enabled = [c for c, e, _, _, _, _ in CHECKS if e]
     warmer_on = EN_WARMER and bool(PLEX_URL)
     if EN_WARMER and not PLEX_URL:
         log.warning("ENABLE_WARMER set but PLEX_URL is empty -> warmer disabled")
-    _needs_instances = [name for name, flag in (
-        ("queue", EN_QUEUE), ("repair", EN_REPAIR),
-        ("missing_seasons", EN_MISSING_SEASONS), ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE),
-        ("multipack", MULTIPACK_ENABLED),
-        ("providers", EN_PROVIDERS),
-    ) if flag]
+    _needs_instances = [cid for cid, en, _, _, _, needs in CHECKS if en and needs]
     if _needs_instances and not INSTANCES:
         log.error("checks %s require at least one instance. Set INSTANCE_1_URL / _APIKEY / _TYPE.",
                   _needs_instances)
