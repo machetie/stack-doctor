@@ -124,17 +124,17 @@ class StrikeCounterTest(unittest.TestCase):
     """_record_fuse_result increments / resets the strike counter correctly."""
 
     def setUp(self):
-        _fuse_strikes[0] = 0
+        _fuse_strikes.reset()
 
     def test_ok_resets_strikes(self):
-        _fuse_strikes[0] = 3
+        _fuse_strikes.value = 3
         strikes, act = _record_fuse_result(_FuseStatus.OK)
         self.assertEqual(strikes, 0)
         self.assertFalse(act)
-        self.assertEqual(_fuse_strikes[0], 0)
+        self.assertEqual(_fuse_strikes.value, 0)
 
     def test_empty_resets_strikes(self):
-        _fuse_strikes[0] = 2
+        _fuse_strikes.value = 2
         strikes, act = _record_fuse_result(_FuseStatus.EMPTY)
         self.assertEqual(strikes, 0)
         self.assertFalse(act)
@@ -176,7 +176,7 @@ class ProbeMountTest(unittest.TestCase):
     """_probe_mount integration tests using real local filesystem."""
 
     def setUp(self):
-        _fuse_strikes[0] = 0
+        _fuse_strikes.reset()
 
     def test_nonexistent_path_unmounted(self):
         # Completely invented path with no matching FUSE ancestor -> UNMOUNTED

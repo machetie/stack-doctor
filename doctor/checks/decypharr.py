@@ -34,6 +34,14 @@ _FUSE_ERRNOS = frozenset({
     107, # ENOTCONN - Transport endpoint is not connected
 })
 
+class _State:
+    """Tiny reset-able mutable cell used for module-level check state."""
+    def __init__(self, default):
+        self._default = default
+        self.value = default
+    def reset(self):
+        self.value = self._default
+
 def _is_fuse_errno(exc):
     """Return True if *exc* looks like a dead FUSE transport."""
     if not isinstance(exc, OSError):
@@ -190,20 +198,20 @@ def _probe_mount(path, read_timeout):
 # ---------------------------------------------------------------------------
 # Strike counter - require N consecutive failures before acting
 # ---------------------------------------------------------------------------
-_fuse_strikes = [0]   # mutable cell updated by check_decypharr
+_fuse_strikes = _State(0)   # mutable cell updated by check_decypharr
 
 def _record_fuse_result(status):
     """Increment/reset strike counter.  Returns (strikes, needs_action)."""
     if status in (_FuseStatus.OK, _FuseStatus.EMPTY):
-        _fuse_strikes[0] = 0
+        _fuse_strikes.reset()
         return 0, False
-    _fuse_strikes[0] += 1
-    return _fuse_strikes[0], _fuse_strikes[0] >= DECY_FUSE_STRIKES
+    _fuse_strikes.value += 1
+    return _fuse_strikes.value, _fuse_strikes.value >= DECY_FUSE_STRIKES
 
 # ---------------------------------------------------------------------------
 # Restart hook
 # ---------------------------------------------------------------------------
-_decy_last_restart = [0.0]
+_decy_last_restart = _State(0.0)
 
 def _decy_restart(reason=""):
     """Run the decypharr restart hook, rate-limited to once per 5 minutes."""
@@ -211,12 +219,12 @@ def _decy_restart(reason=""):
     if DRY_RUN or not DECY_RESTART_CMD:
         log.error("[decypharr] FUSE unhealthy but no restart cmd (or dry-run) -> alert only%s", tag)
         return False
-    if time.time() - _decy_last_restart[0] < 300:
+    if time.time() - _decy_last_restart.value < 300:
         log.warning("[decypharr] restart attempted <5m ago, holding off%s", tag)
         return False
     log.error("[decypharr] running restart hook%s: %s", tag, DECY_RESTART_CMD)
     rc = run_cmd(DECY_RESTART_CMD)
-    _decy_last_restart[0] = time.time()
+    _decy_last_restart.value = time.time()
     log.error("[decypharr] restart hook rc=%s %s",
               rc[0] if rc else "?", rc[1].strip() if (rc and rc[1]) else "")
     return True
@@ -244,12 +252,12 @@ def check_decypharr():
     status, detail = _probe_mount(DECY_MOUNT_TEST, DECY_READ_TIMEOUT)
 
     if status == _FuseStatus.OK:
-        _fuse_strikes[0] = 0
+        _fuse_strikes.reset()
         log.info("[decypharr] mount %s OK (statvfs + read)", DECY_MOUNT_TEST)
         return
 
     if status == _FuseStatus.EMPTY:
-        _fuse_strikes[0] = 0
+        _fuse_strikes.reset()
         log.warning("[decypharr] mount %s: %s", DECY_MOUNT_TEST, detail)
         return
 

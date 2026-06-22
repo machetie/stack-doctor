@@ -18,8 +18,16 @@ from ..clients import *
 from ..state import *
 from .decypharr import _decy_restart, _probe_mount, _FuseStatus
 
-_scan_seen = {}              # activity uuid -> {first, prog, prog_ts, title, acted_ts}
-_plex_last_restart = [0.0]
+class _State:
+    """Tiny reset-able mutable cell used for module-level check state."""
+    def __init__(self, default):
+        self._default = default
+        self.value = default
+    def reset(self):
+        self.value = self._default
+
+_scan_seen = _State({})      # activity uuid -> {first, prog, prog_ts, title, acted_ts}
+_plex_last_restart = _State(0.0)
 def _is_scan_activity(a):
     t = (a.get("type") or "").lower()
     txt = ((a.get("title") or "") + " " + (a.get("subtitle") or "")).lower()
@@ -45,15 +53,15 @@ def check_plex_scan():
         try: prog = int(float(a.get("progress") or 0))
         except Exception: prog = 0
         title = (a.get("title") or a.get("subtitle") or "library scan")[:80]
-        s = _scan_seen.setdefault(uuid, {"first": now, "prog": -1, "prog_ts": now, "title": title, "acted_ts": 0})
+        s = _scan_seen.value.setdefault(uuid, {"first": now, "prog": -1, "prog_ts": now, "title": title, "acted_ts": 0})
         if prog > s["prog"]:
             s["prog"] = prog; s["prog_ts"] = now           # progress advanced -> not stuck, reset the clock
         s["title"] = title
         if now - s["prog_ts"] >= PLEX_SCAN_STUCK:
             stuck.append((uuid, a, s))
-    for u in list(_scan_seen):                              # forget scans that finished / disappeared
+    for u in list(_scan_seen.value):                              # forget scans that finished / disappeared
         if u not in cur:
-            _scan_seen.pop(u, None)
+            _scan_seen.value.pop(u, None)
     if not stuck:
         if cur:
             log.info("[plexscan] %d scan(s) running, progressing", len(cur))
@@ -85,7 +93,7 @@ def check_plex_scan():
                 log.warning("[plexscan] cancel failed for '%s'", s["title"])
         # 3) last resort: restart Plex if a scan stays wedged well past the threshold AND cancellation didn't succeed
         if (PLEX_RESTART_CMD and now - s["first"] >= PLEX_SCAN_STUCK * 2 and 
-            now - _plex_last_restart[0] > 1800 and not cancelled):
+            now - _plex_last_restart.value > 1800 and not cancelled):
             log.error("[plexscan] scan still wedged -> restarting Plex: %s", PLEX_RESTART_CMD)
-            rc = run_cmd(PLEX_RESTART_CMD); _plex_last_restart[0] = time.time()
+            rc = run_cmd(PLEX_RESTART_CMD); _plex_last_restart.value = time.time()
             log.error("[plexscan] Plex restart rc=%s %s", rc[0] if rc else "?", rc[1] if rc else "")

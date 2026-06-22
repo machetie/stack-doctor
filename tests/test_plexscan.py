@@ -95,12 +95,12 @@ class CheckPlexScanBasicTest(unittest.TestCase):
     """Tests for the basic flow: no scans, progressing scans, early return."""
 
     def setUp(self):
-        _scan_seen.clear()
-        _plex_last_restart[0] = 0.0
+        _scan_seen.value.clear()
+        _plex_last_restart.reset()
 
     def tearDown(self):
-        _scan_seen.clear()
-        _plex_last_restart[0] = 0.0
+        _scan_seen.value.clear()
+        _plex_last_restart.reset()
 
     @patch(_MOD + ".PLEX_URL", "")
     @patch(_MOD + ".PLEX_TOKEN", "")
@@ -116,7 +116,7 @@ class CheckPlexScanBasicTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         check_plex_scan()
-        self.assertEqual(len(_scan_seen), 0)
+        self.assertEqual(len(_scan_seen.value), 0)
 
     @patch(_MOD + ".PLEX_SCAN_STUCK", 1800)
     @patch(_MOD + ".Plex")
@@ -127,9 +127,9 @@ class CheckPlexScanBasicTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         check_plex_scan()
-        self.assertIn("uuid-1", _scan_seen)
+        self.assertIn("uuid-1", _scan_seen.value)
         # Not stuck yet (just started)
-        self.assertEqual(_scan_seen["uuid-1"]["prog"], 10)
+        self.assertEqual(_scan_seen.value["uuid-1"]["prog"], 10)
 
     @patch(_MOD + ".PLEX_SCAN_STUCK", 1800)
     @patch(_MOD + ".Plex")
@@ -141,12 +141,12 @@ class CheckPlexScanBasicTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         check_plex_scan()
-        self.assertIn("uuid-1", _scan_seen)
+        self.assertIn("uuid-1", _scan_seen.value)
 
         # Second call: scan is gone
         plex.activities.return_value = []
         check_plex_scan()
-        self.assertNotIn("uuid-1", _scan_seen)
+        self.assertNotIn("uuid-1", _scan_seen.value)
 
     @patch(_MOD + ".PLEX_SCAN_STUCK", 1800)
     @patch(_MOD + ".Plex")
@@ -159,7 +159,7 @@ class CheckPlexScanBasicTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         check_plex_scan()
-        self.assertNotIn("uuid-play", _scan_seen)
+        self.assertNotIn("uuid-play", _scan_seen.value)
 
     @patch(_MOD + ".PLEX_SCAN_STUCK", 1800)
     @patch(_MOD + ".Plex")
@@ -172,7 +172,7 @@ class CheckPlexScanBasicTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         check_plex_scan()
-        self.assertEqual(len(_scan_seen), 0)
+        self.assertEqual(len(_scan_seen.value), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +183,12 @@ class CheckPlexScanStuckTest(unittest.TestCase):
     """Tests for stuck-scan detection and the 3-step recovery."""
 
     def setUp(self):
-        _scan_seen.clear()
-        _plex_last_restart[0] = 0.0
+        _scan_seen.value.clear()
+        _plex_last_restart.reset()
 
     def tearDown(self):
-        _scan_seen.clear()
-        _plex_last_restart[0] = 0.0
+        _scan_seen.value.clear()
+        _plex_last_restart.reset()
 
     @patch(_MOD + ".PLEX_RESTART_CMD", "")
     @patch(_MOD + ".PLEX_SCAN_CANCEL", True)
@@ -205,7 +205,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         # Seed the scan as already tracked and stale
-        _scan_seen["uuid-stuck"] = {
+        _scan_seen.value["uuid-stuck"] = {
             "first": now - 3600,
             "prog": 50,
             "prog_ts": now - 2000,  # stale for 2000s > 1800s threshold
@@ -231,7 +231,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         MockPlex.return_value = plex
 
         # Previously at progress 50, stale timing
-        _scan_seen["uuid-prog"] = {
+        _scan_seen.value["uuid-prog"] = {
             "first": now - 3600,
             "prog": 50,         # current progress 60 > 50 -> advances
             "prog_ts": now - 2000,
@@ -243,7 +243,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         # Progress advanced -> not stuck -> no cancel
         plex.cancel_activity.assert_not_called()
         # prog_ts should be refreshed to approximately now
-        self.assertGreater(_scan_seen["uuid-prog"]["prog_ts"], now - 5)
+        self.assertGreater(_scan_seen.value["uuid-prog"]["prog_ts"], now - 5)
 
     @patch(_MOD + ".PLEX_RESTART_CMD", "")
     @patch(_MOD + ".PLEX_SCAN_CANCEL", True)
@@ -259,7 +259,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex = _make_plex([_activity("uuid-acted", progress=50)])
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-acted"] = {
+        _scan_seen.value["uuid-acted"] = {
             "first": now - 3600,
             "prog": 50,
             "prog_ts": now - 2000,
@@ -283,7 +283,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex = _make_plex([_activity("uuid-dry", progress=50)])
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-dry"] = {
+        _scan_seen.value["uuid-dry"] = {
             "first": now - 3600,
             "prog": 50,
             "prog_ts": now - 2000,
@@ -312,7 +312,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex = _make_plex([_activity("uuid-mount", progress=50)])
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-mount"] = {
+        _scan_seen.value["uuid-mount"] = {
             "first": now - 3600,
             "prog": 50,
             "prog_ts": now - 2000,
@@ -340,7 +340,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex.cancel_activity.return_value = False  # cancel fails
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-restart"] = {
+        _scan_seen.value["uuid-restart"] = {
             "first": now - 7200,  # started 2h ago, well past 2*1800=3600
             "prog": 50,
             "prog_ts": now - 4000,
@@ -367,7 +367,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex.cancel_activity.return_value = True  # cancel succeeds
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-norest"] = {
+        _scan_seen.value["uuid-norest"] = {
             "first": now - 7200,
             "prog": 50,
             "prog_ts": now - 4000,
@@ -390,12 +390,12 @@ class CheckPlexScanStuckTest(unittest.TestCase):
     def test_restart_rate_limited_to_30min(self, MockPlex, mock_cmd):
         """Restart should not fire if _plex_last_restart was < 1800s ago."""
         now = time.time()
-        _plex_last_restart[0] = now - 600  # restarted 10 min ago
+        _plex_last_restart.value = now - 600  # restarted 10 min ago
         plex = _make_plex([_activity("uuid-rl", progress=50)])
         plex.cancel_activity.return_value = False
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-rl"] = {
+        _scan_seen.value["uuid-rl"] = {
             "first": now - 7200,
             "prog": 50,
             "prog_ts": now - 4000,
@@ -419,7 +419,7 @@ class CheckPlexScanStuckTest(unittest.TestCase):
         plex = _make_plex([_activity("uuid-nocancel", progress=50)])
         MockPlex.return_value = plex
 
-        _scan_seen["uuid-nocancel"] = {
+        _scan_seen.value["uuid-nocancel"] = {
             "first": now - 3600,
             "prog": 50,
             "prog_ts": now - 2000,
