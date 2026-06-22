@@ -1,7 +1,7 @@
 """Unit tests for the small utility helpers in doctor.utils.
 
-These helpers were extracted from doctor.config.py in P2.1.  doctor.config still
-re-exports them for backward compatibility, but the tests target the new home.
+These helpers were extracted from doctor.config.py in Phase 2.
+doctor.config still re-exports them for backward compatibility, but the tests target the new home.
 
 All external side effects (urllib, subprocess, /proc/loadavg) are mocked so
 the tests run without network access or a real /proc filesystem.

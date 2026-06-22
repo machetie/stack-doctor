@@ -1,8 +1,8 @@
 """Small, stateless utility helpers used across the doctor package.
 
-These functions were extracted from config.py in Phase 2 so that config.py
-can focus on environment parsing and logging setup while still re-exporting
-them for backward compatibility.
+These functions were extracted from doctor.config.py in Phase 2 so that
+doctor.config.py can focus on environment parsing and logging setup while
+still re-exporting them for backward compatibility.
 """
 import logging
 import subprocess

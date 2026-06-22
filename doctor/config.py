@@ -5,9 +5,12 @@ import json
 import re
 import time
 import signal
+import subprocess
 import threading
 import logging
 import logging.handlers
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
@@ -242,7 +245,6 @@ if len(handlers) > 1:                         # file handler was added
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     handlers=handlers_colored)
 log = logging.getLogger("doctor")
-
 from doctor.utils import http_code, run_cmd, run_output, host_load  # noqa: E402
 
 __all__ = [n for n in dir() if not n.startswith("__") and not isinstance(globals()[n], type(os))]
