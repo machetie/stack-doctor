@@ -60,10 +60,21 @@ def _priority_key(c):
     return (added, -total)
 
 def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
-    """Walk every Sonarr instance and collect all seasons that are monitored, fully aired,
-    have zero episode files, and are old enough to be considered for a search.
+    """Walk every Sonarr instance and collect seasons that need a SeasonSearch.
 
-    Returns (candidates, skipped, airing)."""
+    A season is a candidate when ALL of the following are true:
+      - Series and season are monitored
+      - Season has at least one episode (totalEpisodeCount > 0)
+      - Series was added long enough ago (min_age_secs)
+      - Not still actively airing (no future episode air dates)
+      - Not on recheck cooldown (or backfill mode)
+      - AND one of:
+          a) episodeFileCount == 0  (nothing grabbed at all), OR
+          b) MS_PARTIAL is True AND episodeFileCount < totalEpisodeCount
+             (partial: some files present but season is incomplete and
+             fully aired, so the missing episodes can be searched for)
+
+    Returns (candidates, skipped_cooldown, skipped_airing)."""
     sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
     candidates = []
     skipped = 0
@@ -90,14 +101,20 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
                 if not season.get("monitored"):
                     continue
                 stats = season.get("statistics") or {}
-                if stats.get("episodeFileCount", 0) > 0:
+                fc = stats.get("episodeFileCount", 0)
+                tc = stats.get("totalEpisodeCount", 0)
+                if tc == 0:
                     continue
-                if stats.get("totalEpisodeCount", 0) == 0:
-                    continue
+                if fc >= tc:
+                    continue  # season is complete, nothing to do
+                is_partial = fc > 0  # True = some files present; False = totally empty
+                if is_partial and not MS_PARTIAL:
+                    continue  # partial-season searching is disabled
                 key = "%s:%d:%d" % (arr.name, sid, sn)
                 if not backfill and (now - ms.get(key, 0) < recheck):
                     skipped += 1
                     continue
+                # Fetch episode list once per series (shared across all its seasons).
                 if ep_cache is None:
                     try:
                         ep_cache = arr.episodes(sid)
@@ -105,7 +122,8 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
                         ep_cache = []
                 if _season_still_airing(ep_cache, sn):
                     airing += 1
-                    log.debug("[missing_seasons:%s] skipping still-airing season: %s S%02d", arr.name, title, sn)
+                    log.debug("[missing_seasons:%s] skipping still-airing season: %s S%02d",
+                              arr.name, title, sn)
                     continue
                 candidates.append({
                     "arr": arr,
@@ -114,7 +132,9 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
                     "sn": sn,
                     "key": key,
                     "added_ts": added_ts,
-                    "total_episodes": stats.get("totalEpisodeCount", 0),
+                    "total_episodes": tc,
+                    "file_count": fc,
+                    "is_partial": is_partial,
                 })
     return candidates, skipped, airing
 
@@ -129,14 +149,22 @@ def _process_candidates(ms, candidates, now, backfill):
         if max_actions and acted >= max_actions:
             break
         if DRY_RUN:
-            log.info("[missing_seasons:%s] DRY-RUN would search: %s S%02d",
-                     c["arr"].name, c["title"], c["sn"])
+            if c.get("is_partial"):
+                log.info("[missing_seasons:%s] DRY-RUN would search partial (%d/%d): %s S%02d",
+                         c["arr"].name, c["file_count"], c["total_episodes"], c["title"], c["sn"])
+            else:
+                log.info("[missing_seasons:%s] DRY-RUN would search: %s S%02d",
+                         c["arr"].name, c["title"], c["sn"])
             ms[c["key"]] = now
             acted += 1
             continue
         if c["arr"].command("SeasonSearch", seriesId=c["sid"], seasonNumber=c["sn"]):
-            log.warning("[missing_seasons:%s] 0 files in monitored season -> SeasonSearch: %s S%02d",
-                        c["arr"].name, c["title"], c["sn"])
+            if c.get("is_partial"):
+                log.warning("[missing_seasons:%s] partial season (%d/%d files) -> SeasonSearch: %s S%02d",
+                            c["arr"].name, c["file_count"], c["total_episodes"], c["title"], c["sn"])
+            else:
+                log.warning("[missing_seasons:%s] 0 files in monitored season -> SeasonSearch: %s S%02d",
+                            c["arr"].name, c["title"], c["sn"])
             ms[c["key"]] = now
             acted += 1
         if backfill and batch_size > 0 and acted > 0 and acted % batch_size == 0:

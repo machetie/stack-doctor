@@ -91,6 +91,7 @@ MS_RECHECK            = _dur(os.environ.get("MISSING_SEASONS_RECHECK", "6h"), 21
 MS_SORT_BY            = os.environ.get("MISSING_SEASONS_SORT_BY", "mixed").strip().lower()  # mixed | added | episodes
 MS_BACKFILL_BATCH     = _i("MISSING_SEASONS_BACKFILL_BATCH", 50)  # sleep after this many SeasonSearches in backfill mode
 MS_BACKFILL_DELAY     = _f("MISSING_SEASONS_BACKFILL_DELAY", 0)   # seconds to pause between backfill batches
+MS_PARTIAL            = _b("MISSING_SEASONS_PARTIAL", True)        # also search seasons that are partially complete (some files, not all) when the season has fully aired
 # Run missing_seasons more frequently than other slow checks by default.
 if not os.environ.get("MISSING_SEASONS_INTERVAL"):
     os.environ["MISSING_SEASONS_INTERVAL"] = "15m"
