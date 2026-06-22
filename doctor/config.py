@@ -160,7 +160,7 @@ JAN_QUAR      = os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine")
 JAN_PATTERNS  = os.environ.get("JANITOR_DEAD_PATTERNS", "ARTICLE_NOT_FOUND,still missing,marked as bad").split(",")
 JAN_ERROR_PATTERNS = [p.strip() for p in os.environ.get(
     "JANITOR_ERROR_PATTERNS",
-    "panic,fatal,runtime error,rate limit,rate limited,too many requests,429,cloudflare,cf-ray,blocked,403,unauthorized,token expired,401,context deadline exceeded,connection refused,timeout,i/o timeout"
+    "panic,fatal,runtime error,rate limit,rate limited,too many requests,cloudflare,cf-ray,blocked,unauthorized,token expired,context deadline exceeded,connection refused,timeout,i/o timeout"
 ).split(",") if p.strip()]
 JAN_ALERT_COOLDOWN = _dur(os.environ.get("JANITOR_ALERT_COOLDOWN", "5m"), 300)
 REPAIR_LIBS             = [p.strip() for p in os.environ.get("REPAIR_LIBRARY_PATHS",

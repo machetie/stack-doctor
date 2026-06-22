@@ -34,8 +34,10 @@ _JAN_OP_PATTERNS = [
     ("auth", re.compile(r"\b(unauthorized|token expired|401)\b", re.I)),
     ("network/timeout", re.compile(r"\b(context deadline exceeded|connection refused|i/o timeout|timeout)\b", re.I)),
 ]
-# User-configurable extra patterns (substrings) added to the scan.
-_JAN_USER_PATTERNS = [(p, re.compile(re.escape(p), re.I)) for p in JAN_ERROR_PATTERNS]
+# User-configurable extra patterns added to the scan.
+# Wrap each pattern with word boundaries so short numeric codes (401, 403, 429)
+# and other tokens do not match inside hex hashes, alldebrid IDs, etc.
+_JAN_USER_PATTERNS = [(p, re.compile(r"\b" + re.escape(p) + r"\b", re.I)) for p in JAN_ERROR_PATTERNS]
 
 # Throttle repeated operational/API alerts so we don't log the same thing every 3 minutes.
 _jan_alert_last = {}
