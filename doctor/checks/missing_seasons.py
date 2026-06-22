@@ -192,6 +192,27 @@ def _run_missing_seasons(backfill=False):
         log.info("[%s] searched %d season(s), skipped %d (cooldown), %d (still airing)",
                  label, acted, skipped, airing)
 
+def searched_series(state, arr_name):
+    """Return the set of series IDs that missing_seasons has SeasonSearch-ed at least once.
+
+    The state key format is ``<arr_name>:<series_id>:<season_number>``.
+    Exposed as a public helper so multipack can gate on the same set without
+    coupling to the raw state key format.
+    """
+    ms = state.get("__missing_seasons__", {})
+    prefix = arr_name + ":"
+    ids = set()
+    for key in ms:
+        if key.startswith(prefix):
+            parts = key.split(":", 2)  # split at most twice -> [arr_name, sid, sn]
+            if len(parts) == 3:
+                try:
+                    ids.add(int(parts[1]))
+                except ValueError:
+                    pass
+    return ids
+
+
 def check_missing_seasons():
     """Scheduled check: capped by MS_MAX_ACTIONS and respects MS_RECHECK cooldown."""
     _run_missing_seasons(backfill=False)

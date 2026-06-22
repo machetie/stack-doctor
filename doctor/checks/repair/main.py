@@ -94,7 +94,7 @@ def check_repair():
         # MissingFromDisk check: query *arr history for items Sonarr/Radarr knows are gone from disk.
         # Runs after the symlink sweep so both modes share the REPAIR_MAX_ACTIONS budget.
         if REPAIR_MISSING_FROM_DISK and acted < REPAIR_MAX_ACTIONS:
-            _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
+            acted = _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
         # Orphan scan: filesystem-only dead symlinks that *arr no longer tracks.
         if REPAIR_ORPHAN_SCAN:
             _orphan_dead_symlink_scan()

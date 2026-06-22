@@ -5,8 +5,8 @@ from doctor.checks.multipack import (
     _pack_season_range,
     _incomplete_seasons_covered,
     _rank_packs,
-    _series_searched_by_missing_seasons,
 )
+from doctor.checks.missing_seasons import searched_series as _series_searched_by_missing_seasons
 
 
 class PackSeasonRangeTest(unittest.TestCase):
@@ -73,7 +73,7 @@ def _make_pack(title, quality_weight=1000):
 
 class RankPacksTest(unittest.TestCase):
     def _titles(self, packs, incomplete):
-        return [p["title"] for p in _rank_packs(packs, incomplete)]
+        return [p["title"] for p, _pr, _cov in _rank_packs(packs, incomplete)]
 
     def test_zero_overlap_excluded(self):
         # S01-S04 pack is useless when only S05-S07 are missing

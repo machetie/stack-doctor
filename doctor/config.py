@@ -72,10 +72,19 @@ FAST_INTERVAL        = _dur(os.environ.get("DOCTOR_FAST_INTERVAL", "180s"), 180)
 SLOW_INTERVAL        = _dur(os.environ.get("DOCTOR_SLOW_INTERVAL", "1800s"), 1800)   # 30 min
 SCHEDULER_TICK       = _dur(os.environ.get("DOCTOR_SCHEDULER_TICK", "30s"), 30)      # how often scheduler wakes
 SCHEDULER_CONCURRENCY = _i("DOCTOR_SCHEDULER_CONCURRENCY", 3)                          # max parallel scheduled checks
-def _check_interval(cid, speed):
+def _check_interval(cid, speed, default_iv=None):
+    """Return the run interval in seconds for a check.
+
+    Resolution order (first match wins):
+      1. <CHECK_ID>_INTERVAL env var (or config.json key)
+      2. default_iv argument (per-check override from CHECKS table)
+      3. FAST_INTERVAL / SLOW_INTERVAL based on speed tag
+    """
     per = os.environ.get("%s_INTERVAL" % cid.upper())
     if per:
         return _dur(per, INTERVAL)
+    if default_iv is not None:
+        return int(default_iv)
     return FAST_INTERVAL if speed == "fast" else SLOW_INTERVAL
 EN_QUEUE      = _b("ENABLE_QUEUE", True)
 EN_DECYPHARR  = _b("ENABLE_DECYPHARR", False)
@@ -100,9 +109,8 @@ MULTIPACK_ENABLED       = _b("ENABLE_MULTIPACK", True)             # push cached
 MULTIPACK_MAX_ACTIONS   = _i("MULTIPACK_MAX_ACTIONS", 3)           # max packs pushed per sweep
 MULTIPACK_RECHECK       = _f("MULTIPACK_RECHECK", 7 * 86400)       # seconds before re-checking a series for new packs (default 7 days)
 MULTIPACK_ITEM_INTERVAL = _f("MULTIPACK_ITEM_INTERVAL", 2)         # seconds between pushes
-# Run missing_seasons more frequently than other slow checks by default.
-if not os.environ.get("MISSING_SEASONS_INTERVAL"):
-    os.environ["MISSING_SEASONS_INTERVAL"] = "15m"
+# missing_seasons runs on a tighter default interval than other slow checks;
+# the scheduler handles this via its per-check default_interval column.
 EN_NO_UPGRADE_PROFILE   = _b("ENABLE_NO_UPGRADE_PROFILE", False)
 NO_UPGRADE_PROFILE_ID   = _i("NO_UPGRADE_PROFILE_ID", 0)   # target quality profile id in Sonarr
 NO_UPGRADE_PROFILE_NAME = os.environ.get("NO_UPGRADE_PROFILE_NAME", "WEB-1080p (No Upgrade)")

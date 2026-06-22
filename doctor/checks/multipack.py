@@ -14,7 +14,8 @@ This check automates exactly that:
   5. Sort remaining packs by coverage of incomplete seasons (most covered first), then by
      total pack width as a tie-breaker — prefer S01-S07 over S01-S06.
   6. For each candidate (best first), verify it is debrid-cached by checking whether its
-     folder name exists under the zurg __all__ mount (DECY_MOUNT_TEST).
+     folder name exists in a normalised snapshot of the zurg __all__ mount taken once per
+     sweep (O(1) lookup rather than O(n) directory scan per pack).
   7. Push the first cached pack via Sonarr's /api/v3/release/push, which bypasses
      quality/format rejection and delivers it straight to decypharr.
 
@@ -27,6 +28,7 @@ import time
 from ..config import *
 from ..clients import *
 from ..state import *
+from .missing_seasons import searched_series as _ms_searched_series
 
 # Detects multi-season pack titles: S01-S05, S1-S3, S01-S02, etc.
 _MULTI_SEASON_RE = re.compile(r'\bS(\d+)[.\-]S(\d+)\b', re.IGNORECASE)
@@ -57,52 +59,37 @@ def _incomplete_seasons_covered(pack_range, incomplete_season_numbers):
     return sum(1 for sn in incomplete_season_numbers if first <= sn <= last)
 
 
-def _zurg_all_dir():
-    """Return the zurg __all__ directory path if accessible, else None."""
-    mount = DECY_MOUNT_TEST  # e.g. /mnt/zurg/__all__
-    if mount and os.path.isdir(mount):
-        return mount
-    return None
-
-
 def _normalize(s):
     """Strip all non-alphanumeric chars for fuzzy folder-name matching."""
     return re.sub(r'[^a-z0-9]', '', s.lower())
 
 
-def _is_cached(pack_title, zurg_dir):
-    """Return True if a folder whose normalised name matches pack_title exists in zurg_dir."""
-    norm = _normalize(pack_title)
+def _zurg_cache_set(mount_path):
+    """Return a frozenset of normalised folder names from the zurg __all__ mount.
+
+    Built once per sweep so individual cache lookups are O(1) set membership
+    tests rather than O(n) directory scans.  Returns None if the mount is not
+    accessible.
+    """
+    if not mount_path or not os.path.isdir(mount_path):
+        return None
     try:
-        for entry in os.listdir(zurg_dir):
-            if _normalize(entry) == norm:
-                return True
+        return frozenset(_normalize(e) for e in os.listdir(mount_path))
     except OSError:
-        pass
-    return False
+        return None
 
 
-def _series_searched_by_missing_seasons(state, arr_name):
-    """Return set of series IDs that missing_seasons has already SeasonSearch-ed at least once."""
-    ms = state.get("__missing_seasons__", {})
-    ids = set()
-    prefix = arr_name + ":"
-    for key in ms:
-        if key.startswith(prefix):
-            parts = key.split(":")
-            if len(parts) == 3 and parts[2].isdigit():
-                try:
-                    ids.add(int(parts[1]))
-                except ValueError:
-                    pass
-    return ids
+def _is_cached(pack_title, cache_set):
+    """Return True if pack_title matches any entry in cache_set (O(1))."""
+    return _normalize(pack_title) in cache_set
 
 
 def _incomplete_series(arr):
     """Return dict of series_id -> (title, incomplete_season_numbers) for monitored series
     that have at least one incomplete/missing season.
 
-    incomplete_season_numbers is a frozenset of int season numbers with episodeFileCount < totalEpisodeCount.
+    incomplete_season_numbers is a frozenset of int season numbers with
+    episodeFileCount < totalEpisodeCount.
     """
     try:
         all_series = arr.series()
@@ -129,28 +116,33 @@ def _incomplete_series(arr):
 
 
 def _rank_packs(packs, incomplete_seasons):
-    """Sort packs best-first for a given set of incomplete season numbers.
+    """Sort packs best-first and return (pack, range, covered) triples.
 
-    Primary:   most incomplete seasons covered (descending)
-    Secondary: widest pack range (descending) — S01-S07 beats S01-S06
-    Tertiary:  highest qualityWeight (descending)
+    Each triple contains the raw release dict, its parsed (first, last) season
+    range, and the count of incomplete seasons it covers.  Storing these avoids
+    re-parsing the title in the caller's push loop.
 
-    Packs that cover zero incomplete seasons are excluded entirely.
+    Sort order:
+      Primary:   most incomplete seasons covered (descending)
+      Secondary: widest pack range (descending) — S01-S07 beats S01-S06
+      Tertiary:  highest qualityWeight (descending)
+
+    Packs that cover zero incomplete seasons or have an unparseable title are
+    excluded entirely.
     """
     ranked = []
     for pack in packs:
-        title = pack.get("title", "")
-        pr = _pack_season_range(title)
+        pr = _pack_season_range(pack.get("title", ""))
         if pr is None:
             continue
         covered = _incomplete_seasons_covered(pr, incomplete_seasons)
         if covered == 0:
-            continue  # pack doesn't help at all
-        width = pr[1] - pr[0]  # number of seasons spanned (larger = wider)
+            continue
+        width = pr[1] - pr[0]
         qw = pack.get("qualityWeight", 0)
-        ranked.append((-covered, -width, -qw, pack))
+        ranked.append((-covered, -width, -qw, pack, pr, covered))
     ranked.sort(key=lambda x: (x[0], x[1], x[2]))
-    return [x[3] for x in ranked]
+    return [(x[3], x[4], x[5]) for x in ranked]
 
 
 def check_multipack():
@@ -162,8 +154,9 @@ def check_multipack():
     if not sonarr_instances:
         return
 
-    zurg_dir = _zurg_all_dir()
-    if not zurg_dir:
+    # Build zurg cache set once for the entire sweep (O(1) lookups per pack)
+    cache_set = _zurg_cache_set(DECY_MOUNT_TEST)
+    if cache_set is None:
         log.warning("[multipack] DECY_MOUNT_TEST not accessible — cannot verify debrid cache")
         return
 
@@ -177,7 +170,7 @@ def check_multipack():
                 break
 
             # Only target series missing_seasons has already tried
-            already_searched = _series_searched_by_missing_seasons(state, arr.name)
+            already_searched = _ms_searched_series(state, arr.name)
             if not already_searched:
                 log.debug("[multipack:%s] no series searched by missing_seasons yet — skipping", arr.name)
                 continue
@@ -216,11 +209,9 @@ def check_multipack():
                           arr.name, title, len(releases), len(raw_packs), len(ranked))
 
                 pushed = False
-                for pack in ranked:
+                for pack, pr, covered in ranked:
                     pack_title = pack.get("title", "")
-                    pr = _pack_season_range(pack_title)
-                    covered = _incomplete_seasons_covered(pr, incomplete_seasons) if pr else 0
-                    if not _is_cached(pack_title, zurg_dir):
+                    if not _is_cached(pack_title, cache_set):
                         log.debug("[multipack:%s] not cached (covers %d missing season(s)): %s",
                                   arr.name, covered, pack_title[:70])
                         continue
