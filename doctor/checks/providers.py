@@ -13,9 +13,8 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import DRY_RUN, log
+from ..clients import INSTANCES
 
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
 def check_providers():

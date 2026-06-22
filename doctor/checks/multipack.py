@@ -25,9 +25,12 @@ release searches for shows that missing_seasons hasn't tried yet.
 import os
 import re
 import time
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import (
+    DECY_MOUNT_TEST, DRY_RUN, MULTIPACK_ENABLED, MULTIPACK_ITEM_INTERVAL,
+    MULTIPACK_MAX_ACTIONS, MULTIPACK_RECHECK, log,
+)
+from ..clients import INSTANCES
+from ..state import state_transaction
 from .missing_seasons import searched_series as _ms_searched_series
 
 # Detects multi-season pack titles: S01-S05, S1-S3, S01-S02, etc.

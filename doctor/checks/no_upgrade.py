@@ -13,9 +13,8 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import EN_NO_UPGRADE_PROFILE, NO_UPGRADE_PROFILE_ID, NO_UPGRADE_PROFILE_NAME, log
+from ..clients import INSTANCES
 
 def check_no_upgrade_profile():
     """Find ended Sonarr series that are 100% complete and move them to the no-upgrade profile."""

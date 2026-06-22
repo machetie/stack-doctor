@@ -13,9 +13,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import DRY_RUN, host_load, RES_DROP_CACHES, RES_LOAD_WARN, RES_MEM_MIN, RES_SWAP_WARN, run_cmd, log
 
 def _meminfo():
     d = {}

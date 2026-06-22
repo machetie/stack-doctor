@@ -3,8 +3,8 @@ import re
 import time
 import logging
 from datetime import datetime, timezone
-from ...config import *
-from ...clients import *
+from ...config import REPAIR_VERIFY_DEADLINE, log
+from ...clients import INSTANCES
 
 def _repair_verify_pending(state):
     """Check any in-flight repair searches from previous sweeps.

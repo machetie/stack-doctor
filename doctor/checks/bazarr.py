@@ -13,9 +13,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import BAZARR_APIKEY, BAZARR_URL, http_code, log
 
 def check_bazarr():
     if not BAZARR_URL:

@@ -13,9 +13,12 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import (
+    BLOCKLIST, DRY_RUN, ENABLED_CONDITIONS, host_load,
+    LOAD_MAX, MAX_ACTIONS, MIN_STRIKES, log,
+)
+from ..clients import INSTANCES
+from ..state import _churn_record, _churn_remonitor, state_transaction
 
 def _msgs(rec):
     out = []

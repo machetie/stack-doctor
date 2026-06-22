@@ -3,8 +3,7 @@ import os
 import re
 import time
 import logging
-from ...config import *
-from ...clients import *
+from ...config import REPAIR_DEBRID_MOUNT, log
 
 def _debrid_mount_ok():
     """Return True if the debrid mount looks live (path exists and has at least one child entry).

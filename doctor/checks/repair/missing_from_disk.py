@@ -2,8 +2,8 @@
 import time
 import logging
 from datetime import datetime, timezone
-from ...config import *
-from ...clients import *
+from ...config import DRY_RUN, REPAIR_ITEM_INTERVAL, REPAIR_MFD_RECHECK, REPAIR_UNMONITORED, log
+from ...clients import INSTANCES
 
 def _missing_from_disk_check(state, acted, budget):
     """Query *arr download history for items with reason=MissingFromDisk and re-trigger searches.

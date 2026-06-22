@@ -1,8 +1,8 @@
 """Filesystem-only orphan dead-symlink scanner."""
 import os
 import logging
-from ...config import *
-from ...clients import *
+from ...config import REPAIR_LIBS, log
+from ...clients import INSTANCES
 from .common import _dead_symlink
 
 def _collect_known_paths():

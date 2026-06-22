@@ -13,9 +13,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import http_code, PLEX_SCAN, PLEX_TOKEN, PLEX_URL, log
 
 def check_plex():
     if not PLEX_URL:

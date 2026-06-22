@@ -14,9 +14,12 @@ import urllib.error
 import xml.etree.ElementTree as ET
 import email.utils
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import (
+    DRY_RUN, MS_BACKFILL_BATCH, MS_BACKFILL_DELAY, MS_MAX_ACTIONS,
+    MS_MIN_AGE_HOURS, MS_PARTIAL, MS_RECHECK, MS_SORT_BY, log,
+)
+from ..clients import INSTANCES
+from ..state import state_transaction
 
 def _season_still_airing(episodes, season_number):
     """Return True if *season_number* has at least one episode whose air date is in the future.

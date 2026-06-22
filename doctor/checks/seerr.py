@@ -13,9 +13,9 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import DRY_RUN, SEERR_APIKEY, SEERR_MAX, SEERR_MAX_TRIES, SEERR_URL, log
+from ..clients import Seerr
+from ..state import state_transaction
 
 def check_seerr():
     if not SEERR_URL or not SEERR_APIKEY:

@@ -21,9 +21,11 @@ on single transient errors.
 import os
 import threading
 import time
-from ..config import *
-from ..clients import *
-from ..state import *
+from ..config import (
+    DECY_FUSE_STRIKES, DECY_MOUNT_TEST, DECY_READ_TIMEOUT,
+    DECY_RESTART_CMD, DECY_URL, DRY_RUN,
+    http_code, run_cmd, log,
+)
 
 # ---------------------------------------------------------------------------
 # errno values that signal a dead/stuck FUSE mount
