@@ -61,6 +61,9 @@ UI_SCHEMA = [
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
 ]
 UI_KEYS = set(k for _, items in UI_SCHEMA for k, _ in items)
+
+__all__ = ["_build_server"]
+
 def _is_secret(k):
     ku = k.upper()
     return any(h in ku for h in _SECRET_HINT)

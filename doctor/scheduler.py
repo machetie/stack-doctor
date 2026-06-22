@@ -57,6 +57,9 @@ CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,  
 _check_locks = {cid: threading.Lock() for cid, _, _, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()
+
+__all__ = ["CHECKS", "CheckEntry", "scheduler_loop", "sweep", "_run_scheduled_check"]
+
 def sweep(only: Optional[Any] = None) -> None:
     if not _lock.acquire(blocking=False):
         log.debug("sweep already running"); return
