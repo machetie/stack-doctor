@@ -5,7 +5,21 @@ import logging
 from collections import namedtuple
 from typing import Optional, Callable, Any
 from .config import *
-from .checks import *  # check_* functions referenced by CHECKS
+from .checks import (  # check_* functions referenced by CHECKS
+    check_bazarr,
+    check_decypharr,
+    check_janitor,
+    check_missing_seasons,
+    check_multipack,
+    check_no_upgrade_profile,
+    check_plex,
+    check_plex_scan,
+    check_providers,
+    check_queue,
+    check_repair,
+    check_resources,
+    check_seerr,
+)
 
 # Descriptor for a scheduled check.
 # Fields:
