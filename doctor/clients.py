@@ -1,6 +1,7 @@
 """HTTP API clients: Arr (Sonarr/Radarr/Prowlarr), Plex, Seerr + instance loader."""
 import os
 import json
+from datetime import datetime, timezone
 import time
 import urllib.request
 import urllib.error
@@ -179,12 +180,27 @@ class Arr:
         records = self.history(media_id, page_size=50)
         if isinstance(records, dict):
             records = records.get("records") or []
+        # Parse both timestamps to floats for a reliable "strictly after" comparison.
+        # Lexicographic string comparison breaks when *arr dates include milliseconds
+        # (e.g. "T04:55:30.5Z") or +00:00 offsets — different suffixes sort differently
+        # than the "Z" suffix stored in search_ts.
+        try:
+            since_epoch = datetime.fromisoformat(since_ts.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            since_epoch = None
         for rec in records:
             if rec.get("eventType") != "grabbed":
                 continue
-            # history dates are ISO8601; string compare works for 'after' check
-            if rec.get("date", "") <= since_ts:
-                continue
+            rec_date = rec.get("date") or ""
+            if since_epoch is not None:
+                try:
+                    rec_epoch = datetime.fromisoformat(rec_date.replace("Z", "+00:00")).timestamp()
+                    if rec_epoch <= since_epoch:
+                        continue
+                except Exception:
+                    continue                          # skip records with unparseable dates
+            elif not rec_date or rec_date <= since_ts:
+                continue                              # fallback: string compare (since_epoch parse failed)
             if entity_ids and self.kind == "sonarr":
                 if rec.get("episodeId") not in entity_ids:
                     continue

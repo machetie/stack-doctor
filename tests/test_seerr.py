@@ -163,3 +163,32 @@ class SeerrRetryExceptionTest(unittest.TestCase):
         state, _ = _run([_req(1)], client=client)
         tries = state.get("__seerr__", {})
         self.assertEqual(tries.get("1", 0), 0)
+
+
+class SeerrNoneIdCleanupTest(unittest.TestCase):
+    """Regression tests for the None-id state cleanup bug (A4).
+
+    When a request has id=None, str(None)="None" was added to the `live` set,
+    preventing cleanup of a state key literally named "None".
+    """
+
+    def test_none_id_does_not_pollute_live_set(self):
+        """A request with id=None must not add 'None' to the live set,
+        so stale state keys that happen to be named 'None' get cleaned up."""
+        # Simulate: one real request, one with id=None, and a stale 'None' key in state
+        reqs = [_req(1), {"id": None, "media": {}}]
+        state = {"__seerr__": {"1": 0, "None": 3}}
+        _run(reqs, state=state)
+        # "None" must be cleaned up — it was not a real request id
+        self.assertNotIn("None", state["__seerr__"])
+        # "1" must stay (it's still in the live failed requests)
+        self.assertIn("1", state["__seerr__"])
+
+    def test_real_requests_with_none_id_in_mix_still_retry(self):
+        """A None-id request is skipped but real requests around it still work."""
+        reqs = [{"id": None, "media": {}}, _req(2), {"id": None, "media": {}}]
+        state, client = _run(reqs)
+        tries = state.get("__seerr__", {})
+        # Only req #2 should have been retried
+        self.assertEqual(tries.get("2", 0), 1)
+        self.assertNotIn("None", tries)

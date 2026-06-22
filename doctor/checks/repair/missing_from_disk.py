@@ -11,8 +11,10 @@ def _missing_from_disk_check(state, acted, budget):
     mfd = state.setdefault("__repair_mfd__", {})
     now = time.time()
     for arr in INSTANCES:
-        if arr.kind not in ("sonarr", "radarr") or budget <= 0:
-            break
+        if arr.kind not in ("sonarr", "radarr"):
+            continue                                         # skip non-media instances (prowlarr, etc.)
+        if budget <= 0:
+            break                                            # budget exhausted: stop processing all instances
         try:
             all_media = arr.series() if arr.kind == "sonarr" else arr.movies()
         except Exception as e:

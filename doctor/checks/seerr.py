@@ -37,7 +37,7 @@ def check_seerr():
                 log.info("[seerr] retried %s (attempt %d)", label, n + 1)
             except Exception as e:
                 log.warning("[seerr] retry %s failed: %s", label, str(e)[:80])
-        live = set(str(r.get("id")) for r in reqs)
+        live = set(str(r.get("id")) for r in reqs if r.get("id") is not None)
         for k in [k for k in tries if k not in live]:
             tries.pop(k, None)
         if acted:

@@ -57,7 +57,28 @@ _check_locks = {cid: threading.Lock() for cid, _, _, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()
 
-__all__ = ["CHECKS", "CheckEntry", "scheduler_loop", "sweep", "_run_scheduled_check"]
+# Per-check run metadata.  Keyed by cid; populated by _run_scheduled_check and sweep().
+# Shape: {last_start, last_end, last_duration, last_outcome, last_error, run_count, error_count}
+# last_outcome values: "ok" | "error" | "skipped" | "deferred"
+_check_runs: dict = {}
+
+def _record_run(cid: str, start: float, end: float, outcome: str, error: str = "") -> None:
+    """Update _check_runs for cid in-place (thread-safe: GIL-atomic dict update)."""
+    r = _check_runs.get(cid)
+    if r is None:
+        r = {"run_count": 0, "error_count": 0}
+        _check_runs[cid] = r
+    r["last_start"]    = start
+    r["last_end"]      = end
+    r["last_duration"] = round(end - start, 3)
+    r["last_outcome"]  = outcome
+    r["last_error"]    = error
+    if outcome in ("ok", "error"):
+        r["run_count"] += 1
+    if outcome == "error":
+        r["error_count"] += 1
+
+__all__ = ["CHECKS", "CheckEntry", "_check_runs", "scheduler_loop", "sweep", "_run_scheduled_check"]
 
 def sweep(only: Optional[Any] = None) -> None:
     if not _lock.acquire(blocking=False):
@@ -68,9 +89,12 @@ def sweep(only: Optional[Any] = None) -> None:
             if not en:
                 continue
             log.info("[sweep] running %s", cid)
+            _t0 = time.time()
             try:
                 fn(only) if cid == "queue" else fn()
+                _record_run(cid, _t0, time.time(), "ok")
             except Exception as e:
+                _record_run(cid, _t0, time.time(), "error", str(e)[:200])
                 log.error("[%s] check error: %s", cid, e)
             log.info("[sweep] finished %s", cid)
     finally:
@@ -81,16 +105,21 @@ def _run_scheduled_check(cid: str, fn: Callable[[], None]) -> None:
     lock = _check_locks.get(cid)
     if lock and not lock.acquire(blocking=False):
         log.debug("[%s] already running, skipping scheduled run", cid)
+        _record_run(cid, time.time(), time.time(), "skipped")
         return
     acquired = False
+    t0 = time.time()
     try:
         if not _scheduler_sem.acquire(blocking=False):
             log.info("[%s] scheduler concurrency full, deferring", cid)
+            _record_run(cid, t0, time.time(), "deferred")
             return
         acquired = True
         log.info("[%s] running scheduled check", cid)
         fn()
+        _record_run(cid, t0, time.time(), "ok")
     except Exception as e:
+        _record_run(cid, t0, time.time(), "error", str(e)[:200])
         log.error("[%s] scheduled check error: %s", cid, e)
     finally:
         if acquired:

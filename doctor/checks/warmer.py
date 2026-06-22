@@ -22,6 +22,13 @@ _warm_sem_open = threading.Semaphore(max(1, WARM_OPEN_CONC))     # detail-page (
 _warm_last_ondeck = [0.0]
 _warm_count = [0]           # total warms since start (for the UI)
 _warm_recent = []           # recent warms for the UI: [{"ts","title","why"}]
+
+# Per-cycle metadata (single-element lists so tests can reset them by index)
+_last_cycle_ts        = [0.0]    # unix ts when the last warm_cycle() started
+_last_cycle_duration  = [0.0]    # seconds taken by the last cycle
+_last_cycle_warmed    = [0]      # files warmed in the last cycle
+_last_cycle_candidates = [0]     # candidate paths considered in the last cycle
+_last_cycle_skipped_load = [False]  # True if the last cycle was skipped due to host load
 def _warm_record(title, why):
     _warm_count[0] += 1
     _warm_recent.append({"ts": time.time(), "title": title, "why": why})
@@ -121,15 +128,24 @@ def _warm_targets(plex):
                     add("recent", f)
     return targets
 def warm_cycle():
+    _t0 = time.time()
+    _last_cycle_ts[0] = _t0
     if WARM_LOAD_MAX > 0 and host_load() > WARM_LOAD_MAX:
-        log.info("[warmer] host load > %.0f -> skip cycle", WARM_LOAD_MAX); return
+        log.info("[warmer] host load > %.0f -> skip cycle", WARM_LOAD_MAX)
+        _last_cycle_skipped_load[0] = True
+        _last_cycle_duration[0] = round(time.time() - _t0, 3)
+        return
+    _last_cycle_skipped_load[0] = False
     targets = _warm_targets(Plex(PLEX_URL, PLEX_TOKEN))
+    _last_cycle_candidates[0] = len(targets)
     done = 0
     for reason, path in targets:
         if done >= WARM_MAX_CYCLE:
             break
         if _warm_file(path, reason):
             done += 1
+    _last_cycle_warmed[0] = done
+    _last_cycle_duration[0] = round(time.time() - _t0, 3)
     if done:
         log.info("[warmer] cycle warmed %d (of %d candidate paths)", done, len(targets))
 def warmer_loop(stop):

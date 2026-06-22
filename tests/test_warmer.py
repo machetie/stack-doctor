@@ -414,3 +414,77 @@ class WarmTargetsTest(unittest.TestCase):
         targets = self._run_targets(plex, sources=["ondeck"], ondeck=True, ondeck_every=0)
         paths = [p for _, p in targets]
         self.assertEqual(len(paths), len(set(paths)))
+
+
+class WarmCyclemetadataTest(unittest.TestCase):
+    """Tests for per-cycle metadata vars added in B4."""
+
+    def _import_warmer(self):
+        import importlib
+        import doctor.checks.warmer as w
+        importlib.reload(w)
+        return w
+
+    def test_last_cycle_ts_updated_after_cycle(self):
+        import doctor.checks.warmer as w
+        # Reset
+        w._last_cycle_ts[0] = 0.0
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 0), \
+             patch("doctor.checks.warmer._warm_targets", return_value=[]), \
+             patch("doctor.checks.warmer.Plex"):
+            before = time.time()
+            w.warm_cycle()
+            after = time.time()
+        self.assertGreaterEqual(w._last_cycle_ts[0], before)
+        self.assertLessEqual(w._last_cycle_ts[0], after)
+
+    def test_last_cycle_warmed_count(self):
+        import doctor.checks.warmer as w
+        w._last_cycle_warmed[0] = 0
+        targets = [("ondeck", "/fake/a.mkv"), ("ondeck", "/fake/b.mkv")]
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 0), \
+             patch("doctor.checks.warmer.WARM_MAX_CYCLE", 10), \
+             patch("doctor.checks.warmer._warm_targets", return_value=targets), \
+             patch("doctor.checks.warmer._warm_file", return_value=True), \
+             patch("doctor.checks.warmer.Plex"):
+            w.warm_cycle()
+        self.assertEqual(w._last_cycle_warmed[0], 2)
+
+    def test_last_cycle_candidates_count(self):
+        import doctor.checks.warmer as w
+        w._last_cycle_candidates[0] = 0
+        targets = [("ondeck", "/a"), ("ondeck", "/b"), ("next-ep", "/c")]
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 0), \
+             patch("doctor.checks.warmer.WARM_MAX_CYCLE", 10), \
+             patch("doctor.checks.warmer._warm_targets", return_value=targets), \
+             patch("doctor.checks.warmer._warm_file", return_value=False), \
+             patch("doctor.checks.warmer.Plex"):
+            w.warm_cycle()
+        self.assertEqual(w._last_cycle_candidates[0], 3)
+
+    def test_last_cycle_skipped_load_true_when_load_exceeded(self):
+        import doctor.checks.warmer as w
+        w._last_cycle_skipped_load[0] = False
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 1.0), \
+             patch("doctor.checks.warmer.host_load", return_value=5.0):
+            w.warm_cycle()
+        self.assertTrue(w._last_cycle_skipped_load[0])
+
+    def test_last_cycle_skipped_load_false_when_load_ok(self):
+        import doctor.checks.warmer as w
+        w._last_cycle_skipped_load[0] = True
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 0), \
+             patch("doctor.checks.warmer._warm_targets", return_value=[]), \
+             patch("doctor.checks.warmer.Plex"):
+            w.warm_cycle()
+        self.assertFalse(w._last_cycle_skipped_load[0])
+
+    def test_last_cycle_duration_is_nonnegative_float(self):
+        import doctor.checks.warmer as w
+        w._last_cycle_duration[0] = -1.0
+        with patch("doctor.checks.warmer.WARM_LOAD_MAX", 0), \
+             patch("doctor.checks.warmer._warm_targets", return_value=[]), \
+             patch("doctor.checks.warmer.Plex"):
+            w.warm_cycle()
+        self.assertGreaterEqual(w._last_cycle_duration[0], 0.0)
+        self.assertIsInstance(w._last_cycle_duration[0], float)

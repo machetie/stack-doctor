@@ -99,6 +99,8 @@ def check_repair():
         # Runs after the symlink sweep so both modes share the REPAIR_MAX_ACTIONS budget.
         if REPAIR_MISSING_FROM_DISK and acted < REPAIR_MAX_ACTIONS:
             acted = _missing_from_disk_check(state, acted, REPAIR_MAX_ACTIONS - acted)
-        # Orphan scan: filesystem-only dead symlinks that *arr no longer tracks.
-        if REPAIR_ORPHAN_SCAN:
-            _orphan_dead_symlink_scan()
+    # Orphan scan runs outside the state_transaction: it is a read-only filesystem walk that
+    # neither reads nor writes the state dict, and can take seconds on large libraries.  Holding
+    # STATE_LOCK for the entire walk would block every other concurrent check unnecessarily.
+    if REPAIR_ORPHAN_SCAN:
+        _orphan_dead_symlink_scan()

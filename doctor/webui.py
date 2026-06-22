@@ -12,7 +12,8 @@ from .config import (
 from .clients import INSTANCES
 from .checks.plex import _plex_rescan, _plex_empty_trash
 from .checks import warmer as _warmer
-from .scheduler import CHECKS, sweep, _run_scheduled_check
+from .scheduler import CHECKS, _check_runs, sweep, _run_scheduled_check
+from .state import _load_state
 
 
 UI_HTML = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui.html"), encoding="utf-8").read()
@@ -88,16 +89,43 @@ def _ui_health():
     for t in ths: t.start()
     for t in ths: t.join(7)
     return [r for r in out if r]
+_RUN_NULL = {"last_start": None, "last_end": None, "last_duration": None,
+             "last_outcome": None, "last_error": None, "run_count": 0, "error_count": 0}
+
 def _ui_status():
-    checks = [{"name": n, "on": bool(e)} for n, e, _, _, _, _ in CHECKS]
-    checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL)})
-    checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE)})
+    def _run_info(cid):
+        """Return run metadata for cid, or nulled defaults if the check has never run."""
+        r = _check_runs.get(cid) or {}
+        return {
+            "last_start":    r.get("last_start"),
+            "last_end":      r.get("last_end"),
+            "last_duration": r.get("last_duration"),
+            "last_outcome":  r.get("last_outcome"),
+            "last_error":    r.get("last_error", ""),
+            "run_count":     r.get("run_count", 0),
+            "error_count":   r.get("error_count", 0),
+        }
+    checks = [{"name": n, "on": bool(e), **_run_info(n)} for n, e, _, _, _, _ in CHECKS]
+    # Synthetic entries: warmer and detail-page warm are not in CHECKS but appear in the UI.
+    # They have no run metadata in _check_runs so we always emit nulled defaults.
+    checks.append({"name": "warmer", "on": _b("ENABLE_WARMER", False) and bool(PLEX_URL), **_RUN_NULL})
+    checks.append({"name": "detail-page warm", "on": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE), **_RUN_NULL})
     return {"version": VERSION, "mode": MODE, "dry_run": DRY_RUN, "load": round(host_load(), 2), "checks": checks}
 def _ui_warmer():
     rec = [{"title": r["title"], "why": r["why"], "ago": int(time.time() - r["ts"])} for r in reversed(_warmer._warm_recent)]
-    return {"enabled": _b("ENABLE_WARMER", False) and bool(PLEX_URL),
-            "detail_page": bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
-            "total": _warmer._warm_count[0], "recent": rec[:40]}
+    last_ts = _warmer._last_cycle_ts[0]
+    return {
+        "enabled":      _b("ENABLE_WARMER", False) and bool(PLEX_URL),
+        "detail_page":  bool(WARM_PLEXLOG_CMD or WARM_PLEXLOG_FILE),
+        "total":        _warmer._warm_count[0],
+        "recent":       rec[:40],
+        "last_cycle_ts":           last_ts if last_ts else None,
+        "last_cycle_ago":          round(time.time() - last_ts) if last_ts else None,
+        "last_cycle_duration_s":   _warmer._last_cycle_duration[0],
+        "last_cycle_warmed":       _warmer._last_cycle_warmed[0],
+        "last_cycle_candidates":   _warmer._last_cycle_candidates[0],
+        "last_cycle_skipped_load": _warmer._last_cycle_skipped_load[0],
+    }
 def _ui_config():
     groups = []
     for g, items in UI_SCHEMA:
@@ -131,6 +159,9 @@ def _ui_logs(n):
         return "".join(open(LOG_FILE, errors="ignore").readlines()[-n:])
     except Exception as e:
         return "log read error: " + str(e)[:80]
+def _ui_state():
+    """Return the full state.json as a dict for operator inspection."""
+    return _load_state()
 def _build_server(port):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse, parse_qs
@@ -162,6 +193,7 @@ def _build_server(port):
             if path == "/api/warmer":      return self._send(200, "application/json", json.dumps(_ui_warmer()))
 
             if path == "/api/config":           return self._send(200, "application/json", json.dumps(_ui_config()))
+            if path == "/api/state":             return self._send(200, "application/json", json.dumps(_ui_state()))
             if path == "/api/logs":
                 try: n = min(int(parse_qs(urlparse(self.path).query).get("n", ["300"])[0]), 3000)
                 except Exception: n = 300

@@ -1,7 +1,7 @@
 """Post-repair search verification."""
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from ...config import REPAIR_VERIFY_DEADLINE, log
 from ...clients import INSTANCES
 
@@ -71,6 +71,6 @@ def _repair_record_verify(state, arr, title, cmd_id, media_id, entity_ids):
         "cmd_id":    cmd_id if isinstance(cmd_id, int) else None,
         "media_id":  media_id,
         "entity_ids": entity_ids or [],
-        "search_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S") + "Z",
+        "search_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S") + "Z",
         "deadline":  time.time() + REPAIR_VERIFY_DEADLINE,
     }

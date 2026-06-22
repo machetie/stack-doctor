@@ -247,3 +247,39 @@ class MfdErrorHandlingTest(unittest.TestCase):
         arr.movies.side_effect = RuntimeError("timeout")
         acted, _ = _run([arr])
         self.assertEqual(acted, 0)
+
+
+class MfdBreakContinueBugTest(unittest.TestCase):
+    """Regression tests for the break/continue bug on line 14.
+
+    When a non-sonarr/radarr instance (e.g. prowlarr) appears BEFORE a valid
+    Sonarr instance in INSTANCES, the old `break` would stop processing all
+    remaining instances.  The fix uses `continue` for the kind-guard so only
+    that one instance is skipped.
+    """
+
+    def test_prowlarr_before_sonarr_does_not_block_sonarr(self):
+        """Prowlarr first, then Sonarr with an MFD entry -> Sonarr must still be processed."""
+        prowlarr = _make_arr(name="prowlarr-1", kind="prowlarr")
+        sonarr = _make_arr(name="sonarr-1", kind="sonarr")
+        sonarr.series.return_value = [_series(1)]
+        sonarr.history.return_value = [_grabbed_mfd_ep(1, 1)]
+        acted, _ = _run([prowlarr, sonarr])
+        # Prowlarr should be skipped (not touched), Sonarr should act
+        prowlarr.series.assert_not_called()
+        prowlarr.movies.assert_not_called()
+        sonarr.command.assert_called_once()
+        self.assertEqual(acted, 1)
+
+    def test_budget_zero_still_breaks_out(self):
+        """budget=0 must still prevent any work even across multiple instances."""
+        sonarr = _make_arr(name="sonarr-1", kind="sonarr")
+        sonarr.series.return_value = [_series(1)]
+        sonarr.history.return_value = [_grabbed_mfd_ep(1, 1)]
+        radarr = _make_arr(name="radarr-1", kind="radarr")
+        radarr.movies.return_value = [_movie(5)]
+        radarr.history.return_value = [_grabbed_mfd_movie()]
+        acted, _ = _run([sonarr, radarr], budget=0)
+        sonarr.command.assert_not_called()
+        radarr.command.assert_not_called()
+        self.assertEqual(acted, 0)
