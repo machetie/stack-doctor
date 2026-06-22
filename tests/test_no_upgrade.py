@@ -5,7 +5,7 @@ The check's three _req calls are now all behind public Arr methods (quality_prof
 series, update_series) so we can mock them cleanly without touching _req.
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from doctor.checks.no_upgrade import check_no_upgrade_profile
 

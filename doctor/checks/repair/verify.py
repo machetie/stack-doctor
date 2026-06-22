@@ -1,8 +1,7 @@
 """Post-repair search verification."""
 import re
 import time
-import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from ...config import REPAIR_VERIFY_DEADLINE, log
 from ...clients import INSTANCES
 
@@ -63,7 +62,6 @@ def _repair_verify_pending(state):
         pv.pop(key, None)
 def _repair_record_verify(state, arr, title, cmd_id, media_id, entity_ids):
     """Store a pending verification entry so the next sweep can check if the grab landed."""
-    import datetime
     pv = state.setdefault("__repair_verify__", {})
     # key is stable across sweeps; title slug + arr name
     key = "%s:%s" % (arr.name, re.sub(r"[^a-z0-9]+", "_", title.lower())[:40])
@@ -73,6 +71,6 @@ def _repair_record_verify(state, arr, title, cmd_id, media_id, entity_ids):
         "cmd_id":    cmd_id if isinstance(cmd_id, int) else None,
         "media_id":  media_id,
         "entity_ids": entity_ids or [],
-        "search_ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S") + "Z",
+        "search_ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S") + "Z",
         "deadline":  time.time() + REPAIR_VERIFY_DEADLINE,
     }

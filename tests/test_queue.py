@@ -14,7 +14,7 @@ test_missing_seasons.py.
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import doctor.state as _state
 from doctor.checks.queue import stuck_reason, _msgs, check_queue

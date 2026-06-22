@@ -15,7 +15,7 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from doctor.checks.janitor import (
     _scan_operational_errors,

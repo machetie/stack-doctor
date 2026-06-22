@@ -1,18 +1,4 @@
 """Check: no_upgrade."""
-import os
-import sys
-import json
-import re
-import time
-import signal
-import subprocess
-import threading
-import logging
-import logging.handlers
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from ..config import EN_NO_UPGRADE_PROFILE, NO_UPGRADE_PROFILE_ID, NO_UPGRADE_PROFILE_NAME, log
 from ..clients import INSTANCES
 

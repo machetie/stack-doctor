@@ -1,18 +1,5 @@
 """Check: plexscan."""
-import os
-import sys
-import json
-import re
 import time
-import signal
-import subprocess
-import threading
-import logging
-import logging.handlers
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from ..config import (
     DECY_MOUNT_TEST, DECY_READ_TIMEOUT, DRY_RUN,
     PLEX_RESTART_CMD, PLEX_SCAN_CANCEL, PLEX_SCAN_STUCK,

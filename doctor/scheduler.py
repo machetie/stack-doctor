@@ -1,7 +1,6 @@
 """Scheduler: per-check intervals, bounded concurrency, and the full sweep."""
 import time
 import threading
-import logging
 from collections import namedtuple
 from typing import Optional, Callable, Any
 from .config import (

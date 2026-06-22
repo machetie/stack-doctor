@@ -1,7 +1,5 @@
 """Re-trigger searches for items *arr reports as MissingFromDisk."""
 import time
-import logging
-from datetime import datetime, timezone
 from ...config import DRY_RUN, REPAIR_ITEM_INTERVAL, REPAIR_MFD_RECHECK, REPAIR_UNMONITORED, log
 from ...clients import INSTANCES
 

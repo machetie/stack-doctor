@@ -11,7 +11,7 @@ symlinks.  Arr instances are MagicMock.  Config globals are patched on the
 dead_symlinks module (they arrive via star-import).
 """
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 from doctor.checks.repair.dead_symlinks import (
     _radarr_dead_files,

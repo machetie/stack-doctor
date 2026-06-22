@@ -1,8 +1,6 @@
 """Dead symlink detection and repair actions."""
-import time
-import logging
 from ...config import DRY_RUN, REPAIR_LIBS, REPAIR_UNMONITORED, REPAIR_VERIFY, log
-from .common import _dead_symlink, _debrid_mount_ok
+from .common import _dead_symlink
 from .verify import _repair_record_verify
 
 def _radarr_dead_files(movies):

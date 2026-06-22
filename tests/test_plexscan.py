@@ -11,7 +11,7 @@ between tests.
 """
 import time
 import unittest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 from doctor.checks.plexscan import (
     _is_scan_activity,

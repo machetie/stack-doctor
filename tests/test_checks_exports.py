@@ -79,19 +79,8 @@ class ConsumerImportPatternsTest(unittest.TestCase):
 
     def test_scheduler_import_pattern(self):
         from doctor.checks import (
-            check_bazarr,
-            check_decypharr,
-            check_janitor,
-            check_missing_seasons,
-            check_multipack,
-            check_no_upgrade_profile,
-            check_plex,
-            check_plex_scan,
-            check_providers,
             check_queue,
             check_repair,
-            check_resources,
-            check_seerr,
         )
         self.assertTrue(callable(check_queue))
         self.assertTrue(callable(check_repair))

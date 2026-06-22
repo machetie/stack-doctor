@@ -13,7 +13,6 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-import doctor.state as _state
 from doctor.state import _churn_record, _churn_remonitor, _offenders
 
 

@@ -1,6 +1,5 @@
 """Detect seasons spread across multiple dirs and upgrade them to season packs."""
 import os
-import logging
 
 def _sonarr_season_pack_check(arr, series):
     """Yield (series_title, season_number, arr) for any fully-available sonarr season whose episode

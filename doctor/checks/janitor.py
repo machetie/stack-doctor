@@ -8,19 +8,9 @@
    errors or becomes unreachable.
 """
 import os
-import sys
 import json
 import re
 import time
-import signal
-import subprocess
-import threading
-import logging
-import logging.handlers
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
 from ..config import (
     DECY_URL, DRY_RUN, JAN_ALERT_COOLDOWN, JAN_ERROR_PATTERNS,
     JAN_LIBS, JAN_LOG, JAN_LOG_CMD, JAN_PATTERNS, JAN_QUAR,

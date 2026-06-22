@@ -1,20 +1,12 @@
 """HTTP API clients: Arr (Sonarr/Radarr/Prowlarr), Plex, Seerr + instance loader."""
 import os
-import sys
 import json
-import re
 import time
-import signal
-import subprocess
-import threading
-import logging
-import logging.handlers
 import urllib.request
 import urllib.error
 import socket
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional
 from .config import BLOCKLIST, REMOVE_CLIENT, TIMEOUT, log
 
 class Arr:

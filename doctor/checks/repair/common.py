@@ -1,8 +1,5 @@
 """Helpers for the repair check."""
 import os
-import re
-import time
-import logging
 from ...config import REPAIR_DEBRID_MOUNT, log
 
 def _debrid_mount_ok():

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
-from doctor.checks.missing_seasons import _gather_candidates, _season_still_airing
+from doctor.checks.missing_seasons import _gather_candidates
 
 
 def _make_season(sn, monitored=True, file_count=0, total=10):
