@@ -12,3 +12,4 @@ from .repair import *  # noqa: F401,F403
 from .warmer import *  # noqa: F401,F403
 from .missing_seasons import *  # noqa: F401,F403
 from .no_upgrade import *  # noqa: F401,F403
+from .multipack import *  # noqa: F401,F403

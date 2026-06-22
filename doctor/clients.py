@@ -149,6 +149,30 @@ class Arr:
         except Exception:
             return None
 
+    def release_search(self, series_id, season_number=1, timeout=45):
+        """GET /release?seriesId=&seasonNumber= — returns list of release dicts (same as Sonarr UI).
+        Returns [] on failure."""
+        try:
+            resp = self._req("GET", "/release?seriesId=%d&seasonNumber=%d" % (series_id, season_number),
+                             t=timeout)
+            return json.load(resp) or []
+        except Exception as e:
+            log.debug("[%s] release_search(%d, %d) failed: %s", self.name, series_id, season_number, str(e)[:60])
+            return []
+
+    def release_push(self, release):
+        """POST /release/push — bypasses Sonarr's rejection logic and pushes directly to download client.
+        Returns True on success."""
+        try:
+            self._req("POST", "/release/push", data=json.dumps(release).encode())
+            return True
+        except urllib.error.HTTPError as e:
+            log.warning("[%s] release_push failed HTTP %d: %s", self.name, e.code, e.read()[:80])
+            return False
+        except Exception as e:
+            log.warning("[%s] release_push failed: %s", self.name, str(e)[:60])
+            return False
+
     def history_grabbed(self, media_id, since_ts, entity_ids=None):
         """Return the most recent 'grabbed' history record for media_id posted after since_ts.
         For sonarr, optionally filter to specific episode IDs. Returns None if nothing found."""

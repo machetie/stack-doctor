@@ -17,7 +17,8 @@ CHECKS = [("queue", EN_QUEUE, check_queue, "fast"),
           ("bazarr", EN_BAZARR, check_bazarr, "fast"),
           ("seerr", EN_SEERR, check_seerr, "fast"),
           ("missing_seasons", EN_MISSING_SEASONS, check_missing_seasons, "slow"),
-          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow")]
+          ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE, check_no_upgrade_profile, "slow"),
+          ("multipack", MULTIPACK_ENABLED, check_multipack, "slow")]
 _check_locks = {cid: threading.Lock() for cid, _, _, _ in CHECKS}
 _scheduler_sem = threading.Semaphore(max(1, SCHEDULER_CONCURRENCY))
 _lock = threading.Lock()

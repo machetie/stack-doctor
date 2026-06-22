@@ -33,6 +33,7 @@ def main():
     _needs_instances = [name for name, flag in (
         ("queue", EN_QUEUE), ("repair", EN_REPAIR),
         ("missing_seasons", EN_MISSING_SEASONS), ("no_upgrade_profile", EN_NO_UPGRADE_PROFILE),
+        ("multipack", MULTIPACK_ENABLED),
         ("providers", EN_PROVIDERS),
     ) if flag]
     if _needs_instances and not INSTANCES:

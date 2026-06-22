@@ -95,8 +95,11 @@ MS_SORT_BY            = os.environ.get("MISSING_SEASONS_SORT_BY", "mixed").strip
 MS_BACKFILL_BATCH     = _i("MISSING_SEASONS_BACKFILL_BATCH", 50)  # sleep after this many SeasonSearches in backfill mode
 MS_BACKFILL_DELAY     = _f("MISSING_SEASONS_BACKFILL_DELAY", 0)   # seconds to pause between backfill batches
 MS_PARTIAL            = _b("MISSING_SEASONS_PARTIAL", True)        # also search seasons that are partially complete (some files, not all) when the season has fully aired
-MS_SERIES_SEARCH      = _b("MISSING_SEASONS_SERIES_SEARCH", True)  # escalate to SeriesSearch when SeasonSearch(es) have been tried but the show is still incomplete (finds multi-season packs)
-MS_SERIES_SEARCH_AFTER = _i("MISSING_SEASONS_SERIES_SEARCH_AFTER", 2)  # number of MS_RECHECK cycles a season must have been searched before the series-level SeriesSearch is triggered
+# ---- multipack ----
+MULTIPACK_ENABLED       = _b("ENABLE_MULTIPACK", True)             # push cached multi-season packs that Sonarr would normally reject
+MULTIPACK_MAX_ACTIONS   = _i("MULTIPACK_MAX_ACTIONS", 3)           # max packs pushed per sweep
+MULTIPACK_RECHECK       = _f("MULTIPACK_RECHECK", 7 * 86400)       # seconds before re-checking a series for new packs (default 7 days)
+MULTIPACK_ITEM_INTERVAL = _f("MULTIPACK_ITEM_INTERVAL", 2)         # seconds between pushes
 # Run missing_seasons more frequently than other slow checks by default.
 if not os.environ.get("MISSING_SEASONS_INTERVAL"):
     os.environ["MISSING_SEASONS_INTERVAL"] = "15m"

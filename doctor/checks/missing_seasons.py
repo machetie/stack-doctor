@@ -59,59 +59,10 @@ def _priority_key(c):
     # mixed and added both prioritize age, then size
     return (added, -total)
 
-def _series_eligible_for_series_search(ms, arr, ser, now, recheck, backfill):
-    """Return a SeriesSearch candidate dict if this series should be escalated, else None.
-
-    A series is escalated to a SeriesSearch (which finds multi-season packs) when:
-      - MS_SERIES_SEARCH is enabled
-      - At least one monitored, fully-aired season is still incomplete
-      - That season has been SeasonSearch-ed at least once already (has a state key)
-        without becoming complete — indicating SeasonSearch alone isn't working
-      - The series-level SeriesSearch cooldown has expired
-
-    This replicates what was previously done manually: after per-season searches fail
-    to find all episodes, a SeriesSearch surfaces multi-season torrent packs (e.g.
-    "Show S01-S05 BluRay") that individual SeasonSearches miss."""
-    if not MS_SERIES_SEARCH:
-        return None
-    sid = ser.get("id")
-    title = (ser.get("title") or "")[:60]
-    # Series-level cooldown: MS_SERIES_SEARCH_AFTER * recheck seconds
-    series_key = "%s:%d:series" % (arr.name, sid)
-    series_cooldown = recheck * MS_SERIES_SEARCH_AFTER
-    if not backfill and (now - ms.get(series_key, 0) < series_cooldown):
-        return None
-    # Find which incomplete seasons have already been SeasonSearch-ed at least once
-    searched_incomplete = []
-    for season in (ser.get("seasons") or []):
-        sn = season.get("seasonNumber", 0)
-        if sn == 0 or not season.get("monitored"):
-            continue
-        stats = season.get("statistics") or {}
-        fc = stats.get("episodeFileCount", 0)
-        tc = stats.get("totalEpisodeCount", 0)
-        if tc == 0 or fc >= tc:
-            continue  # complete or no episodes
-        season_key = "%s:%d:%d" % (arr.name, sid, sn)
-        if ms.get(season_key, 0) > 0:
-            # This season has been SeasonSearch-ed but is still incomplete
-            searched_incomplete.append(sn)
-    if not searched_incomplete:
-        return None
-    return {
-        "arr": arr,
-        "title": title,
-        "sid": sid,
-        "key": series_key,
-        "added_ts": _series_added_ts(ser),
-        "searched_incomplete": searched_incomplete,
-    }
-
 def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
-    """Walk every Sonarr instance and collect seasons that need a SeasonSearch,
-    plus any series that should be escalated to a SeriesSearch.
+    """Walk every Sonarr instance and collect seasons that need a SeasonSearch.
 
-    A season is a SeasonSearch candidate when ALL of the following are true:
+    A season is a candidate when ALL of the following are true:
       - Series and season are monitored
       - Season has at least one episode (totalEpisodeCount > 0)
       - Series was added long enough ago (min_age_secs)
@@ -123,14 +74,9 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
              (partial: some files present but season is incomplete and
              fully aired, so the missing episodes can be searched for)
 
-    A series is escalated to SeriesSearch when MS_SERIES_SEARCH is enabled and
-    one or more of its seasons have already been SeasonSearch-ed but remain
-    incomplete, and the series-level SeriesSearch cooldown has expired.
-
-    Returns (season_candidates, series_candidates, skipped_cooldown, skipped_airing)."""
+    Returns (candidates, skipped_cooldown, skipped_airing)."""
     sonarr_instances = [a for a in INSTANCES if a.kind == "sonarr"]
-    season_candidates = []
-    series_candidates = []
+    candidates = []
     skipped = 0
     airing = 0
     for arr in sonarr_instances:
@@ -181,7 +127,7 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
                     log.debug("[missing_seasons:%s] skipping still-airing season: %s S%02d",
                               arr.name, title, sn)
                     continue
-                season_candidates.append({
+                candidates.append({
                     "arr": arr,
                     "title": title,
                     "sid": sid,
@@ -192,22 +138,16 @@ def _gather_candidates(ms, now, min_age_secs, recheck, backfill):
                     "file_count": fc,
                     "is_partial": is_partial,
                 })
-            # After processing all seasons, check if this series should be escalated
-            sc = _series_eligible_for_series_search(ms, arr, ser, now, recheck, backfill)
-            if sc:
-                series_candidates.append(sc)
-    return season_candidates, series_candidates, skipped, airing
+    return candidates, skipped, airing
 
-def _process_candidates(ms, season_candidates, series_candidates, now, backfill):
-    """Issue SeasonSearch and SeriesSearch commands.
+def _process_candidates(ms, candidates, now, backfill):
+    """Issue SeasonSearch commands for up to MS_MAX_ACTIONS candidates (or all in backfill mode).
 
-    SeasonSearch candidates run first, then SeriesSearch escalations, sharing the
-    MS_MAX_ACTIONS budget. Returns the number of searches issued."""
+    Returns the number of searches issued."""
     max_actions = 0 if backfill else MS_MAX_ACTIONS
     acted = 0
     batch_size = MS_BACKFILL_BATCH if backfill else 0
-
-    for c in season_candidates:
+    for c in candidates:
         if max_actions and acted >= max_actions:
             break
         if DRY_RUN:
@@ -231,26 +171,6 @@ def _process_candidates(ms, season_candidates, series_candidates, now, backfill)
             acted += 1
         if backfill and batch_size > 0 and acted > 0 and acted % batch_size == 0:
             time.sleep(MS_BACKFILL_DELAY)
-
-    for c in series_candidates:
-        if max_actions and acted >= max_actions:
-            break
-        seasons_str = "S%s" % "+S".join("%02d" % s for s in sorted(c["searched_incomplete"]))
-        if DRY_RUN:
-            log.info("[missing_seasons:%s] DRY-RUN would SeriesSearch (multi-season pack): %s [%s]",
-                     c["arr"].name, c["title"], seasons_str)
-            ms[c["key"]] = now
-            acted += 1
-            continue
-        if c["arr"].command("SeriesSearch", seriesId=c["sid"]):
-            log.warning("[missing_seasons:%s] SeasonSearch(es) still incomplete -> SeriesSearch "
-                        "(looking for multi-season pack): %s [%s]",
-                        c["arr"].name, c["title"], seasons_str)
-            ms[c["key"]] = now
-            acted += 1
-        if backfill and batch_size > 0 and acted > 0 and acted % batch_size == 0:
-            time.sleep(MS_BACKFILL_DELAY)
-
     return acted
 
 def _run_missing_seasons(backfill=False):
@@ -263,15 +183,13 @@ def _run_missing_seasons(backfill=False):
         ms = state.setdefault("__missing_seasons__", {})
         now = time.time()
         recheck = 0 if backfill else MS_RECHECK
-        season_cands, series_cands, skipped, airing = _gather_candidates(
-            ms, now, MS_MIN_AGE_HOURS * 3600, recheck, backfill)
+        candidates, skipped, airing = _gather_candidates(ms, now, MS_MIN_AGE_HOURS * 3600, recheck, backfill)
         label = "missing_seasons:backfill" if backfill else "missing_seasons"
-        log.debug("[%s] gathered %d season candidate(s), %d series escalation(s): "
-                  "%d on cooldown, %d still airing",
-                  label, len(season_cands), len(series_cands), skipped, airing)
-        season_cands.sort(key=_priority_key)
-        acted = _process_candidates(ms, season_cands, series_cands, now, backfill)
-        log.info("[%s] searched %d season(s)/series, skipped %d (cooldown), %d (still airing)",
+        log.debug("[%s] gathered %d candidate(s): %d on cooldown, %d still airing",
+                  label, len(candidates), skipped, airing)
+        candidates.sort(key=_priority_key)
+        acted = _process_candidates(ms, candidates, now, backfill)
+        log.info("[%s] searched %d season(s), skipped %d (cooldown), %d (still airing)",
                  label, acted, skipped, airing)
 
 def check_missing_seasons():
