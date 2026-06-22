@@ -4,7 +4,14 @@ import threading
 import logging
 from collections import namedtuple
 from typing import Optional, Callable, Any
-from .config import *
+from .config import (
+    EN_BAZARR, EN_DECYPHARR, EN_JANITOR, EN_MISSING_SEASONS,
+    EN_NO_UPGRADE_PROFILE, EN_PLEX, EN_PLEX_SCAN, EN_PROVIDERS,
+    EN_QUEUE, EN_REPAIR, EN_RESOURCES, EN_SEERR,
+    FAST_INTERVAL, MULTIPACK_ENABLED, SCHEDULER_CONCURRENCY,
+    SCHEDULER_TICK, SLOW_INTERVAL,
+    _check_interval, _human, log,
+)
 from .checks import (  # check_* functions referenced by CHECKS
     check_bazarr,
     check_decypharr,

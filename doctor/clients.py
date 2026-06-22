@@ -15,7 +15,7 @@ import socket
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from .config import *
+from .config import BLOCKLIST, REMOVE_CLIENT, TIMEOUT, log
 
 class Arr:
     def __init__(self, name: str, kind: str, url: str, apikey: str):

@@ -13,8 +13,13 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from .config import *
-from .clients import *
+from .config import (
+    BAZARR_APIKEY, BAZARR_URL, CONFIG_FILE, DECY_URL, DRY_RUN, EN_UI,
+    LOG_FILE, MODE, PLEX_TOKEN, PLEX_URL, SEERR_APIKEY, SEERR_URL,
+    TRIGGER_EVENTS, UI_TOKEN, VERSION, WARM_PLEXLOG_CMD, WARM_PLEXLOG_FILE,
+    _b, host_load, http_code, log,
+)
+from .clients import INSTANCES
 from .checks.plex import _plex_rescan, _plex_empty_trash
 from .checks import warmer as _warmer
 from .scheduler import CHECKS, sweep, _run_scheduled_check

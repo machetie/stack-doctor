@@ -2,20 +2,10 @@
 import contextlib
 import json
 import os
-import sys
-import re
 import time
-import signal
-import subprocess
 import threading
-import logging
-import logging.handlers
-import urllib.request
-import urllib.error
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from .config import *
-from .clients import *
+from .config import CHURN_ACTION, CHURN_BACKOFF, CHURN_LIMIT, STATE_FILE, _human, log
+from .clients import INSTANCES
 
 
 # Single process-wide lock guarding read-modify-write cycles on the shared state file.
