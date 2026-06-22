@@ -125,6 +125,7 @@ DECY_URL          = os.environ.get("DECYPHARR_URL", "")             # e.g. http:
 DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on the FUSE mount to read-test
 DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
 DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
+DECY_FUSE_STRIKES = _i("DECYPHARR_FUSE_STRIKES", 2)                 # consecutive failures before restart hook fires
 PLEX_URL   = os.environ.get("PLEX_URL", "")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)

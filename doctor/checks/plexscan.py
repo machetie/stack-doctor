@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from ..config import *
 from ..clients import *
 from ..state import *
-from .decypharr import _decy_restart, _read_test
+from .decypharr import _decy_restart, _probe_mount, _FuseStatus
 
 _scan_seen = {}              # activity uuid -> {first, prog, prog_ts, title, acted_ts}
 _plex_last_restart = [0.0]
@@ -63,10 +63,13 @@ def check_plex_scan():
         log.error("[plexscan] STUCK scan '%s' (no progress for %dm, stalled at %d%%)", s["title"], mins, max(s["prog"], 0))
         if DRY_RUN:
             log.info("[plexscan] DRY-RUN: would fix mount + cancel scan"); continue
-        # 1) root cause: a hung decypharr mount blocks the scanner on I/O
-        if DECY_MOUNT_TEST and _read_test(DECY_MOUNT_TEST, DECY_READ_TIMEOUT) is False:
-            log.error("[plexscan] decypharr mount is hung -> restarting it (the usual cause of a wedged scan)")
-            _decy_restart("plex scan wedged on hung mount")
+        # 1) root cause: a hung/dead decypharr mount blocks the scanner on I/O
+        if DECY_MOUNT_TEST:
+            _ps_status, _ps_detail = _probe_mount(DECY_MOUNT_TEST, DECY_READ_TIMEOUT)
+            if _ps_status in (_FuseStatus.DEAD, _FuseStatus.HUNG, _FuseStatus.UNMOUNTED):
+                log.error("[plexscan] decypharr mount %s (%s) -> restarting it (usual cause of wedged scan)",
+                          _ps_status, _ps_detail)
+                _decy_restart("plex scan wedged on %s mount" % _ps_status)
         # 2) cancel the wedged scan so Plex stops blocking on the bad item
         cancelled = False
         if PLEX_SCAN_CANCEL and (a.get("cancellable") in ("1", "true", None)):
