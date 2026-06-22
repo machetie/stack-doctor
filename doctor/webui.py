@@ -15,7 +15,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from .config import *
 from .clients import *
-from .checks import *
 from .checks.plex import _plex_rescan, _plex_empty_trash
 from .checks import warmer as _warmer
 from .scheduler import CHECKS, sweep, _run_scheduled_check
