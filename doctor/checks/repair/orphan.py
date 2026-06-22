@@ -37,6 +37,8 @@ def _orphan_dead_symlink_scan():
     if not REPAIR_LIBS:
         return
     known = _collect_known_paths()
+    log.debug("[repair:orphan] collected %d known path(s) from *arr, scanning %d library root(s)",
+              len(known), len(REPAIR_LIBS))
     orphans = []
     for root in REPAIR_LIBS:
         if not os.path.isdir(root):
@@ -56,5 +58,7 @@ def _orphan_dead_symlink_scan():
             log.warning("[repair:orphan] %s", fp)
         if len(orphans) > 20:
             log.warning("[repair:orphan] ... and %d more", len(orphans) - 20)
+    else:
+        log.debug("[repair:orphan] no orphan dead symlinks found in %d library path(s)", len(REPAIR_LIBS))
 
 

@@ -32,6 +32,7 @@ def check_repair():
             try:
                 if arr.kind == "sonarr":
                     series = arr.series()
+                    log.debug("[repair:%s] scanning %d series for dead symlinks", arr.name, len(series))
                     for sid, title, sn, efids in _sonarr_dead_files(arr, series):
                         if acted >= REPAIR_MAX_ACTIONS:
                             cap_hit = "REPAIR_MAX_ACTIONS"; break
@@ -40,6 +41,8 @@ def check_repair():
                         count = len(efids)
                         if symlinks + count > REPAIR_MAX_SYMLINKS:
                             cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        log.debug("[repair:%s] dead symlink(s) found: %s S%02d (%d file(s))",
+                                  arr.name, title, sn, count)
                         if _repair_sonarr_season(arr, sid, title, sn, efids, state):
                             acted += 1
                             symlinks += count
@@ -47,11 +50,13 @@ def check_repair():
                                 time.sleep(REPAIR_ITEM_INTERVAL)
                 else:
                     movies = arr.movies()
+                    log.debug("[repair:%s] scanning %d movies for dead symlinks", arr.name, len(movies))
                     for mid, title, mfid in _radarr_dead_files(movies):
                         if acted >= REPAIR_MAX_ACTIONS:
                             cap_hit = "REPAIR_MAX_ACTIONS"; break
                         if symlinks >= REPAIR_MAX_SYMLINKS:
                             cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        log.debug("[repair:%s] dead symlink found: %s", arr.name, title)
                         if _repair_radarr_movie(arr, mid, title, mfid, state):
                             acted += 1
                             symlinks += 1
@@ -62,6 +67,8 @@ def check_repair():
         if acted or symlinks:
             log.info("[repair] symlink sweep: %d season(s)/movie(s), %d dead symlink(s) re-grabbed%s",
                      acted, symlinks, " (capped by %s)" % cap_hit if cap_hit else "")
+        else:
+            log.debug("[repair] symlink sweep: no dead symlinks found")
         # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
         # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
         if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:
@@ -76,6 +83,7 @@ def check_repair():
                 for title, sn, sid, a in _sonarr_season_pack_check(arr, series):
                     if sp_budget <= 0:
                         break
+                    log.debug("[repair:season_pack:%s] multi-dir season detected: %s S%02d", arr.name, title, sn)
                     if DRY_RUN:
                         log.info("[repair:season_pack] DRY-RUN would search season pack: %s S%02d", title, sn); sp_budget -= 1; continue
                     if a.command("SeasonSearch", seriesId=sid, seasonNumber=sn):

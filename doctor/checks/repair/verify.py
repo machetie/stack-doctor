@@ -18,7 +18,9 @@ def _repair_verify_pending(state):
     """
     pv = state.setdefault("__repair_verify__", {})
     if not pv:
+        log.debug("[repair:verify] no pending searches to verify")
         return
+    log.debug("[repair:verify] checking %d pending search(es)", len(pv))
     now = time.time()
     arr_map = {a.name: a for a in INSTANCES}
     expired = []

@@ -166,11 +166,14 @@ def _probe_mount(path, read_timeout):
     # Layer 1 - kernel mount table
     if not _mount_registered(path):
         return _FuseStatus.UNMOUNTED, "not in /proc/mounts"
+    log.debug("[decypharr] mount probe layer 1 OK: %s registered in /proc/mounts", path)
 
     # Layer 2 - statvfs (fast dead-FUSE detector, does not hang)
     status, detail = _probe_statvfs(path, timeout=5)
     if status != _FuseStatus.OK:
+        log.debug("[decypharr] mount probe layer 2 FAIL: statvfs %s -> %s (%s)", path, status, detail)
         return status, detail
+    log.debug("[decypharr] mount probe layer 2 OK: statvfs %s responsive", path)
 
     # Layer 3 - real file read
     try:
@@ -181,6 +184,7 @@ def _probe_mount(path, read_timeout):
     if fpath is None:
         return _FuseStatus.EMPTY, "no media file found under %s" % path
 
+    log.debug("[decypharr] mount probe layer 3: reading %s (timeout=%ds)", fpath, read_timeout)
     return _read_file(fpath, read_timeout)
 
 # ---------------------------------------------------------------------------

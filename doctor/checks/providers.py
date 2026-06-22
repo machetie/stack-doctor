@@ -26,6 +26,7 @@ def check_providers():
                   if h.get("type") in ("warning", "error")
                   and any(k in (h.get("message") or "").lower() for k in _PROVIDER_KEYWORDS)]
         if not issues:
+            log.debug("[providers:%s] all providers healthy", arr.name)
             continue
         log.warning("[providers:%s] %d provider issue(s): %s", arr.name, len(issues),
                     " | ".join((h.get("message") or "")[:60] for h in issues[:2]))

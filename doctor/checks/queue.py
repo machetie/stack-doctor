@@ -52,12 +52,18 @@ def check_queue(only=None):
             recs = arr.queue()
             if recs is None:
                 continue
+            log.debug("[queue:%s] fetched %d queue item(s)", arr.name, len(recs))
             strikes = state.get(arr.name, {}); new = {}; stuck = 0
             for r in recs:
                 reason = stuck_reason(r)
                 if not reason:
+                    log.debug("[queue:%s] item ok: %s (state=%s status=%s)",
+                              arr.name, (r.get("title") or "")[:60],
+                              r.get("trackedDownloadState"), r.get("trackedDownloadStatus"))
                     continue
                 stuck += 1; iid = str(r.get("id")); cnt = strikes.get(iid, 0) + 1; new[iid] = cnt
+                log.debug("[queue:%s] stuck item (reason=%s strike=%d): %s",
+                          arr.name, reason, cnt, (r.get("title") or "")[:60])
                 if cnt >= MIN_STRIKES and actions < MAX_ACTIONS:
                     title = (r.get("title") or "")[:70]
                     if DRY_RUN:
@@ -73,6 +79,8 @@ def check_queue(only=None):
             state[arr.name] = new
             if stuck:
                 log.info("[queue:%s] %d stuck tracked, %d acted", arr.name, stuck, actions)
+            else:
+                log.debug("[queue:%s] queue clean (0 stuck items)", arr.name)
             for h in arr.health():
                 if h.get("type") in ("error", "warning"):
                     log.debug("[queue:%s] health %s: %s", arr.name, h.get("type"), (h.get("message") or "")[:90])

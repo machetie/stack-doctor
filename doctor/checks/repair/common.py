@@ -16,6 +16,7 @@ def _debrid_mount_ok():
     try:
         children = os.listdir(p)
         if children:
+            log.debug("[repair] debrid mount %s OK (%d entries)", p, len(children))
             return True
         log.warning("[repair] debrid mount %s exists but is empty -> service down? skipping sweep", p)
         return False

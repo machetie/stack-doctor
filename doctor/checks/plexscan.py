@@ -31,9 +31,12 @@ def check_plex_scan():
         return
     plex = Plex(PLEX_URL, PLEX_TOKEN)
     acts = plex.activities()
+    log.debug("[plexscan] fetched %d Plex activit%s", len(acts), "y" if len(acts)==1 else "ies")
     now = time.time(); cur = set(); stuck = []
     for a in acts:
         if not _is_scan_activity(a):
+            log.debug("[plexscan] non-scan activity: type=%s title=%s",
+                      a.get("type"), (a.get("title") or "")[:50])
             continue
         uuid = a.get("uuid") or ""
         if not uuid:
@@ -54,6 +57,8 @@ def check_plex_scan():
     if not stuck:
         if cur:
             log.info("[plexscan] %d scan(s) running, progressing", len(cur))
+        else:
+            log.debug("[plexscan] no active scans")
         return
     for uuid, a, s in stuck:
         if now - s.get("acted_ts", 0) < PLEX_SCAN_STUCK:   # one recovery attempt per stuck-window; don't hammer

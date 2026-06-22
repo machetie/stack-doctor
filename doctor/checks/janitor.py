@@ -77,6 +77,10 @@ def _probe_decy_api():
             _jan_alert("decy_api:%s" % path, "[janitor] decypharr API %s returned HTTP %d (auth/blocked)", url, code)
         elif code == 0:
             _jan_alert("decy_api:%s" % path, "[janitor] decypharr API %s unreachable (no response)", url)
+        elif 200 <= code < 300:
+            log.debug("[janitor] decypharr API %s -> HTTP %d OK", url, code)
+        else:
+            log.debug("[janitor] decypharr API %s -> HTTP %d (unexpected but non-critical)", url, code)
 
 def _read_log_tail():
     """Return the last ~2MB of the decypharr log as a string."""
@@ -95,6 +99,7 @@ def check_janitor():
     if data is None:
         log.debug("[janitor] need JANITOR_LOG_CMD or a readable JANITOR_DECYPHARR_LOG")
         return
+    log.debug("[janitor] scanning %d bytes of log tail", len(data))
 
     bad = set()
 
@@ -123,6 +128,7 @@ def check_janitor():
     if not bad:
         log.debug("[janitor] no dead releases in log tail")
         return
+    log.debug("[janitor] found %d dead release(s): %s", len(bad), ", ".join(sorted(bad)[:10]))
 
     if not JAN_LIBS:
         _jan_alert("janitor:dead", "[janitor] %d dead release(s) in log but no JANITOR_LIBRARY_PATHS to quarantine", len(bad))

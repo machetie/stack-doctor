@@ -45,10 +45,13 @@ def _human(sec: int) -> str:
     return "%ds" % sec
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
 def _load_overrides():
+    """Load config.json into os.environ.  Environment variables already set
+    (e.g. from docker-compose) take priority over config.json values so that
+    compose overrides always win."""
     try:
         with open(CONFIG_FILE) as f:
             for k, v in json.load(f).items():
-                if v is not None:
+                if v is not None and str(k) not in os.environ:
                     os.environ[str(k)] = str(v)
     except Exception:
         pass

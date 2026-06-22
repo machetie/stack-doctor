@@ -19,6 +19,7 @@ def _missing_from_disk_check(state, acted, budget):
             all_media = arr.series() if arr.kind == "sonarr" else arr.movies()
         except Exception as e:
             log.warning("[repair:mfd:%s] failed to fetch media list: %s", arr.name, str(e)[:60]); continue
+        log.debug("[repair:mfd:%s] scanning %d item(s) for MissingFromDisk history", arr.name, len(all_media))
         for item in all_media:
             if budget <= 0:
                 break
@@ -42,6 +43,7 @@ def _missing_from_disk_check(state, acted, budget):
                 data = rec.get("data") or {}
                 if data.get("reason") != "MissingFromDisk":
                     continue
+                log.debug("[repair:mfd:%s] MissingFromDisk history entry for: %s", arr.name, title)
                 if arr.kind == "sonarr":
                     ep = rec.get("episode") or {}
                     season_number = ep.get("seasonNumber")

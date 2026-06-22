@@ -45,18 +45,24 @@ def check_no_upgrade_profile():
         except Exception as e:
             log.warning("[no_upgrade_profile:%s] fetch failed: %s", arr.name, e)
             continue
+        log.debug("[no_upgrade_profile:%s] scanning %d series (target profile id=%d)",
+                  arr.name, len(all_series), target_id)
 
         to_move = []
         for s in all_series:
             if s.get("status") != "ended":
                 continue
             if s.get("qualityProfileId") == target_id:
+                log.debug("[no_upgrade_profile:%s] already on target profile: %s", arr.name, s.get("title", "")[:60])
                 continue
             stats = s.get("statistics", {})
             ep_count  = stats.get("episodeCount", 0)
             pct       = stats.get("percentOfEpisodes", 0)
             if ep_count > 0 and pct >= 100:
                 to_move.append(s)
+            else:
+                log.debug("[no_upgrade_profile:%s] ended but incomplete (%.0f%%): %s",
+                          arr.name, pct, s.get("title", "")[:60])
 
         if not to_move:
             log.debug("[no_upgrade_profile:%s] no newly completed ended shows found", arr.name)
