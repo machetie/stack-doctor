@@ -26,7 +26,7 @@ def main():
     if "--backfill-missing-seasons" in sys.argv:
         sys.argv.remove("--backfill-missing-seasons")
         backfill_missing_seasons()
-    enabled = [c for c, e, _, _ in CHECKS if e]
+    enabled = [c for c, e, _, _, _ in CHECKS if e]
     warmer_on = EN_WARMER and bool(PLEX_URL)
     if EN_WARMER and not PLEX_URL:
         log.warning("ENABLE_WARMER set but PLEX_URL is empty -> warmer disabled")
