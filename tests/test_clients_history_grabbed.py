@@ -4,9 +4,8 @@ These tests target the ISO-8601 timestamp comparison bug (A3) where string
 lexicographic comparison fails when *arr API dates include milliseconds or
 timezone offsets in a different format than the stored search_ts.
 """
+from unittest.mock import patch
 import unittest
-from unittest.mock import MagicMock, patch
-import doctor.clients as clients_mod
 from doctor.clients import Arr
 
 

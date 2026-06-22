@@ -1,7 +1,7 @@
 """HTTP API clients: Arr (Sonarr/Radarr/Prowlarr), Plex, Seerr + instance loader."""
 import os
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 import time
 import urllib.request
 import urllib.error

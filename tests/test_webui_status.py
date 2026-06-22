@@ -5,7 +5,6 @@ metadata from scheduler._check_runs, without breaking existing fields.
 """
 import time
 import unittest
-from unittest.mock import patch
 
 
 def _call_ui_status():

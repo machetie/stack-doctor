@@ -3,10 +3,9 @@
 These tests verify that _run_scheduled_check and sweep() correctly populate
 the _check_runs dict with timing, outcome, and counter information.
 """
-import threading
 import time
 import unittest
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock
 
 import doctor.scheduler as sched_mod
 from doctor.scheduler import _run_scheduled_check, _check_runs
