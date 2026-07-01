@@ -205,5 +205,260 @@ class ProbeMountTest(unittest.TestCase):
         self.assertEqual(status, _FuseStatus.UNKNOWN)
 
 
+
+
+class ParseLogTsTest(unittest.TestCase):
+    """_parse_log_ts extracts unix timestamps from decypharr log lines."""
+
+    def test_plain_timestamp(self):
+        from doctor.checks.decypharr import _parse_log_ts
+        import datetime
+        line = "2026-07-01 00:22:18 | ERROR | [webdav] Error streaming file: foo.mkv"
+        ts = _parse_log_ts(line)
+        self.assertIsNotNone(ts)
+        dt = datetime.datetime.fromtimestamp(ts)
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 7)
+        self.assertEqual(dt.day, 1)
+        self.assertEqual(dt.hour, 0)
+        self.assertEqual(dt.minute, 22)
+
+    def test_ansi_prefixed_timestamp(self):
+        from doctor.checks.decypharr import _parse_log_ts
+        line = "[90m2026-06-30 15:54:13[0m | ERROR | [webdav] Error streaming file"
+        ts = _parse_log_ts(line)
+        self.assertIsNotNone(ts)
+
+    def test_no_timestamp_returns_none(self):
+        from doctor.checks.decypharr import _parse_log_ts
+        self.assertIsNone(_parse_log_ts("no timestamp here"))
+        self.assertIsNone(_parse_log_ts(""))
+
+
+class CountLinkErrorsTest(unittest.TestCase):
+    """_count_link_errors_in_window counts matching errors within the window."""
+
+    def _make_line(self, offset_secs, error_code="read_pxy_timeout"):
+        """Return a log line whose timestamp is now - offset_secs."""
+        import datetime
+        ts = datetime.datetime.fromtimestamp(time.time() - offset_secs)
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            '%s | ERROR | [webdav] Error streaming file: Show/Episode.mkv '
+            'error="failed to get download link: %s: unknown error code: %s"'
+            % (ts_str, error_code, error_code)
+        )
+
+    def test_empty_log(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        count, _ = _count_link_errors_in_window("", 600)
+        self.assertEqual(count, 0)
+
+    def test_no_matching_lines(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        log = "2026-07-01 00:00:00 | INFO | [manager] all good\n"
+        count, _ = _count_link_errors_in_window(log, 600)
+        self.assertEqual(count, 0)
+
+    def test_recent_errors_counted(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        lines = "\n".join(self._make_line(i * 30) for i in range(5))
+        count, newest = _count_link_errors_in_window(lines, 600)
+        self.assertEqual(count, 5)
+        self.assertIsNotNone(newest)
+
+    def test_old_errors_excluded(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        # All lines are older than the window
+        lines = "\n".join(self._make_line(700 + i * 10) for i in range(5))
+        count, _ = _count_link_errors_in_window(lines, 600)
+        self.assertEqual(count, 0)
+
+    def test_mixed_age_only_recent_counted(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        recent = [self._make_line(60), self._make_line(120)]
+        old = [self._make_line(900), self._make_line(1200)]
+        lines = "\n".join(recent + old)
+        count, _ = _count_link_errors_in_window(lines, 600)
+        self.assertEqual(count, 2)
+
+    def test_hoster_timeout_pattern(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        line = self._make_line(60, error_code="hoster_timeout")
+        count, _ = _count_link_errors_in_window(line, 600)
+        self.assertEqual(count, 1)
+
+    def test_unknown_error_code_pattern(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        import datetime
+        ts = datetime.datetime.fromtimestamp(time.time() - 30).strftime("%Y-%m-%d %H:%M:%S")
+        line = ('%s | ERROR | [webdav] Error streaming file: foo error='
+                '"failed to get download link: xyz: unknown error code: xyz"' % ts)
+        count, _ = _count_link_errors_in_window(line, 600)
+        self.assertEqual(count, 1)
+
+    def test_hoster_unavailable_pattern(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        line = self._make_line(60, error_code="hoster_unavailable")
+        count, _ = _count_link_errors_in_window(line, 600)
+        self.assertEqual(count, 1)
+
+    def test_ansi_coloured_line(self):
+        from doctor.checks.decypharr import _count_link_errors_in_window
+        import datetime
+        ts = datetime.datetime.fromtimestamp(time.time() - 10).strftime("%Y-%m-%d %H:%M:%S")
+        line = (
+            "[90m%s[0m [31m| ERROR |[0m [webdav] Error streaming file: foo "
+            'error="failed to get download link: read_pxy_timeout: unknown error code: read_pxy_timeout"'
+            % ts
+        )
+        count, _ = _count_link_errors_in_window(line, 600)
+        self.assertEqual(count, 1)
+
+
+class CheckLinkErrorsTest(unittest.TestCase):
+    """check_link_errors() integration: patching log source and restart hook."""
+
+    def _make_line(self, offset_secs):
+        import datetime
+        ts = datetime.datetime.fromtimestamp(time.time() - offset_secs).strftime("%Y-%m-%d %H:%M:%S")
+        return (
+            '%s | ERROR | [webdav] Error streaming file: Show/Ep.mkv '
+            'error="failed to get download link: read_pxy_timeout: unknown error code: read_pxy_timeout"'
+            % ts
+        )
+
+    def setUp(self):
+        import doctor.checks.decypharr as m
+        self._orig_read = m._read_decy_log
+        self._orig_restart_ts = m._link_err_last_restart.value
+        m._link_err_last_restart.value = 0.0   # reset cooldown
+
+    def tearDown(self):
+        import doctor.checks.decypharr as m
+        m._read_decy_log = self._orig_read
+        m._link_err_last_restart.value = self._orig_restart_ts
+
+    def _patch_log(self, lines):
+        import doctor.checks.decypharr as m
+        m._read_decy_log = lambda: lines
+
+    def test_below_threshold_no_restart(self):
+        import doctor.checks.decypharr as m
+        import doctor.config as cfg
+        orig_log_cmd = m.DECY_LINK_ERR_LOG_CMD
+        try:
+            m.DECY_LINK_ERR_LOG_CMD = "notempty"   # pass the guard
+            # Provide fewer errors than the threshold
+            below = "\n".join(self._make_line(i * 10) for i in range(max(1, cfg.DECY_LINK_ERR_THRESHOLD - 1)))
+            self._patch_log(below)
+            called = []
+            orig_run_cmd = m.run_cmd
+            m.run_cmd = lambda cmd: called.append(cmd) or (0, "ok")
+            result = m.check_link_errors()
+            self.assertFalse(result)
+            self.assertEqual(called, [])
+        finally:
+            m.DECY_LINK_ERR_LOG_CMD = orig_log_cmd
+            m.run_cmd = orig_run_cmd
+
+    def test_above_threshold_triggers_restart(self):
+        import doctor.checks.decypharr as m
+        import doctor.config as cfg
+        orig_restart_cmd = m.DECY_RESTART_CMD
+        orig_dry_run = m.DRY_RUN
+        orig_log_cmd = m.DECY_LINK_ERR_LOG_CMD
+        orig_restart = m.DECY_LINK_ERR_RESTART
+        try:
+            m.DECY_RESTART_CMD = "echo restart"
+            m.DRY_RUN = False
+            m.DECY_LINK_ERR_LOG_CMD = "notempty"   # any truthy value passes the guard
+            m.DECY_LINK_ERR_RESTART = True
+            lines = "\n".join(self._make_line(i * 10) for i in range(cfg.DECY_LINK_ERR_THRESHOLD + 5))
+            self._patch_log(lines)
+            called = []
+            orig_run_cmd = m.run_cmd
+            m.run_cmd = lambda cmd: called.append(cmd) or (0, "ok")
+            result = m.check_link_errors()
+            self.assertTrue(result)
+            self.assertEqual(len(called), 1)
+            self.assertIn("restart", called[0])
+        finally:
+            m.DECY_RESTART_CMD = orig_restart_cmd
+            m.DRY_RUN = orig_dry_run
+            m.DECY_LINK_ERR_LOG_CMD = orig_log_cmd
+            m.DECY_LINK_ERR_RESTART = orig_restart
+            m.run_cmd = orig_run_cmd
+
+    def test_dry_run_no_restart(self):
+        import doctor.checks.decypharr as m
+        import doctor.config as cfg
+        orig_restart_cmd = m.DECY_RESTART_CMD
+        orig_dry_run = m.DRY_RUN
+        orig_log_cmd = m.DECY_LINK_ERR_LOG_CMD
+        orig_restart = m.DECY_LINK_ERR_RESTART
+        try:
+            m.DECY_RESTART_CMD = "echo restart"
+            m.DRY_RUN = True
+            m.DECY_LINK_ERR_LOG_CMD = "notempty"
+            m.DECY_LINK_ERR_RESTART = True
+            lines = "\n".join(self._make_line(i * 10) for i in range(cfg.DECY_LINK_ERR_THRESHOLD + 5))
+            self._patch_log(lines)
+            called = []
+            orig_run_cmd = m.run_cmd
+            m.run_cmd = lambda cmd: called.append(cmd) or (0, "ok")
+            result = m.check_link_errors()
+            self.assertFalse(result)
+            self.assertEqual(called, [])
+        finally:
+            m.DECY_RESTART_CMD = orig_restart_cmd
+            m.DRY_RUN = orig_dry_run
+            m.DECY_LINK_ERR_LOG_CMD = orig_log_cmd
+            m.DECY_LINK_ERR_RESTART = orig_restart
+            m.run_cmd = orig_run_cmd
+
+    def test_cooldown_prevents_second_restart(self):
+        import doctor.checks.decypharr as m
+        import doctor.config as cfg
+        orig_restart_cmd = m.DECY_RESTART_CMD
+        orig_dry_run = m.DRY_RUN
+        orig_log_cmd = m.DECY_LINK_ERR_LOG_CMD
+        orig_restart = m.DECY_LINK_ERR_RESTART
+        try:
+            m.DECY_RESTART_CMD = "echo restart"
+            m.DRY_RUN = False
+            m.DECY_LINK_ERR_LOG_CMD = "notempty"
+            m.DECY_LINK_ERR_RESTART = True
+            m._link_err_last_restart.value = time.time()  # simulate recent restart
+            lines = "\n".join(self._make_line(i * 10) for i in range(cfg.DECY_LINK_ERR_THRESHOLD + 5))
+            self._patch_log(lines)
+            called = []
+            orig_run_cmd = m.run_cmd
+            m.run_cmd = lambda cmd: called.append(cmd) or (0, "ok")
+            result = m.check_link_errors()
+            self.assertFalse(result)
+            self.assertEqual(called, [])
+        finally:
+            m.DECY_RESTART_CMD = orig_restart_cmd
+            m.DRY_RUN = orig_dry_run
+            m.DECY_LINK_ERR_LOG_CMD = orig_log_cmd
+            m.DECY_LINK_ERR_RESTART = orig_restart
+            m.run_cmd = orig_run_cmd
+
+    def test_no_log_source_skips(self):
+        import doctor.checks.decypharr as m
+        orig_log_cmd = m.DECY_LINK_ERR_LOG_CMD
+        orig_jan_cmd = m.JAN_LOG_CMD
+        orig_jan_log = m.JAN_LOG
+        try:
+            m.DECY_LINK_ERR_LOG_CMD = ""
+            m.JAN_LOG_CMD = ""
+            m.JAN_LOG = ""
+            result = m.check_link_errors()
+            self.assertFalse(result)
+        finally:
+            m.DECY_LINK_ERR_LOG_CMD = orig_log_cmd
+            m.JAN_LOG_CMD = orig_jan_cmd
+            m.JAN_LOG = orig_jan_log
 if __name__ == "__main__":
     unittest.main()

@@ -11,6 +11,7 @@ symlinks.  Arr instances are MagicMock.  Config globals are patched on the
 dead_symlinks module (they arrive via star-import).
 """
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from doctor.checks.repair.dead_symlinks import (
@@ -48,9 +49,9 @@ def _efile(efid, path, season_number=None):
     return ef
 
 
-def _episode(epid, efid, season_number):
+def _episode(epid, efid, season_number, episode_number=None):
     """Minimal Sonarr episode dict."""
-    return {"id": epid, "episodeFileId": efid, "seasonNumber": season_number}
+    return {"id": epid, "episodeFileId": efid, "seasonNumber": season_number, "episodeNumber": episode_number}
 
 
 def _make_arr(name="sonarr-1", kind="sonarr"):
@@ -154,7 +155,7 @@ class SonarrDeadFilesTest(unittest.TestCase):
 
         result = list(_sonarr_dead_files(arr, series))
         self.assertEqual(len(result), 1)
-        sid, title, sn, efids = result[0]
+        sid, title, sn, efids, _series_dict, _epids = result[0]
         self.assertEqual(sid, 5)
         self.assertEqual(sn, 1)
         self.assertCountEqual(efids, [100, 101])
@@ -211,6 +212,7 @@ class SonarrDeadFilesTest(unittest.TestCase):
         # Only the /allowed/ file should be included
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][3], [100])
+        self.assertEqual(result[0][5], [10])
 
     @patch(_MOD + "._dead_symlink", return_value=True)
     def test_season_from_episode_cross_reference(self, _ds):
@@ -223,6 +225,7 @@ class SonarrDeadFilesTest(unittest.TestCase):
         result = list(_sonarr_dead_files(arr, series))
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0][2], 1)  # season number from cross-reference
+        self.assertEqual(result[0][5], [10])
 
     @patch(_MOD + "._dead_symlink", return_value=True)
     def test_skips_file_without_id(self, _ds):
@@ -322,7 +325,7 @@ class RepairRadarrMovieTest(unittest.TestCase):
         state = {}
 
         _repair_radarr_movie(arr, mid=1, title="Movie", mfid=10, state=state)
-        mock_verify.assert_called_once_with(state, arr, "Movie", 42, 1, [1])
+        mock_verify.assert_called_once_with(state, arr, "Movie", 42, 1, [1], hierarchical=False)
 
     @patch(_MOD + "._repair_record_verify")
     @patch(_MOD + ".REPAIR_VERIFY", True)
@@ -401,7 +404,9 @@ class RepairSonarrSeasonTest(unittest.TestCase):
 
         _repair_sonarr_season(arr, sid=5, title="Show", season_number=1,
                               efids=[100], state=state)
-        mock_verify.assert_called_once_with(state, arr, "Show", 99, 5, [10])
+        mock_verify.assert_called_once_with(state, arr, "Show", 99, 5, [10],
+                                                          strategy='season', season_number=1, series_id=5,
+                                                          hierarchical=False)
 
     @patch(_MOD + "._repair_record_verify")
     @patch(_MOD + ".REPAIR_VERIFY", True)
@@ -432,3 +437,281 @@ class RepairSonarrSeasonTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical search strategy
+# ---------------------------------------------------------------------------
+
+class HierarchicalSearchStrategyTest(unittest.TestCase):
+    """Test the smart command selection for dead seasons based on airing status."""
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", True)
+    def test_ended_show_uses_series_search(self):
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [{"id": 10, "seasonNumber": 1}]
+        arr.command.return_value = 99
+        series = {"id": 5, "title": "Ended Show", "ended": True}
+
+        _repair_sonarr_season(arr, sid=5, title="Ended Show", season_number=1,
+                              efids=[100], state=None, series=series)
+        arr.command.assert_called_once_with("SeriesSearch", seriesId=5)
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", True)
+    def test_continuing_show_with_ended_season_uses_season_search(self):
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [{"id": 10, "seasonNumber": 1}]
+        arr.command.return_value = 99
+        # previousAiring 30 days ago -> season ended
+        prev = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        series = {
+            "id": 5, "title": "Continuing Show", "ended": False,
+            "seasons": [{"seasonNumber": 1, "statistics": {"previousAiring": prev}}]
+        }
+
+        _repair_sonarr_season(arr, sid=5, title="Continuing Show", season_number=1,
+                              efids=[100], state=None, series=series)
+        arr.command.assert_called_once_with("SeasonSearch", seriesId=5, seasonNumber=1)
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", True)
+    def test_continuing_show_with_ongoing_season_uses_episode_search(self):
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [{"id": 10, "seasonNumber": 1}, {"id": 11, "seasonNumber": 1}]
+        arr.command.return_value = 99
+        # previousAiring 1 day ago -> ongoing season
+        prev = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        series = {
+            "id": 5, "title": "Continuing Show", "ended": False,
+            "seasons": [{"seasonNumber": 1, "statistics": {"previousAiring": prev}}]
+        }
+
+        _repair_sonarr_season(arr, sid=5, title="Continuing Show", season_number=1,
+                              efids=[100], state=None, series=series)
+        arr.command.assert_called_once_with("EpisodeSearch", episodeIds=[10, 11])
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", False)
+    def test_disabled_hierarchical_defaults_to_season_search(self):
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [{"id": 10, "seasonNumber": 1}]
+        arr.command.return_value = 99
+        series = {"id": 5, "title": "Show", "ended": True}
+
+        _repair_sonarr_season(arr, sid=5, title="Show", season_number=1,
+                              efids=[100], state=None, series=series)
+        arr.command.assert_called_once_with("SeasonSearch", seriesId=5, seasonNumber=1)
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", True)
+    @patch(_MOD + ".REPAIR_VERIFY", True)
+    @patch(_MOD + ".DRY_RUN", False)
+    def test_records_strategy_and_season_in_verify(self, *_):
+        from doctor.checks.repair.verify import _repair_record_verify
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [{"id": 10, "seasonNumber": 1}]
+        arr.command.return_value = 99
+        state = {}
+        series = {"id": 5, "title": "Ended Show", "ended": True}
+
+        _repair_sonarr_season(arr, sid=5, title="Ended Show", season_number=1,
+                              efids=[100], state=state, series=series)
+        arr.command.assert_called_once_with("SeriesSearch", seriesId=5)
+        # verify state should record strategy and season
+        pv = state.get("__repair_verify__", {})
+        key = "sonarr-1:ended_show:s01"
+        self.assertIn(key, pv)
+        self.assertEqual(pv[key]["strategy"], "series")
+        self.assertEqual(pv[key]["season_number"], 1)
+        self.assertEqual(pv[key]["series_id"], 5)
+        self.assertTrue(pv[key].get("hierarchical"))
+
+
+# ---------------------------------------------------------------------------
+# Janitor-reported dead files
+# ---------------------------------------------------------------------------
+
+class JanitorDeadFilesTest(unittest.TestCase):
+
+    def _setup_arr(self, efiles, eps):
+        arr = _make_arr()
+        arr.episode_files.return_value = efiles
+        arr.episodes.return_value = eps
+        return arr
+
+    @patch(_MOD + "._dead_symlink", return_value=False)
+    def test_janitor_dead_file_without_episode_file_record(self, _ds):
+        """When the janitor has already removed the file, _sonarr_dead_files should still
+        detect the missing episode from the quarantined orig path in the state."""
+        efiles = []  # episode file already deleted
+        eps = [_episode(10, None, 1, episode_number=2)]  # no episodeFileId
+        arr = self._setup_arr(efiles, eps)
+        series = [_series(5, "Show", monitored=True)]
+        series[0]["path"] = "/lib/shows/Show"
+        state = {
+            "__janitor_dead_files__": {
+                "RELEASE/Show.S01E02.1080p.mkv": {
+                    "ts": 0,
+                    "orig": "/lib/shows/Show/Season 01/Show - S01E02.mkv",
+                    "target": "/mnt/zurg/__all__/RELEASE/Show.S01E02.1080p.mkv",
+                }
+            }
+        }
+
+        result = list(_sonarr_dead_files(arr, series, state=state))
+        self.assertEqual(len(result), 1)
+        sid, title, sn, efids, _series_dict, epids = result[0]
+        self.assertEqual(sid, 5)
+        self.assertEqual(sn, 1)
+        self.assertEqual(efids, [])
+        self.assertEqual(epids, [10])
+
+    @patch(_MOD + "._dead_symlink", return_value=False)
+    def test_janitor_dead_file_fallback_by_release_name(self, _ds):
+        """When the janitor entry has no orig path, the repair check can still find the
+        episode by guessing the series from the release name and parsing the filename."""
+        efiles = []
+        eps = [_episode(10, None, 1, episode_number=2)]
+        arr = self._setup_arr(efiles, eps)
+        series = [_series(5, "Mr. Robot", monitored=True)]
+        series[0]["sortTitle"] = "mrrobot"
+        state = {
+            "__janitor_dead_files__": {
+                "Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S01E02.1080p.BluRay.DTS.x264-SbR.mkv": {
+                    "ts": 0,
+                    "orig": None,
+                    "target": None,
+                }
+            }
+        }
+        result = list(_sonarr_dead_files(arr, series, state=state))
+        self.assertEqual(len(result), 1)
+        sid, title, sn, efids, _series_dict, epids = result[0]
+        self.assertEqual(sid, 5)
+        self.assertEqual(sn, 1)
+        self.assertEqual(efids, [])
+        self.assertEqual(epids, [10])
+
+    @patch(_MOD + "._dead_symlink", return_value=False)
+    def test_janitor_dead_file_ignored_without_orig_path(self, _ds):
+        efiles = []
+        eps = []
+        arr = self._setup_arr(efiles, eps)
+        series = [_series(5, "Show")]
+        state = {
+            "__janitor_dead_files__": {
+                "RELEASE/Show.S01E02.1080p.mkv": {
+                    "ts": 0,
+                    "orig": None,
+                    "target": None,
+                }
+            }
+        }
+        result = list(_sonarr_dead_files(arr, series, state=state))
+        self.assertEqual(result, [])
+
+    @patch(_MOD + "._dead_symlink", return_value=False)
+    def test_janitor_dead_file_matches_symlink_target(self, _ds):
+        """A live-looking symlink whose target is recorded as dead by the janitor is treated as dead."""
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as libdir:
+            fp = os.path.join(libdir, "Show - S01E02.mkv")
+            os.symlink("/mnt/zurg/__all__/RELEASE/Show.S01E02.1080p.mkv", fp)
+            efiles = [_efile(100, fp, season_number=1)]
+            eps = [_episode(10, 100, 1, episode_number=2)]
+            arr = self._setup_arr(efiles, eps)
+            series = [_series(5, "Show")]
+            series[0]["path"] = libdir
+            state = {
+                "__janitor_dead_files__": {
+                    "RELEASE/Show.S01E02.1080p.mkv": {
+                        "ts": 0,
+                        "orig": fp,
+                        "target": "/mnt/zurg/__all__/RELEASE/Show.S01E02.1080p.mkv",
+                    }
+                }
+            }
+            result = list(_sonarr_dead_files(arr, series, state=state))
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0][3], [100])
+            self.assertEqual(result[0][5], [10])
+
+
+class ParseJanitorDeadPathTest(unittest.TestCase):
+
+    def test_parses_standard_path(self):
+        from doctor.checks.repair.dead_symlinks import _parse_janitor_dead_path
+        series = [{"id": 5, "title": "Show", "path": "/lib/shows/Show (2020) {imdb-tt123}"}]
+        orig = "/lib/shows/Show (2020) {imdb-tt123}/Season 02/Show (2020) - S02E05.mkv"
+        ser, sn, eps = _parse_janitor_dead_path(orig, series)
+        self.assertEqual(ser["id"], 5)
+        self.assertEqual(sn, 2)
+        self.assertEqual(eps, [5])
+
+    def test_multi_episode_filename(self):
+        from doctor.checks.repair.dead_symlinks import _parse_janitor_dead_path
+        series = [{"id": 5, "title": "Show", "path": "/lib/shows/Show"}]
+        orig = "/lib/shows/Show/Season 01/Show - S01E01-E02.mkv"
+        ser, sn, eps = _parse_janitor_dead_path(orig, series)
+        self.assertEqual(sn, 1)
+        self.assertEqual(eps, [1, 2])
+
+    def test_no_match(self):
+        from doctor.checks.repair.dead_symlinks import _parse_janitor_dead_path
+        series = [{"id": 5, "title": "Show", "path": "/lib/shows/Show"}]
+        self.assertIsNone(_parse_janitor_dead_path("/other/path/Show/Season 01/Show - S01E01.mkv", series))
+
+
+class RepairSonarrSeasonEpidsTest(unittest.TestCase):
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_SEARCH", True)
+    @patch(_MOD + ".REPAIR_VERIFY", False)
+    @patch(_MOD + ".DRY_RUN", False)
+    def test_passed_epids_used_for_episode_search(self):
+        arr = _make_arr("sonarr-1", "sonarr")
+        arr.episodes.return_value = [
+            {"id": 10, "seasonNumber": 1},
+            {"id": 11, "seasonNumber": 1},
+        ]
+        arr.command.return_value = 99
+        series = {"id": 5, "title": "Show", "ended": False, "seasons": []}
+
+        _repair_sonarr_season(arr, sid=5, title="Show", season_number=1,
+                              efids=[], state=None, series=series, epids=[10])
+        arr.command.assert_called_once_with("EpisodeSearch", episodeIds=[10])
+
+
+
+class GuessSeriesFromReleaseTest(unittest.TestCase):
+
+    def test_exact_match(self):
+        from doctor.checks.repair.dead_symlinks import _guess_series_from_release
+        series = [{"id": 5, "title": "Mr. Robot", "sortTitle": "mrrobot"}]
+        ser = _guess_series_from_release("Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED", series)
+        self.assertEqual(ser["id"], 5)
+
+    def test_dotted_title_normalized(self):
+        from doctor.checks.repair.dead_symlinks import _guess_series_from_release
+        series = [{"id": 5, "title": "My Dress-Up Darling", "sortTitle": "my dress up darling"}]
+        ser = _guess_series_from_release("My.Dress-Up.Darling.S02.1080p.BluRay.Remux.DUAL.FLAC.2.0.AVC-DemiHuman", series)
+        self.assertEqual(ser["id"], 5)
+
+    def test_no_match(self):
+        from doctor.checks.repair.dead_symlinks import _guess_series_from_release
+        series = [{"id": 5, "title": "Other Show", "sortTitle": "other show"}]
+        ser = _guess_series_from_release("Mr.Robot.S01.1080p.mkv", series)
+        self.assertIsNone(ser)
+
+
+class ParseEpisodesFromFilenameTest(unittest.TestCase):
+
+    def test_single_episode(self):
+        from doctor.checks.repair.dead_symlinks import _parse_episodes_from_filename
+        self.assertEqual(_parse_episodes_from_filename("Show.S01E05.1080p.mkv", 1), [5])
+
+    def test_episode_range(self):
+        from doctor.checks.repair.dead_symlinks import _parse_episodes_from_filename
+        self.assertEqual(_parse_episodes_from_filename("Show.S01E01-E02.1080p.mkv", 1), [1, 2])
+        self.assertEqual(_parse_episodes_from_filename("Show.S01E01E02.1080p.mkv", 1), [1, 2])
+
+    def test_different_season_ignored(self):
+        from doctor.checks.repair.dead_symlinks import _parse_episodes_from_filename
+        self.assertEqual(_parse_episodes_from_filename("Show.S02E05.1080p.mkv", 1), [])

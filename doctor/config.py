@@ -100,6 +100,13 @@ MULTIPACK_ENABLED       = _b("ENABLE_MULTIPACK", True)             # push cached
 MULTIPACK_MAX_ACTIONS   = _i("MULTIPACK_MAX_ACTIONS", 3)           # max packs pushed per sweep
 MULTIPACK_RECHECK       = _f("MULTIPACK_RECHECK", 7 * 86400)       # seconds before re-checking a series for new packs (default 7 days)
 MULTIPACK_ITEM_INTERVAL = _f("MULTIPACK_ITEM_INTERVAL", 2)         # seconds between pushes
+# ---- force_import (importarr-style: force import matched-by-ID releases) ----
+EN_FORCE_IMPORT        = _b("ENABLE_FORCE_IMPORT", False)          # try manual import of obfuscated/misnamed releases
+FI_MAX_ACTIONS         = _i("FORCE_IMPORT_MAX_ACTIONS", 10)       # max manual imports per sweep
+FI_MIN_STRIKES         = _i("FORCE_IMPORT_MIN_STRIKES", 1)        # consecutive hits before acting (often safe at 1)
+FI_FALLBACK            = _b("FORCE_IMPORT_FALLBACK", True)         # remove + re-search if force import fails
+FI_IMPORT_MODE         = os.environ.get("FORCE_IMPORT_MODE", "auto").strip().lower()  # auto | copy | move
+FI_RECHECK             = _dur(os.environ.get("FORCE_IMPORT_RECHECK", "1h"), 3600)  # cooldown per item
 # missing_seasons runs on a tighter default interval than other slow checks;
 # the scheduler handles this via its per-check default_interval column.
 EN_NO_UPGRADE_PROFILE   = _b("ENABLE_NO_UPGRADE_PROFILE", False)
@@ -134,6 +141,15 @@ DECY_MOUNT_TEST   = os.environ.get("DECYPHARR_MOUNT_TEST", "")      # a dir on t
 DECY_READ_TIMEOUT = _i("DECYPHARR_READ_TIMEOUT", 25)
 DECY_RESTART_CMD  = os.environ.get("DECYPHARR_RESTART_CMD", "")     # shell cmd to recover a hung mount
 DECY_FUSE_STRIKES = _i("DECYPHARR_FUSE_STRIKES", 2)                 # consecutive failures before restart hook fires
+# ---- decypharr link-error cache poisoning detector ----
+# decypharr caches ALL provider errors (including transient RD CDN errors like
+# read_pxy_timeout) as permanent in-memory validation failures.  Once poisoned
+# the only fix is a restart.  stack-doctor detects this by counting these
+# error lines in the log tail over a rolling window.
+DECY_LINK_ERR_LOG_CMD   = os.environ.get("DECYPHARR_LINK_ERR_LOG_CMD", "")  # cmd to fetch log; falls back to JAN_LOG_CMD / JAN_LOG
+DECY_LINK_ERR_THRESHOLD = _i("DECYPHARR_LINK_ERR_THRESHOLD", 20)    # errors in window before acting (default 20)
+DECY_LINK_ERR_WINDOW    = _dur(os.environ.get("DECYPHARR_LINK_ERR_WINDOW", "10m"), 600)  # rolling window in seconds (default 10m)
+DECY_LINK_ERR_RESTART   = _b("DECYPHARR_LINK_ERR_RESTART", True)    # restart decypharr when threshold hit (uses DECY_RESTART_CMD)
 PLEX_URL   = os.environ.get("PLEX_URL", "")
 PLEX_TOKEN = os.environ.get("PLEX_TOKEN", "")
 PLEX_SCAN  = _b("PLEX_SCAN_ON_CHECK", False)
@@ -186,6 +202,9 @@ REPAIR_MFD_RECHECK       = _dur(os.environ.get("REPAIR_MFD_RECHECK", "24h"), 864
 REPAIR_VERIFY            = _b("REPAIR_VERIFY", False)              # enable post-repair grab verification
 REPAIR_VERIFY_DEADLINE   = _dur(os.environ.get("REPAIR_VERIFY_DEADLINE", "4h"), 14400)  # give up after this long
 REPAIR_ORPHAN_SCAN      = _b("REPAIR_ORPHAN_SCAN", True)             # report dead symlinks not tracked by *arr
+REPAIR_HIERARCHICAL_SEARCH = _b("REPAIR_HIERARCHICAL_SEARCH", False)  # prefer series/season/episode searches based on airing status
+REPAIR_HIERARCHICAL_FALLBACK = _b("REPAIR_HIERARCHICAL_FALLBACK", True)  # fall back to narrower search if wider search finds nothing
+REPAIR_SEASON_ENDED_THRESHOLD = _dur(os.environ.get("REPAIR_SEASON_ENDED_THRESHOLD", "7d"), 604800)  # how long after last aired date to treat a season as ended
 TRIGGER_EVENTS = set(e.strip() for e in os.environ.get(
     "DOCTOR_TRIGGER_EVENTS", "Download,ManualInteractionRequired,DownloadFailed,Grab").split(",") if e.strip())
 handlers = [logging.StreamHandler(sys.stdout)]

@@ -163,7 +163,7 @@ class RepairSonarrTest(unittest.TestCase):
     def test_calls_repair_sonarr_for_dead_files(self):
         arr = _make_arr(kind="sonarr")
         arr.series.return_value = [{"id": 1, "title": "Show"}]
-        dead = [(1, "Show", 1, [10, 11])]  # sid, title, season, efids
+        dead = [(1, "Show", 1, [10, 11], {"id": 1, "title": "Show"}, [100, 101])]  # sid, title, season, efids
         mocks = _run([arr], sonarr_dead_files=dead)
         mocks["repair_sonarr"].assert_called_once()
 
@@ -171,14 +171,14 @@ class RepairSonarrTest(unittest.TestCase):
         arr = _make_arr(kind="sonarr")
         arr.series.return_value = [{}]
         # Two seasons with 1 and 2 files respectively
-        dead = [(1, "Show", 1, [10]), (1, "Show", 2, [11, 12])]
+        dead = [(1, "Show", 1, [10], {"id": 1, "title": "Show"}, [100]), (1, "Show", 2, [11, 12], {"id": 1, "title": "Show"}, [101, 102])]
         mocks = _run([arr], sonarr_dead_files=dead, repair_max_actions=10, repair_max_symlinks=50)
         self.assertEqual(mocks["repair_sonarr"].call_count, 2)
 
     def test_sonarr_stops_at_max_actions(self):
         arr = _make_arr(kind="sonarr")
         arr.series.return_value = [{}]
-        dead = [(1, "Show", 1, [10]), (1, "Show", 2, [11])]
+        dead = [(1, "Show", 1, [10], {"id": 1, "title": "Show"}, [100]), (1, "Show", 2, [11], {"id": 1, "title": "Show"}, [101])]
         mocks = _run([arr], sonarr_dead_files=dead, repair_max_actions=1)
         self.assertEqual(mocks["repair_sonarr"].call_count, 1)
 
@@ -186,7 +186,7 @@ class RepairSonarrTest(unittest.TestCase):
         arr = _make_arr(kind="sonarr")
         arr.series.return_value = [{}]
         # 3 files in the group but symlink cap is 2 — group is too big
-        dead = [(1, "Show", 1, [10, 11, 12])]
+        dead = [(1, "Show", 1, [10, 11, 12], {"id": 1, "title": "Show"}, [100, 101, 102])]
         mocks = _run([arr], sonarr_dead_files=dead, repair_max_symlinks=2)
         mocks["repair_sonarr"].assert_not_called()
 

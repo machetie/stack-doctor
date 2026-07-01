@@ -15,6 +15,7 @@ from .janitor import check_janitor
 from .bazarr import check_bazarr
 from .seerr import check_seerr
 from .repair import check_repair
+from .force_import import check_force_import
 from .warmer import warmer_loop, plexlog_loop
 from .missing_seasons import check_missing_seasons, backfill_missing_seasons
 from .no_upgrade import check_no_upgrade_profile
@@ -23,6 +24,7 @@ from .multipack import check_multipack
 __all__ = [
     "check_bazarr",
     "check_decypharr",
+    "check_force_import",
     "check_janitor",
     "check_missing_seasons",
     "check_multipack",

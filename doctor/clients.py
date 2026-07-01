@@ -150,6 +150,39 @@ class Arr:
         except Exception:
             return None
 
+    def manualimport(self, series_id=None, movie_id=None, folder=None, t=30):
+        """Fetch manual-import candidates for a series/movie or folder.
+        Returns a list of file dicts, each with path, episodeIds/movieId, quality, etc."""
+        import urllib.parse
+        params = []
+        if self.kind == "sonarr" and series_id:
+            params.append("seriesId=%d" % series_id)
+        elif self.kind == "radarr" and movie_id:
+            params.append("movieId=%d" % movie_id)
+        if folder:
+            params.append("folder=%s" % urllib.parse.quote(folder))
+        if not params:
+            return []
+        path = "/manualimport?%s" % "&".join(params)
+        try:
+            return self._jget(path, t=t) or []
+        except Exception as e:
+            log.warning("[%s] manualimport fetch failed: %s", self.name, str(e)[:70])
+            return []
+
+    def manualimport_command(self, files, import_mode="auto"):
+        """POST a ManualImport command with the supplied file list.
+        Returns the command id on success, or None on failure."""
+        if not files:
+            return None
+        body = {"name": "ManualImport", "files": files, "importMode": import_mode}
+        try:
+            resp = json.load(self._req("POST", "/command", data=json.dumps(body).encode()))
+            return resp.get("id") or True
+        except Exception as e:
+            log.warning("[%s] manualimport command failed: %s", self.name, str(e)[:70])
+            return None
+
     def release_search(self, series_id, season_number=1, timeout=45):
         """GET /release?seriesId=&seasonNumber= — returns list of release dicts (same as Sonarr UI).
         Returns [] on failure."""

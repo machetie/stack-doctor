@@ -11,7 +11,7 @@ from .common import _debrid_mount_ok
 from .dead_symlinks import _radarr_dead_files, _sonarr_dead_files, _repair_radarr_movie, _repair_sonarr_season
 from .season_pack import _sonarr_season_pack_check
 from .missing_from_disk import _missing_from_disk_check
-from .verify import _repair_verify_pending
+from .verify import _repair_verify_pending, _repair_process_fallbacks, _repair_verify_key
 from .orphan import _orphan_dead_symlink_scan
 
 def check_repair():
@@ -25,9 +25,15 @@ def check_repair():
         # verify pending searches from previous sweeps before starting a new one
         if REPAIR_VERIFY:
             _repair_verify_pending(state)
+            # issue any fallback searches that were scheduled by the verify step
+            fb_issued = _repair_process_fallbacks(state)
+            if fb_issued:
+                log.info("[repair] issued %d hierarchical fallback search(es)", fb_issued)
         acted = 0          # search commands issued (groups)
         symlinks = 0       # total dead symlinks deleted
         cap_hit = None
+        # Track which janitor-reported dead files are being handled by this sweep.
+        janitor_processed = []
         for arr in INSTANCES:
             if arr.kind not in ("sonarr", "radarr"):
                 continue
@@ -37,7 +43,7 @@ def check_repair():
                 if arr.kind == "sonarr":
                     series = arr.series()
                     log.debug("[repair:%s] scanning %d series for dead symlinks", arr.name, len(series))
-                    for sid, title, sn, efids in _sonarr_dead_files(arr, series):
+                    for sid, title, sn, efids, series, epids in _sonarr_dead_files(arr, series, state=state, processed=janitor_processed):
                         if acted >= REPAIR_MAX_ACTIONS:
                             cap_hit = "REPAIR_MAX_ACTIONS"; break
                         if symlinks >= REPAIR_MAX_SYMLINKS:
@@ -45,9 +51,16 @@ def check_repair():
                         count = len(efids)
                         if symlinks + count > REPAIR_MAX_SYMLINKS:
                             cap_hit = "REPAIR_MAX_SYMLINKS"; break
+                        # Skip if this season already has a pending repair search in flight
+                        if REPAIR_VERIFY:
+                            key = _repair_verify_key(arr.name, title, sn)
+                            if state.get("__repair_verify__", {}).get(key):
+                                log.debug("[repair:%s] skipping %s S%02d: pending repair search in flight",
+                                          arr.name, title, sn)
+                                continue
                         log.debug("[repair:%s] dead symlink(s) found: %s S%02d (%d file(s))",
                                   arr.name, title, sn, count)
-                        if _repair_sonarr_season(arr, sid, title, sn, efids, state):
+                        if _repair_sonarr_season(arr, sid, title, sn, efids, state, series=series, epids=epids):
                             acted += 1
                             symlinks += count
                             if REPAIR_ITEM_INTERVAL > 0:
@@ -55,7 +68,7 @@ def check_repair():
                 else:
                     movies = arr.movies()
                     log.debug("[repair:%s] scanning %d movies for dead symlinks", arr.name, len(movies))
-                    for mid, title, mfid in _radarr_dead_files(movies):
+                    for mid, title, mfid in _radarr_dead_files(movies, state=state, processed=janitor_processed):
                         if acted >= REPAIR_MAX_ACTIONS:
                             cap_hit = "REPAIR_MAX_ACTIONS"; break
                         if symlinks >= REPAIR_MAX_SYMLINKS:
@@ -73,6 +86,15 @@ def check_repair():
                      acted, symlinks, " (capped by %s)" % cap_hit if cap_hit else "")
         else:
             log.debug("[repair] symlink sweep: no dead symlinks found")
+        # Clean up janitor dead-file entries that were processed this sweep.
+        if janitor_processed:
+            janitor_dead = state.get("__janitor_dead_files__", {})
+            removed = 0
+            for key in janitor_processed:
+                if janitor_dead.pop(key, None):
+                    removed += 1
+            if removed:
+                log.debug("[repair] cleared %d processed janitor dead-file record(s)", removed)
         # season-pack check: find sonarr seasons that are fully downloaded but spread across multiple
         # parent dirs (individual episode grabs, not a season pack). Trigger a season search to upgrade.
         if REPAIR_SEASON_PACKS and acted < REPAIR_MAX_ACTIONS:

@@ -227,3 +227,141 @@ class RecordVerifyTest(unittest.TestCase):
         entry = list(state["__repair_verify__"].values())[0]
         ts = entry["search_ts"]
         self.assertRegex(ts, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+class HierarchicalFallbackTest(unittest.TestCase):
+    """Test fallback to narrower search strategies when a wider search stalls."""
+
+    def _pending_fb(self, strategy, hierarchical=True, sn=1, sid=5, epids=None, **kw):
+        e = _pending("sonarr-1", media_id=sid, entity_ids=epids or [10], **kw)
+        e["strategy"] = strategy
+        e["season_number"] = sn
+        e["series_id"] = sid
+        e["hierarchical"] = hierarchical
+        return e
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_FALLBACK", True)
+    def test_series_search_falls_back_to_season(self):
+        arr = _make_arr()
+        arr.history_grabbed.return_value = None
+        past = time.time() - 1
+        entry = self._pending_fb("series", deadline=past, cmd_done=True)
+        state = {"__repair_verify__": {"k1": entry}}
+        from doctor.checks.repair.verify import _repair_verify_pending
+        with patch(_MOD + ".INSTANCES", [arr]):
+            _repair_verify_pending(state)
+        pv = state["__repair_verify__"]
+        self.assertIn("k1", pv)
+        self.assertEqual(pv["k1"]["strategy"], "season")
+        self.assertTrue(pv["k1"].get("needs_fallback"))
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_FALLBACK", True)
+    def test_season_search_falls_back_to_episode(self):
+        arr = _make_arr()
+        arr.history_grabbed.return_value = None
+        past = time.time() - 1
+        entry = self._pending_fb("season", deadline=past, cmd_done=True)
+        state = {"__repair_verify__": {"k1": entry}}
+        from doctor.checks.repair.verify import _repair_verify_pending
+        with patch(_MOD + ".INSTANCES", [arr]):
+            _repair_verify_pending(state)
+        pv = state["__repair_verify__"]
+        self.assertIn("k1", pv)
+        self.assertEqual(pv["k1"]["strategy"], "episode")
+        self.assertTrue(pv["k1"].get("needs_fallback"))
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_FALLBACK", True)
+    def test_episode_search_does_not_fall_back(self):
+        arr = _make_arr()
+        arr.history_grabbed.return_value = None
+        past = time.time() - 1
+        entry = self._pending_fb("episode", deadline=past, cmd_done=True)
+        state = {"__repair_verify__": {"k1": entry}}
+        from doctor.checks.repair.verify import _repair_verify_pending
+        with patch(_MOD + ".INSTANCES", [arr]):
+            _repair_verify_pending(state)
+        self.assertEqual(state["__repair_verify__"], {})
+
+    @patch(_MOD + ".REPAIR_HIERARCHICAL_FALLBACK", False)
+    def test_fallback_disabled_removes_on_deadline(self):
+        arr = _make_arr()
+        arr.history_grabbed.return_value = None
+        past = time.time() - 1
+        entry = self._pending_fb("series", deadline=past, cmd_done=True)
+        state = {"__repair_verify__": {"k1": entry}}
+        from doctor.checks.repair.verify import _repair_verify_pending
+        with patch(_MOD + ".INSTANCES", [arr]):
+            _repair_verify_pending(state)
+        self.assertEqual(state["__repair_verify__"], {})
+
+    def test_non_hierarchical_does_not_fall_back(self):
+        arr = _make_arr()
+        arr.history_grabbed.return_value = None
+        past = time.time() - 1
+        entry = self._pending_fb("series", hierarchical=False, deadline=past, cmd_done=True)
+        state = {"__repair_verify__": {"k1": entry}}
+        from doctor.checks.repair.verify import _repair_verify_pending
+        with patch(_MOD + ".INSTANCES", [arr]):
+            _repair_verify_pending(state)
+        self.assertEqual(state["__repair_verify__"], {})
+
+
+class ProcessFallbacksTest(unittest.TestCase):
+    """Test _repair_process_fallbacks issues the correct narrowed search commands."""
+
+    def _make_state(self, strategy, sn=1, sid=5, epids=None):
+        return {"__repair_verify__": {
+            "k1": {
+                "arr_name": "sonarr-1", "title": "Show", "strategy": strategy,
+                "needs_fallback": True, "series_id": sid, "season_number": sn,
+                "entity_ids": epids or [10], "hierarchical": True,
+            }
+        }}
+
+    def test_series_fallback_issues_season_search(self):
+        arr = _make_arr()
+        arr.command.return_value = 123
+        # state contains the *target* fallback strategy (season)
+        state = self._make_state("season", sn=2, sid=5)
+        from doctor.checks.repair.verify import _repair_process_fallbacks
+        with patch(_MOD + ".INSTANCES", [arr]):
+            issued = _repair_process_fallbacks(state)
+        self.assertEqual(issued, 1)
+        arr.command.assert_called_once_with("SeasonSearch", seriesId=5, seasonNumber=2)
+        entry = state["__repair_verify__"]["k1"]
+        self.assertEqual(entry["cmd_id"], 123)
+        self.assertFalse(entry.get("needs_fallback"))
+        self.assertFalse(entry.get("cmd_done"))
+
+    def test_season_fallback_issues_episode_search(self):
+        arr = _make_arr()
+        arr.command.return_value = 124
+        # state contains the *target* fallback strategy (episode)
+        state = self._make_state("episode", sn=1, sid=5, epids=[10, 11])
+        from doctor.checks.repair.verify import _repair_process_fallbacks
+        with patch(_MOD + ".INSTANCES", [arr]):
+            issued = _repair_process_fallbacks(state)
+        self.assertEqual(issued, 1)
+        arr.command.assert_called_once_with("EpisodeSearch", episodeIds=[10, 11])
+        entry = state["__repair_verify__"]["k1"]
+        self.assertEqual(entry["cmd_id"], 124)
+        self.assertFalse(entry.get("needs_fallback"))
+
+    def test_no_needs_fallback_skips(self):
+        arr = _make_arr()
+        state = {"__repair_verify__": {"k1": {"arr_name": "sonarr-1", "needs_fallback": False}}}
+        from doctor.checks.repair.verify import _repair_process_fallbacks
+        with patch(_MOD + ".INSTANCES", [arr]):
+            issued = _repair_process_fallbacks(state)
+        self.assertEqual(issued, 0)
+        arr.command.assert_not_called()
+
+    def test_command_failure_keeps_needs_fallback(self):
+        arr = _make_arr()
+        arr.command.return_value = None
+        state = self._make_state("season", sn=1, sid=5, epids=[10])
+        from doctor.checks.repair.verify import _repair_process_fallbacks
+        with patch(_MOD + ".INSTANCES", [arr]):
+            issued = _repair_process_fallbacks(state)
+        self.assertEqual(issued, 0)
+        self.assertTrue(state["__repair_verify__"]["k1"].get("needs_fallback"))

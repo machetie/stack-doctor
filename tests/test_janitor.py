@@ -15,7 +15,7 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from doctor.checks.janitor import (
     _scan_operational_errors,
@@ -349,3 +349,102 @@ class ProbeDecyApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# File-level quarantine and state recording
+# ---------------------------------------------------------------------------
+
+class ReleaseRelTest(unittest.TestCase):
+
+    def test_under_all(self):
+        from doctor.checks.janitor import _release_rel
+        self.assertEqual(_release_rel("/mnt/zurg/__all__/RELEASE/file.mkv"), "RELEASE/file.mkv")
+
+    def test_under_complete(self):
+        from doctor.checks.janitor import _release_rel
+        self.assertEqual(_release_rel("/mnt/zurg/complete/RELEASE/file.mkv"), "RELEASE/file.mkv")
+
+    def test_no_match(self):
+        from doctor.checks.janitor import _release_rel
+        self.assertIsNone(_release_rel("/some/other/path/file.mkv"))
+
+
+class DeadFileMatchesTest(unittest.TestCase):
+
+    def test_exact_rel_match(self):
+        from doctor.checks.janitor import _dead_file_matches
+        self.assertTrue(_dead_file_matches("RELEASE/file.mkv", {"RELEASE/file.mkv": True}))
+
+    def test_basename_match(self):
+        from doctor.checks.janitor import _dead_file_matches
+        self.assertTrue(_dead_file_matches("RELEASE/file.mkv", {"file.mkv": True}))
+
+    def test_no_match(self):
+        from doctor.checks.janitor import _dead_file_matches
+        self.assertFalse(_dead_file_matches("RELEASE/file.mkv", {"OTHER/file.mkv": True}))
+
+
+class CheckJanitorFileLevelTest(unittest.TestCase):
+
+    def setUp(self):
+        self._saved_alert = dict(_jan_alert_last)
+        _jan_alert_last.clear()
+
+    def tearDown(self):
+        _jan_alert_last.clear()
+        _jan_alert_last.update(self._saved_alert)
+
+    @patch(_MOD + "._read_log_tail", return_value="""
+[webdav] Error streaming file: Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv error="marked as bad"
+""")
+    @patch(_MOD + ".JAN_LIBS", ["/lib"])
+    @patch(_MOD + ".JAN_QUAR", "/quarantine")
+    @patch(_MOD + ".DRY_RUN", False)
+    @patch(_MOD + ".state_transaction")
+    def test_only_quarantines_specific_dead_file(self, mock_tx, *_):
+        from doctor.checks.janitor import check_janitor
+        import os
+        with tempfile.TemporaryDirectory() as libdir:
+            os.makedirs(os.path.join(libdir, "shows"))
+            # Create two symlinks in the same release
+            good = os.path.join(libdir, "shows", "good.mkv")
+            bad = os.path.join(libdir, "shows", "bad.mkv")
+            os.symlink("/mnt/zurg/__all__/Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E12.1080p.BluRay.DTS.x264-SbR.mkv", good)
+            os.symlink("/mnt/zurg/__all__/Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv", bad)
+
+            state = {"__janitor_dead_files__": {}}
+            mock_tx.return_value.__enter__ = lambda s: state
+            mock_tx.return_value.__exit__ = MagicMock(return_value=False)
+            with patch(_MOD + ".JAN_LIBS", [os.path.join(libdir, "shows")]):
+                check_janitor()
+
+            self.assertTrue(os.path.islink(good), "good file should not be quarantined")
+            self.assertFalse(os.path.exists(bad), "bad file should be quarantined")
+            self.assertIn("Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv", state["__janitor_dead_files__"])
+            self.assertIsNotNone(state["__janitor_dead_files__"]["Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv"]["orig"])
+
+    @patch(_MOD + "._read_log_tail", return_value="""
+[link] Giving up on entry after repeated failed re-insertions attempts=3 filename=Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv infohash=abc name=Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED reason=empty_link
+""")
+    @patch(_MOD + ".JAN_LIBS", ["/lib"])
+    @patch(_MOD + ".JAN_QUAR", "/quarantine")
+    @patch(_MOD + ".DRY_RUN", False)
+    @patch(_MOD + ".state_transaction")
+    def test_quarantines_from_link_pattern(self, mock_tx, *_):
+        from doctor.checks.janitor import check_janitor
+        import os
+        with tempfile.TemporaryDirectory() as libdir:
+            os.makedirs(os.path.join(libdir, "shows"))
+            fp = os.path.join(libdir, "shows", "file.mkv")
+            os.symlink("/mnt/zurg/__all__/Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv", fp)
+
+            state = {"__janitor_dead_files__": {}}
+            mock_tx.return_value.__enter__ = lambda s: state
+            mock_tx.return_value.__exit__ = MagicMock(return_value=False)
+            with patch(_MOD + ".JAN_LIBS", [os.path.join(libdir, "shows")]):
+                check_janitor()
+
+            self.assertFalse(os.path.exists(fp))
+            key = "Mr.Robot.S01-S04.1080p.BluRay.DD5.1.x264-MIXED/Mr.Robot.S04E13.1080p.BluRay.DTS.x264-SbR.mkv"
+            self.assertIn(key, state["__janitor_dead_files__"])

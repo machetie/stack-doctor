@@ -4,7 +4,7 @@ import threading
 from collections import namedtuple
 from typing import Optional, Callable, Any
 from .config import (
-    EN_BAZARR, EN_DECYPHARR, EN_JANITOR, EN_MISSING_SEASONS,
+    EN_BAZARR, EN_DECYPHARR, EN_FORCE_IMPORT, EN_JANITOR, EN_MISSING_SEASONS,
     EN_NO_UPGRADE_PROFILE, EN_PLEX, EN_PLEX_SCAN, EN_PROVIDERS,
     EN_QUEUE, EN_REPAIR, EN_RESOURCES, EN_SEERR,
     FAST_INTERVAL, MULTIPACK_ENABLED, SCHEDULER_CONCURRENCY,
@@ -14,6 +14,7 @@ from .config import (
 from .checks import (  # check_* functions referenced by CHECKS
     check_bazarr,
     check_decypharr,
+    check_force_import,
     check_janitor,
     check_missing_seasons,
     check_multipack,
@@ -48,6 +49,7 @@ CHECKS = [CheckEntry("queue",              EN_QUEUE,              check_queue,  
           CheckEntry("resources",          EN_RESOURCES,          check_resources,          "fast", None, False),
           CheckEntry("janitor",            EN_JANITOR,            check_janitor,            "slow", None, False),
           CheckEntry("repair",             EN_REPAIR,             check_repair,             "slow", None, True),
+          CheckEntry("force_import",       EN_FORCE_IMPORT,       check_force_import,       "slow", None, True),   # importarr-style manual import
           CheckEntry("bazarr",             EN_BAZARR,             check_bazarr,             "fast", None, False),
           CheckEntry("seerr",              EN_SEERR,              check_seerr,              "fast", None, False),
           CheckEntry("missing_seasons",    EN_MISSING_SEASONS,    check_missing_seasons,    "slow", 900,   True),   # 15 min default

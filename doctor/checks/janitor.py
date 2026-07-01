@@ -1,10 +1,14 @@
 """Check: janitor.
 
-1. Reads the decypharr log tail and quarantines library symlinks that point to dead releases
-   (ARTICLE_NOT_FOUND, still missing, marked as bad, empty_link, etc.).
-2. Scans the same log tail for operational/infra error patterns (panic, fatal, rate-limit,
+1. Reads the decypharr log tail and quarantines library symlinks that point to dead files
+   (ARTICLE_NOT_FOUND, still missing, marked as bad, empty_link, etc.).  Only the exact
+   file reported in the log is quarantined; other files in the same release are left alone.
+2. Records the dead file paths in persistent state so the repair check can trigger a
+   re-search even after the symlink has been removed (important on FUSE mounts where a
+   "dead" file may still appear to exist).
+3. Scans the same log tail for operational/infra error patterns (panic, fatal, rate-limit,
    cloudflare, auth, network timeouts) and logs a summary, throttled so it doesn't spam.
-3. Optionally probes the decypharr HTTP API (if DECY_URL is set) and logs when it returns
+4. Optionally probes the decypharr HTTP API (if DECY_URL is set) and logs when it returns
    errors or becomes unreachable.
 """
 import os
@@ -16,6 +20,7 @@ from ..config import (
     JAN_LIBS, JAN_LOG, JAN_LOG_CMD, JAN_PATTERNS, JAN_QUAR,
     http_code, run_output, log,
 )
+from ..state import state_transaction
 
 # Operational-error categories we scan for in the decypharr log.
 # Each regex is case-insensitive and matches a whole word / short phrase.
@@ -86,6 +91,26 @@ def _read_log_tail():
             return f.read()
     return None
 
+def _release_rel(target):
+    """Return the path of a symlink target relative to the /__all__ or /complete root.
+
+    Example: /mnt/zurg/__all__/RELEASE/file.mkv -> RELEASE/file.mkv
+    """
+    mm = re.search(r"/(?:__all__|complete)/(.+)$", target)
+    if not mm:
+        return None
+    return mm.group(1).lstrip("/")
+
+def _dead_file_matches(rel_path, bad_files):
+    """Return True if a symlink relative path matches a known dead file.
+
+    bad_files is a dict keyed by exact relative path (RELEASE/file.mkv).  If only the
+    filename was available from the log, the key may be just the filename.
+    """
+    if rel_path in bad_files:
+        return True
+    return os.path.basename(rel_path) in bad_files
+
 def check_janitor():
     data = _read_log_tail()
     if data is None:
@@ -93,20 +118,29 @@ def check_janitor():
         return
     log.debug("[janitor] scanning %d bytes of log tail", len(data))
 
-    bad = set()
+    bad_files = {}
 
     # Pattern 1: [webdav] Error streaming file: <path> error="<msg>"
     # Catches: ARTICLE_NOT_FOUND, still missing, marked as bad, etc.
+    # path is "RELEASE/filename.mkv" relative to the debrid root.
     pat_stream = re.compile(r"Error streaming file: (.+?) error=\"([^\"]*)\"")
     for m in pat_stream.finditer(data):
         path, err = m.group(1), m.group(2)
         if any(p.strip() and p.strip() in err for p in JAN_PATTERNS):
-            bad.add(path.strip().split("/")[0])
+            bad_files[path.strip()] = True
 
-    # Pattern 2: [link] Giving up on entry ... filename=<name> reason=empty_link
-    pat_filename = re.compile(r"(?:Giving up on entry|empty_link).*?\bfilename=(\S+)")
+    # Pattern 2: [link] Giving up on entry ... filename=<name> name=<release> reason=empty_link
+    # filename alone is recorded if the release name is not on the same line.
+    pat_filename = re.compile(
+        r"(?:Giving up on entry|empty_link).*?\bfilename=(\S+)(?:.*?\bname=(\S+))?"
+    )
     for m in pat_filename.finditer(data):
-        bad.add(m.group(1).split("/")[0])
+        filename = m.group(1)
+        release = m.group(2)
+        if release:
+            bad_files["%s/%s" % (release, filename)] = True
+        else:
+            bad_files[filename] = True
 
     # Operational errors that don't necessarily map to a single dead release.
     op_counts = _scan_operational_errors(data)
@@ -117,54 +151,72 @@ def check_janitor():
     # Probe the decypharr API for correlated health issues.
     _probe_decy_api()
 
-    if not bad:
+    if not bad_files:
         log.debug("[janitor] no dead releases in log tail")
         return
-    log.debug("[janitor] found %d dead release(s): %s", len(bad), ", ".join(sorted(bad)[:10]))
+    log.debug("[janitor] found %d dead file(s): %s", len(bad_files), ", ".join(sorted(bad_files)[:10]))
 
     if not JAN_LIBS:
-        _jan_alert("janitor:dead", "[janitor] %d dead release(s) in log but no JANITOR_LIBRARY_PATHS to quarantine", len(bad))
+        _jan_alert("janitor:dead", "[janitor] %d dead file(s) in log but no JANITOR_LIBRARY_PATHS to quarantine", len(bad_files))
         return
 
-    moved = 0
-    qroot = os.path.join(JAN_QUAR, time.strftime("%Y%m%d-%H%M%S"))
-    manifest = []
-    for libp in JAN_LIBS:
-        libp = os.path.abspath(libp)
-        for root, _, files in os.walk(libp):
-            for fn in files:
-                fp = os.path.abspath(os.path.join(root, fn))
-                if not os.path.islink(fp):
-                    continue
-                try:
-                    tgt = os.readlink(fp)
-                except Exception:
-                    continue
-                mm = re.search(r"/(?:__all__|complete)/([^/]+)(?:/|$)", tgt)
-                if not mm or mm.group(1) not in bad:
-                    continue
-                if DRY_RUN:
-                    log.info("[janitor] WOULD quarantine: %s", fp)
-                    continue
-                try:
-                    dst = os.path.join(qroot, fp.lstrip("/"))
-                    if os.path.exists(dst) or os.path.islink(dst):
+    with state_transaction() as state:
+        janitor_dead = state.setdefault("__janitor_dead_files__", {})
+        now = time.time()
+        for bf in bad_files:
+            if bf not in janitor_dead:
+                janitor_dead[bf] = {"ts": now, "orig": None, "target": None}
+
+        moved = 0
+        qroot = os.path.join(JAN_QUAR, time.strftime("%Y%m%d-%H%M%S"))
+        manifest = []
+        for libp in JAN_LIBS:
+            libp = os.path.abspath(libp)
+            for root, _, files in os.walk(libp):
+                for fn in files:
+                    fp = os.path.abspath(os.path.join(root, fn))
+                    if not os.path.islink(fp):
                         continue
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    os.symlink(tgt, dst)
-                    os.unlink(fp)
-                    manifest.append({"orig": fp, "target": tgt})
-                    moved += 1
-                except Exception as e:
-                    log.warning("[janitor] move failed %s: %s", fp, e)
+                    try:
+                        tgt = os.readlink(fp)
+                    except Exception:
+                        continue
+                    rel = _release_rel(tgt)
+                    if rel is None or not _dead_file_matches(rel, bad_files):
+                        continue
+                    if DRY_RUN:
+                        log.info("[janitor] WOULD quarantine: %s", fp)
+                        continue
+                    try:
+                        dst = os.path.join(qroot, fp.lstrip("/"))
+                        if os.path.exists(dst) or os.path.islink(dst):
+                            continue
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        os.symlink(tgt, dst)
+                        os.unlink(fp)
+                        manifest.append({"orig": fp, "target": tgt})
+                        moved += 1
+                        # Update the state entry with the orig path so repair can act on it.
+                        if rel in janitor_dead:
+                            janitor_dead[rel]["orig"] = fp
+                            janitor_dead[rel]["target"] = tgt
+                        else:
+                            # fallback when only the filename was known
+                            base = os.path.basename(rel)
+                            if base in janitor_dead:
+                                janitor_dead[base]["orig"] = fp
+                                janitor_dead[base]["target"] = tgt
+                    except Exception as e:
+                        log.warning("[janitor] move failed %s: %s", fp, e)
 
-    if manifest:
-        try:
-            os.makedirs(qroot, exist_ok=True)
-            with open(os.path.join(qroot, "manifest.json"), "w") as f:
-                json.dump(manifest, f, indent=1)
-        except Exception:
-            pass
+        if manifest:
+            try:
+                os.makedirs(qroot, exist_ok=True)
+                with open(os.path.join(qroot, "manifest.json"), "w") as f:
+                    json.dump(manifest, f, indent=1)
+            except Exception:
+                pass
 
-    if moved:
-        log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s", moved, len(bad), qroot)
+        if moved:
+            log.info("[janitor] quarantined %d dead-file symlink(s) across %d release(s) -> %s",
+                     moved, len({b.split("/")[0] for b in bad_files}), qroot)

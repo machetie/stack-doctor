@@ -21,10 +21,15 @@ on single transient errors.
 import os
 import threading
 import time
+import re
+
 from ..config import (
-    DECY_FUSE_STRIKES, DECY_MOUNT_TEST, DECY_READ_TIMEOUT,
+    DECY_FUSE_STRIKES, DECY_LINK_ERR_LOG_CMD, DECY_LINK_ERR_RESTART,
+    DECY_LINK_ERR_THRESHOLD, DECY_LINK_ERR_WINDOW,
+    DECY_MOUNT_TEST, DECY_READ_TIMEOUT,
     DECY_RESTART_CMD, DECY_URL, DRY_RUN,
-    http_code, run_cmd, log,
+    JAN_LOG, JAN_LOG_CMD,
+    http_code, run_cmd, run_output, log,
 )
 
 # ---------------------------------------------------------------------------
@@ -231,6 +236,165 @@ def _decy_restart(reason=""):
               rc[0] if rc else "?", rc[1].strip() if (rc and rc[1]) else "")
     return True
 
+
+# ---------------------------------------------------------------------------
+# Link-error cache poisoning detector
+# ---------------------------------------------------------------------------
+# decypharr's link/service.go caches every error from validateLink() in an
+# in-memory map (s.validated).  Errors returned by ErrorCodeToLinkError() for
+# unknown codes (e.g. RealDebrid CDN errors: read_pxy_timeout, read_timeout,
+# hoster_timeout) are classified as CategoryPermanent, so they are cached
+# forever and never retried.  The only way to clear the cache is a restart.
+#
+# This sub-check reads the decypharr log tail, counts webdav "Error streaming
+# file" lines that contain known transient-but-mis-classified error strings
+# within DECY_LINK_ERR_WINDOW seconds, and triggers a restart via
+# DECY_RESTART_CMD when the count exceeds DECY_LINK_ERR_THRESHOLD.
+#
+# Patterns that indicate a poisoned cache (transient RD/debrid CDN errors that
+# decypharr incorrectly caches as permanent):
+_LINK_ERR_PATTERNS = re.compile(
+    r"Error streaming file:.*"
+    r"(?:read_pxy_timeout|read_timeout|hoster_timeout|hoster_unavailable"
+    r"|unknown error code)",
+    re.I,
+)
+
+# Log-line timestamp formats decypharr uses:
+#   2026-07-01 00:22:18  (space-separated date + time, no TZ)
+_LOG_TS_RE = re.compile(
+    r"^(?:\[[0-9;]*m)?"          # optional ANSI colour prefix
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"  # group 1: timestamp
+)
+
+_link_err_last_restart = _State(0.0)
+
+
+def _parse_log_ts(line):
+    """Return a unix timestamp float from a decypharr log line, or None."""
+    m = _LOG_TS_RE.match(line)
+    if not m:
+        return None
+    ts_str = m.group(1)
+    try:
+        import datetime
+        dt = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _read_decy_log():
+    """Return the decypharr log tail as a string (up to ~2 MB).
+
+    Source priority:
+      1. DECYPHARR_LINK_ERR_LOG_CMD (dedicated override)
+      2. JAN_LOG_CMD  (shared janitor log command)
+      3. JAN_LOG      (shared janitor log file path)
+    Falls back to "" if nothing is configured.
+    """
+    cmd = DECY_LINK_ERR_LOG_CMD or JAN_LOG_CMD
+    if cmd:
+        return run_output(cmd)
+    if JAN_LOG:
+        try:
+            with open(JAN_LOG, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 2 * 1024 * 1024))
+                return fh.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            log.debug("[decypharr] link_err: could not read %s: %s", JAN_LOG, e)
+    return ""
+
+
+def _count_link_errors_in_window(log_data, window_secs):
+    """Count matching error lines whose timestamp falls within the last
+    *window_secs* seconds of wall-clock time.
+
+    Returns (count, newest_ts_or_None).
+    """
+    now = time.time()
+    cutoff = now - window_secs
+    count = 0
+    newest_ts = None
+    for line in log_data.splitlines():
+        if not _LINK_ERR_PATTERNS.search(line):
+            continue
+        ts = _parse_log_ts(line)
+        if ts is None or ts < cutoff:
+            continue
+        count += 1
+        if newest_ts is None or ts > newest_ts:
+            newest_ts = ts
+    return count, newest_ts
+
+
+def check_link_errors():
+    """Detect a poisoned link-validation cache and restart decypharr if needed.
+
+    Reads the decypharr log tail and counts webdav streaming errors caused by
+    transient provider errors (read_pxy_timeout etc.) that decypharr wrongly
+    caches as permanent.  When the count in the rolling window exceeds
+    DECY_LINK_ERR_THRESHOLD the restart hook fires (if configured and enabled).
+
+    Returns True if a restart was triggered, False otherwise.
+    """
+    # Need a log source AND the restart cmd to do anything useful
+    if not (DECY_LINK_ERR_LOG_CMD or JAN_LOG_CMD or JAN_LOG):
+        return False
+
+    log_data = _read_decy_log()
+    if not log_data:
+        return False
+
+    count, newest_ts = _count_link_errors_in_window(log_data, DECY_LINK_ERR_WINDOW)
+
+    if count == 0:
+        log.debug("[decypharr] link_err: 0 cached-error streaming failures in last %ds window", DECY_LINK_ERR_WINDOW)
+        return False
+
+    log.info(
+        "[decypharr] link_err: %d transient-but-cached streaming error(s) in last %ds "
+        "(threshold=%d, newest=%.0fs ago)",
+        count, DECY_LINK_ERR_WINDOW, DECY_LINK_ERR_THRESHOLD,
+        (time.time() - newest_ts) if newest_ts else -1,
+    )
+
+    if count < DECY_LINK_ERR_THRESHOLD:
+        return False
+
+    # Threshold exceeded — the validated-link cache is likely poisoned.
+    log.warning(
+        "[decypharr] link_err: %d errors >= threshold %d in %ds window -> "
+        "link validation cache is poisoned by transient provider errors",
+        count, DECY_LINK_ERR_THRESHOLD, DECY_LINK_ERR_WINDOW,
+    )
+
+    if not DECY_LINK_ERR_RESTART:
+        log.warning("[decypharr] link_err: DECYPHARR_LINK_ERR_RESTART=false, alert only")
+        return False
+
+    if not DECY_RESTART_CMD:
+        log.warning("[decypharr] link_err: no DECYPHARR_RESTART_CMD configured, alert only")
+        return False
+
+    if DRY_RUN:
+        log.warning("[decypharr] link_err: dry-run, would restart (reason=link_err_cache_poisoned)")
+        return False
+
+    if time.time() - _link_err_last_restart.value < 300:
+        log.warning("[decypharr] link_err: restart attempted <5m ago, holding off")
+        return False
+
+    log.error("[decypharr] link_err: restarting decypharr to flush poisoned link cache: %s", DECY_RESTART_CMD)
+    rc = run_cmd(DECY_RESTART_CMD)
+    _link_err_last_restart.value = time.time()
+    log.error("[decypharr] link_err: restart rc=%s %s",
+              rc[0] if rc else "?", rc[1].strip() if (rc and rc[1]) else "")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Main check entry point
 # ---------------------------------------------------------------------------
@@ -246,6 +410,9 @@ def check_decypharr():
     if DECY_URL:
         c = http_code(DECY_URL, t=10)
         log.info("[decypharr] api %s -> %s", DECY_URL, c if c else "DOWN")
+
+    # --- Link-error cache poisoning detector ---
+    check_link_errors()
 
     if not DECY_MOUNT_TEST:
         return
