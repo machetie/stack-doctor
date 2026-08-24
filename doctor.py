@@ -103,6 +103,53 @@ def _atomic_write_json(path, obj, indent=None):
             pass
         raise
 
+# --------------------------------------------------------------------------- #
+# metrics: a tiny in-process registry rendered as Prometheus text at /metrics.
+# Counters only grow; gauges are set outright. Labels are a sorted tuple of
+# (key, value) pairs. Stdlib-only, thread-safe, no external client needed.
+# --------------------------------------------------------------------------- #
+_metrics_lock = threading.Lock()
+_metrics_counters = {}   # (name, labels_tuple) -> float
+_metrics_gauges = {}     # (name, labels_tuple) -> float
+
+def _metric_labels(labels):
+    return tuple(sorted((str(k), str(v)) for k, v in (labels or {}).items()))
+
+def metric_inc(name, value=1, **labels):
+    key = (name, _metric_labels(labels))
+    with _metrics_lock:
+        _metrics_counters[key] = _metrics_counters.get(key, 0) + value
+
+def metric_set(name, value, **labels):
+    key = (name, _metric_labels(labels))
+    with _metrics_lock:
+        _metrics_gauges[key] = value
+
+def _metric_render_line(name, labels_tuple, value):
+    if labels_tuple:
+        lbl = ",".join('%s="%s"' % (k, str(v).replace("\\", "\\\\").replace('"', '\\"'))
+                       for k, v in labels_tuple)
+        head = "%s{%s}" % (name, lbl)
+    else:
+        head = name
+    # render integers without a trailing .0 for readability
+    v = int(value) if float(value).is_integer() else value
+    return "%s %s" % (head, v)
+
+def _metrics_render():
+    """Render the registry as Prometheus text exposition format."""
+    with _metrics_lock:
+        counters = dict(_metrics_counters)
+        gauges = dict(_metrics_gauges)
+    lines, seen_help = [], set()
+    for kind, store in (("counter", counters), ("gauge", gauges)):
+        for (name, labels_tuple), value in sorted(store.items()):
+            if name not in seen_help:
+                lines.append("# TYPE %s %s" % (name, kind))
+                seen_help.add(name)
+            lines.append(_metric_render_line(name, labels_tuple, value))
+    return "\n".join(lines) + ("\n" if lines else "")
+
 # Coarse, re-entrant lock serializing every shared-state read-modify-write.
 # In event mode each webhook spawns a sweep thread; holding this around a
 # load()->mutate->save() sequence guarantees last-writer-wins can't turn into
@@ -157,6 +204,7 @@ INTERVAL    = _i("DOCTOR_INTERVAL", 900)
 PORT        = _i("DOCTOR_PORT", 8088)                                 # webhook port (event mode)
 UI_PORT     = _i("DOCTOR_UI_PORT", 12345)                            # web dashboard port
 EN_UI       = _b("ENABLE_UI", False)
+EN_METRICS  = _b("ENABLE_METRICS", True)                             # expose Prometheus /metrics (token-gated if DOCTOR_UI_TOKEN set)
 UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional ?token= / X-Doctor-Token gate
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
@@ -677,6 +725,7 @@ def _probe_mount(mount, probe):
     th = threading.Thread(target=_chk, daemon=True); th.start(); th.join(MOUNT_GUARD_TIMEOUT)
     ok = result["ok"] if not th.is_alive() else False
     _mount_ok_cache[mount] = ok
+    metric_set("stackdoctor_mount_up", 1 if ok else 0, mount=mount)
     if ok:
         log.info("[mount-guard] %s up+responsive (probe %s)", mount, probe)
     else:
@@ -1066,6 +1115,7 @@ def check_queue(only=None):
                     log.warning("[queue:%s] force_import failed: %s", arr.name, str(e)[:90]); n = 0
                 if n:
                     actions += 1; new.pop(iid, None)
+                    metric_inc("stackdoctor_queue_actions_total", action="force_import", instance=arr.name)
                     log.info("[queue:%s] force-imported %d file(s) (%s): %s", arr.name, n, reason, title)
                     continue
                 if not (FORCE_IMPORT_ESCALATE and cnt >= FORCE_IMPORT_ESCALATE):
@@ -1082,6 +1132,7 @@ def check_queue(only=None):
                     try:
                         arr.remove(r["id"], blocklist=BLOCKLIST, skip_redownload=True)
                         actions += 1; new.pop(iid, None)
+                        metric_inc("stackdoctor_queue_actions_total", action="clear", instance=arr.name)
                         log.info("[queue:%s] cleared stuck item (blocklist=%s, no re-search): %s",
                                  arr.name, str(BLOCKLIST).lower(), title)
                     except Exception as e:
@@ -1092,6 +1143,7 @@ def check_queue(only=None):
             parked = _churn_record(state, arr, r, title)   # un-monitor first so the remove can't re-search
             try:
                 arr.remove(r["id"], blocklist=bl); actions += 1; new.pop(iid, None)
+                metric_inc("stackdoctor_queue_actions_total", action=action, instance=arr.name)
                 log.info("[queue:%s] removed (%s, action=%s, blocklist=%s)%s: %s",
                          arr.name, reason, action, str(bl).lower(),
                          " [parked, no re-search]" if parked else " -> re-search", title)
@@ -1103,6 +1155,9 @@ def check_queue(only=None):
         for h in arr.health():
             if h.get("type") in ("error", "warning"):
                 log.debug("[queue:%s] health %s: %s", arr.name, h.get("type"), (h.get("message") or "")[:90])
+    parked = sum(1 for off in state.get("__offenders__", {}).values()
+                 for o in off.values() if o.get("until", 0) != 0)
+    metric_set("stackdoctor_churn_offenders", parked)
     _save_state(state)
 
 # =========================================================================== #
@@ -1951,6 +2006,9 @@ def check_scrubber():
         except Exception:
             pass
     _scrub_save_state(state)
+    metric_inc("stackdoctor_scrubber_files_total", ok_n, result="ok")
+    metric_inc("stackdoctor_scrubber_files_total", suspect, result="suspect")
+    metric_inc("stackdoctor_scrubber_files_total", bad, result="bad")
     log.info("[scrubber] done: %d ok, %d suspect, %d bad (action)", ok_n, suspect, bad)
 
 # =========================================================================== #
@@ -2946,6 +3004,7 @@ def check_repair():
                 log.info("[repair:%s] WOULD re-grab NOW: %s", arr.name, title); searched += 1; continue
             if arr.command(body) is not None:
                 cd[str(tid)] = now; searched += 1
+                metric_inc("stackdoctor_repair_regrabs_total", instance=arr.name)
                 log.warning("[repair:%s] file went missing -> re-grabbing NOW: %s", arr.name, title)
     for d in cool.values():                     # prune stale cooldown entries
         for k, ts in list(d.items()):
@@ -3969,7 +4028,9 @@ def sweep(only=None):
                 try:
                     fn(only) if cid == "queue" else fn()
                 except Exception as e:
+                    metric_inc("stackdoctor_sweep_errors_total", check=cid)
                     log.error("[%s] check error: %s", cid, e)
+        metric_inc("stackdoctor_sweep_total")
     finally:
         _lock.release()
 
@@ -5782,6 +5843,12 @@ def _build_server(port):
             path = urlparse(self.path).path
             if path in ("/health", "/healthz"):
                 return self._send(200, "text/plain", "ok")
+            if path == "/metrics":
+                if not EN_METRICS:
+                    return self._send(404, "text/plain", "nf")
+                if not self._authed():
+                    return self._send(401, "text/plain", "unauthorized")
+                return self._send(200, "text/plain; version=0.0.4; charset=utf-8", _metrics_render())
             if not EN_UI:
                 return self._send(404, "text/plain", "nf")
             if not self._authed():
