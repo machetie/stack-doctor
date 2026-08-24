@@ -102,6 +102,24 @@ def _atomic_write_json(path, obj, indent=None):
             pass
         raise
 
+# Coarse, re-entrant lock serializing every shared-state read-modify-write.
+# In event mode each webhook spawns a sweep thread; holding this around a
+# load()->mutate->save() sequence guarantees last-writer-wins can't turn into
+# a lost update (P0-1 already prevents corruption; this prevents interleaving).
+_state_lock = threading.RLock()
+
+def _state_update(load_fn, mutate_fn, save_fn):
+    """Run load -> mutate -> save atomically under _state_lock.
+
+    `mutate_fn(state)` should mutate in place and may return a value, which is
+    returned to the caller. Serializes concurrent updaters so no increment or
+    record is lost when two sweeps race."""
+    with _state_lock:
+        state = load_fn()
+        result = mutate_fn(state)
+        save_fn(state)
+        return result
+
 # UI-saved overrides: merge a JSON overlay over the inherited env BEFORE config is read, so edits win.
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
 
@@ -3898,13 +3916,17 @@ def sweep(only=None):
     if not _lock.acquire(blocking=False):
         log.debug("sweep already running"); return
     try:
-        for cid, en, fn in CHECKS:
-            if not en:
-                continue
-            try:
-                fn(only) if cid == "queue" else fn()
-            except Exception as e:
-                log.error("[%s] check error: %s", cid, e)
+        # Hold the shared-state lock for the whole sweep body: even if a future
+        # change lets two sweep bodies overlap, per-check load->mutate->save
+        # sequences stay serialized (re-entrant, so _state_update is safe here).
+        with _state_lock:
+            for cid, en, fn in CHECKS:
+                if not en:
+                    continue
+                try:
+                    fn(only) if cid == "queue" else fn()
+                except Exception as e:
+                    log.error("[%s] check error: %s", cid, e)
     finally:
         _lock.release()
 

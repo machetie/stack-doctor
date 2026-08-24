@@ -8,6 +8,8 @@ import inspect
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -112,6 +114,65 @@ class SaveStateDurabilityIntegrationTest(unittest.TestCase):
                 with patch.object(doctor.json, "dump", side_effect=OSError("boom")):
                     doctor._save_state({"queue": []})
                 self.assertEqual(open(path, "rb").read(), original)
+
+
+class StateUpdateSerializationTest(unittest.TestCase):
+    """_state_update must serialize concurrent load->mutate->save so no update
+    is lost when many threads race (the event-mode webhook scenario)."""
+
+    def test_no_lost_updates_under_concurrency(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            doctor._atomic_write_json(path, {"count": 0})
+
+            def load():
+                return json.load(open(path))
+
+            def save(s):
+                doctor._atomic_write_json(path, s)
+
+            def mutate(s):
+                # widen the race window so an unlocked impl would lose updates
+                cur = s.get("count", 0)
+                time.sleep(0.001)
+                s["count"] = cur + 1
+
+            N = 25
+
+            def worker():
+                doctor._state_update(load, mutate, save)
+
+            threads = [threading.Thread(target=worker) for _ in range(N)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(json.load(open(path)), {"count": N})
+
+    def test_state_update_returns_mutate_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            doctor._atomic_write_json(path, {"n": 5})
+            out = doctor._state_update(
+                lambda: json.load(open(path)),
+                lambda s: s.get("n", 0) * 2,
+                lambda s: doctor._atomic_write_json(path, s),
+            )
+            self.assertEqual(out, 10)
+
+    def test_state_lock_is_reentrant(self):
+        # _state_update nested inside a held _state_lock must not deadlock
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            doctor._atomic_write_json(path, {"n": 0})
+            with doctor._state_lock:
+                doctor._state_update(
+                    lambda: json.load(open(path)),
+                    lambda s: s.__setitem__("n", 1),
+                    lambda s: doctor._atomic_write_json(path, s),
+                )
+            self.assertEqual(json.load(open(path)), {"n": 1})
 
 
 if __name__ == "__main__":
