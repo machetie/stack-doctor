@@ -131,5 +131,63 @@ class ScrubConfirmBeforeDeleteTest(unittest.TestCase):
         act.assert_called_once()
 
 
+class ScrubMissingBinaryTest(unittest.TestCase):
+    def test_scrub_run_missing_binary_returns_127_and_flags(self):
+        doctor._SCRUB_BINS_MISSING[0] = False
+        with patch.object(doctor.subprocess, "run", side_effect=FileNotFoundError("ffprobe")):
+            rc, err = doctor._scrub_run(["ffprobe", "x"], 10)
+        self.assertEqual(rc, 127)
+        self.assertTrue(doctor._SCRUB_BINS_MISSING[0])
+        self.assertIn("binary not found", err)
+
+    def test_missing_bins_disables_scrubber_without_walking(self):
+        with patch.object(doctor, "SCRUB_PATHS", ["/mnt/lib"]), \
+             patch.object(doctor, "_scrub_bins_ok", return_value=False), \
+             patch.object(doctor, "_scrub_walk") as walk, \
+             patch.object(doctor, "log") as lg:
+            doctor.check_scrubber()
+        walk.assert_not_called()
+
+    def test_mid_sweep_binary_missing_aborts_without_strike(self):
+        st = MagicMock()
+        st.st_mtime = 0.0
+        st.st_size = 12345
+        files = [("/mnt/zurg/real.mkv", "/mnt/lib/link.mkv")]
+
+        def t1(path):
+            doctor._SCRUB_BINS_MISSING[0] = True
+            return (False, "binary not found: ffprobe")
+
+        act = MagicMock(return_value=True)
+        with tempfile.TemporaryDirectory() as quar, \
+             patch.object(doctor, "SCRUB_PATHS", ["/mnt/lib"]), \
+             patch.object(doctor, "SCRUB_QUAR", quar), \
+             patch.object(doctor, "SCRUB_LOAD_MAX", 0), \
+             patch.object(doctor, "SCRUB_STRIKES", 1), \
+             patch.object(doctor, "SCRUB_MIN_AGE", 0), \
+             patch.object(doctor, "SCRUB_MAX_DELETES", 1), \
+             patch.object(doctor, "SCRUB_MAX_FILES", 10), \
+             patch.object(doctor, "SCRUB_CONFIRM_DEL", False), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "_scrub_bins_ok", return_value=True), \
+             patch.object(doctor, "_scrub_walk", return_value=iter(files)), \
+             patch.object(doctor, "_stat_with_timeout", return_value=st), \
+             patch.object(doctor, "_scrub_load_state", return_value={}), \
+             patch.object(doctor, "_scrub_save_state", return_value=None), \
+             patch.object(doctor, "_scrub_t1_header", side_effect=t1), \
+             patch.object(doctor, "_scrub_act_on_bad", act) as act_mock, \
+             patch.object(doctor, "_mount_ok_for", return_value=True):
+            doctor.check_scrubber()
+        act_mock.assert_not_called()
+
+    def test_bins_ok_true_when_both_present(self):
+        with patch.object(doctor.shutil, "which", return_value="/usr/bin/ffprobe"):
+            self.assertTrue(doctor._scrub_bins_ok())
+
+    def test_bins_ok_false_when_ffmpeg_missing(self):
+        with patch.object(doctor.shutil, "which", side_effect=lambda b: "/x" if b == doctor.SCRUB_FFPROBE else None):
+            self.assertFalse(doctor._scrub_bins_ok())
+
+
 if __name__ == "__main__":
     unittest.main()

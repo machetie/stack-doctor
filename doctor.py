@@ -1537,9 +1537,7 @@ def check_janitor():
         log.warning("[janitor] hit JANITOR_MAX_MOVES=%d -> stopping this sweep", JAN_MAX_MOVES)
     if manifest:
         try:
-            os.makedirs(qroot, exist_ok=True)
-            with open(qroot + "/manifest.json", "w") as _f:
-                json.dump(manifest, _f, indent=1)
+            _atomic_write_json(os.path.join(qroot, "manifest.json"), manifest, indent=1)
         except Exception:
             pass
     if moved:
@@ -1678,9 +1676,14 @@ def _orphans_debrids():
 
 def _orphans_used_set():
     """File-level used set: the folder-name path component of every library symlink
-    target under the debrid mount. Returns (set_of_folder_names, total_links)."""
+    target under the debrid mount. Returns (set_of_folder_names, total_links).
+
+    Uses the configurable ORPH_MOUNT prefix (not a hardcoded /mnt/zurg), and
+    normalizes relative symlink targets against the symlink's own directory so a
+    relative link can't silently look orphaned."""
     used = set()
     total = 0
+    mount = ORPH_MOUNT.rstrip("/")
     for d in ORPH_LINK_DIRS:
         try:
             for root, _, files in os.walk(d):
@@ -1693,10 +1696,16 @@ def _orphans_used_set():
                         target = os.readlink(fp)
                     except Exception:
                         continue
-                    p = target.split("/")
-                    # /mnt/zurg/<view>/<folder>/<file...>  ->  folder = p[4]
-                    if len(p) >= 5 and p[1] == "mnt" and p[2] == "zurg":
-                        used.add(p[4])
+                    if not target:
+                        continue
+                    if not target.startswith("/"):
+                        # relative link -> resolve against the symlink's own dir
+                        target = os.path.normpath(os.path.join(os.path.dirname(fp), target))
+                    if target.startswith(mount + "/"):
+                        # mount/<view>/<folder>/<file...> -> folder is the component after the view
+                        parts = target[len(mount) + 1:].split("/")
+                        if len(parts) >= 2:
+                            used.add(parts[1])
         except Exception as e:
             log.warning("[orphans] walk %s failed: %s", d, str(e)[:80])
     return used, total
@@ -2031,6 +2040,8 @@ def _scrub_arr_index():
     _SCRUB_ARR_INDEX_CACHE["data"]  = idx
     return idx
 
+_SCRUB_BINS_MISSING = [False]
+
 def _scrub_run(cmd, timeout):
     """Run cmd with a hard timeout. Returns (rc, stderr_text). Empty stderr = clean."""
     try:
@@ -2040,7 +2051,16 @@ def _scrub_run(cmd, timeout):
     except subprocess.TimeoutExpired:
         return 124, "TIMEOUT after %ds" % timeout
     except FileNotFoundError as e:
+        # binary absent: NOT corruption. Mark it so the sweep can abort without
+        # recording a strike (otherwise a repo image without ffmpeg would strike
+        # every file every sweep and quarantine good files).
+        _SCRUB_BINS_MISSING[0] = True
         return 127, "binary not found: %s" % e
+
+def _scrub_bins_ok():
+    """True when both ffprobe and ffmpeg are on PATH. Cached per sweep via the
+    module flag so a missing binary disables the scrubber instead of striking files."""
+    return bool(shutil.which(SCRUB_FFPROBE)) and bool(shutil.which(SCRUB_FFMPEG))
 
 # ffprobe/ffmpeg stderr lines that are non-fatal on a decypharr FUSE mount and must
 # NOT cost a re-grab. These are cosmetic decoder/container warnings that occur on
@@ -2207,6 +2227,12 @@ def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
 def check_scrubber():
     if not SCRUB_PATHS:
         log.debug("[scrubber] no SCRUBBER_PATHS (or JANITOR_LIBRARY_PATHS) configured"); return
+    _SCRUB_BINS_MISSING[0] = False
+    if not _scrub_bins_ok():
+        log.error("[scrubber] ffprobe/ffmpeg not found on PATH (SCRUBBER_FFPROBE=%s SCRUBBER_FFMPEG=%s) "
+                  "-> scrubber disabled this run; install ffmpeg or set the paths",
+                  SCRUB_FFPROBE, SCRUB_FFMPEG)
+        return
     _reset_mount_cache()
     # plex-safe gate
     load1 = host_load()
@@ -2271,6 +2297,10 @@ def check_scrubber():
         # ----- tier 1: ffprobe header -----
         ok, why = _scrub_t1_header(real_path)
         cur_tier = 1
+        if _SCRUB_BINS_MISSING[0]:
+            # binary vanished mid-sweep -> abort without striking this file
+            log.error("[scrubber] ffprobe/ffmpeg missing mid-sweep -> aborting scan (no strikes)")
+            break
         # ----- tier 2: ffmpeg skim at N seek points (FUSE-safe; blocks on cold chunks) -----
         if ok and SCRUB_TIER >= 2:
             ok, why = _scrub_t2_skim(real_path); cur_tier = 2

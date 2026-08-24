@@ -13,10 +13,12 @@ COPY doctor.py /app/doctor.py
 
 # No Python dependencies (standard library only). openssh-client lets a restart
 # hook reach a *host* service (e.g. DECYPHARR_RESTART_CMD="ssh root@host systemctl restart decypharr").
+# ffmpeg/ffprobe are required by the scrubber (ENABLE_SCRUBBER) - baked in so a
+# repo-built image never "strikes every file" because the binary is absent.
 # Runs as root so a bind-mounted /data (and an optional rw /mnt/library for the
 # janitor) is always writable regardless of host ownership.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-client \
+    && apt-get install -y --no-install-recommends openssh-client ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data
 VOLUME /data
