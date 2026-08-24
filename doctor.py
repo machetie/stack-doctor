@@ -609,14 +609,45 @@ def http_code(url, headers=None, t=10):
     except Exception:
         return 0
 
+_MASK_RE = re.compile(
+    r"(?i)([a-z0-9_-]*(?:apikey|api[_-]?key|token|password|passwd|secret)[a-z0-9_-]*"
+    r"\s*[=:]\s*|--(?:apikey|api-key|token|password|secret)[= ])(\S+)")
+
+def _mask_cmd(cmd):
+    """Redact secret-looking values in a shell command string for safe logging."""
+    if not cmd:
+        return cmd
+    return _MASK_RE.sub(lambda m: m.group(1) + "***", str(cmd))
+
 def run_cmd(cmd):
     if not cmd:
         return None
+    log.debug("[cmd] run: %s", _mask_cmd(cmd))
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
         return (p.returncode, (p.stdout + p.stderr).strip()[:300])
     except Exception as e:
         return (1, "cmd error: " + str(e)[:120])
+
+def _validate_shell_commands():
+    """Log a clear warning for any configured shell command that is obviously
+    malformed (unbalanced quotes), so a typo surfaces at startup rather than
+    failing opaquely as root mid-sweep. Empty is fine (feature just off)."""
+    named = [
+        ("DECYPHARR_RESTART_CMD", DECY_RESTART_CMD),
+        ("ALTMOUNT_RESTART_CMD", ALT_RESTART_CMD),
+        ("ALTMOUNT_PROP_FIX_CMD", ALT_PROP_FIX_CMD),
+        ("JANITOR_LOG_CMD", JAN_LOG_CMD),
+        ("METACLEAN_FAILED_CMD", META_FAILED_CMD),
+        ("METACLEAN_STORM_CMD", META_STORM_CMD),
+        ("WARMER_PLEXLOG_CMD", WARM_PLEXLOG_CMD),
+    ]
+    for name, cmd in named:
+        if not cmd:
+            continue
+        if cmd.count('"') % 2 or cmd.count("'") % 2:
+            log.warning("[config] %s has unbalanced quotes -> may fail at runtime: %s",
+                        name, _mask_cmd(cmd))
 
 def _safe_rmtree(path):
     """Remove a directory only if it looks like an absolute temp/staging path.
@@ -640,6 +671,9 @@ def _safe_rmtree(path):
         return False, str(e)[:120]
 
 def run_output(cmd, t=120):
+    if not cmd:
+        return ""
+    log.debug("[cmd] run: %s", _mask_cmd(cmd))
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t)
         return p.stdout
@@ -4021,16 +4055,26 @@ def sweep(only=None):
         # Hold the shared-state lock for the whole sweep body: even if a future
         # change lets two sweep bodies overlap, per-check load->mutate->save
         # sequences stay serialized (re-entrant, so _state_update is safe here).
+        t0 = time.time()
+        ran = 0
+        errs = []
         with _state_lock:
             for cid, en, fn in CHECKS:
                 if not en:
                     continue
+                ran += 1
                 try:
                     fn(only) if cid == "queue" else fn()
                 except Exception as e:
+                    errs.append(cid)
                     metric_inc("stackdoctor_sweep_errors_total", check=cid)
                     log.error("[%s] check error: %s", cid, e)
         metric_inc("stackdoctor_sweep_total")
+        dur = time.time() - t0
+        log.info("sweep done: checks=%d errors=%d%s dur=%.1fs%s",
+                 ran, len(errs),
+                 " [" + ",".join(errs) + "]" if errs else "",
+                 dur, " scope=%s" % only if only else "")
     finally:
         _lock.release()
 
@@ -5941,6 +5985,7 @@ def main():
              ", ".join([a.name for a in INSTANCES] + extra) or "-", DRY_RUN)
     log.info("safety posture: dry_run=%s scrubber_delete_arr=%s scrubber_min_age=%dh max_actions=%d mount_guards=%d",
              DRY_RUN, SCRUB_DEL_ARR, SCRUB_MIN_AGE, MAX_ACTIONS, len(MOUNT_GUARDS))
+    _validate_shell_commands()
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
