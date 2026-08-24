@@ -163,6 +163,8 @@ LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
 HTTP_RETRIES = _i("DOCTOR_HTTP_RETRIES", 3)             # total attempts for idempotent arr reads/test calls
 HTTP_RETRY_BASE = _f("DOCTOR_HTTP_RETRY_BASE", 0.5)     # first backoff delay (s); doubles each retry, +jitter
+QUEUE_PAGE_SIZE = _i("DOCTOR_QUEUE_PAGE_SIZE", 1000)    # records per queue page
+QUEUE_MAX_FETCH = _i("DOCTOR_QUEUE_MAX_FETCH", 5000)    # hard cap on total queue records fetched per instance/sweep
 DRY_RUN     = _b("DOCTOR_DRY_RUN", True)
 
 # which checks are on
@@ -790,7 +792,24 @@ class Arr:
         if self.kind == "prowlarr":
             return []                                            # prowlarr has no download queue
         try:
-            return json.load(self._req_retry("GET", "/queue?page=1&pageSize=1000&" + self.unknown)).get("records", [])
+            records, page = [], 1
+            while True:
+                data = json.load(self._req_retry(
+                    "GET", "/queue?page=%d&pageSize=%d&%s" % (page, QUEUE_PAGE_SIZE, self.unknown)))
+                recs = data.get("records", []) or []
+                records.extend(recs)
+                total = data.get("totalRecords")
+                # stop when: this page was short (last page), we've reached the
+                # reported total, or we've hit the hard fetch cap.
+                if (len(recs) < QUEUE_PAGE_SIZE
+                        or (total is not None and len(records) >= total)
+                        or len(records) >= QUEUE_MAX_FETCH):
+                    if len(records) >= QUEUE_MAX_FETCH and (total or 0) > len(records):
+                        log.warning("[%s] queue fetch capped at %d of %s records (DOCTOR_QUEUE_MAX_FETCH)",
+                                    self.name, len(records), total)
+                    break
+                page += 1
+            return records
         except Exception as e:
             log.warning("[%s] queue fetch failed: %s", self.name, e); return None
 
