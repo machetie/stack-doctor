@@ -80,9 +80,30 @@ class UsedSetTest(unittest.TestCase):
     def test_non_zurg_targets_ignored(self):
         with tempfile.TemporaryDirectory() as d:
             os.symlink("/mnt/altmount/sonarr/X/f.mkv", os.path.join(d, "l1"))
-            with patch.object(doctor, "ORPH_LINK_DIRS", [d]):
+            with patch.object(doctor, "ORPH_LINK_DIRS", [d]), \
+                 patch.object(doctor, "ORPH_MOUNT", "/mnt/zurg"):
                 used, total = doctor._orphans_used_set()
         self.assertEqual(used, set())
+        self.assertEqual(total, 1)
+
+    def test_configurable_mount_prefix(self):
+        # a symlink under a non-default ORPH_MOUNT must still be counted as used
+        with tempfile.TemporaryDirectory() as d:
+            os.symlink("/custom/mount/__all__/Folder/f.mkv", os.path.join(d, "l1"))
+            with patch.object(doctor, "ORPH_LINK_DIRS", [d]), \
+                 patch.object(doctor, "ORPH_MOUNT", "/custom/mount"):
+                used, total = doctor._orphans_used_set()
+        self.assertIn("Folder", used)
+
+    def test_relative_target_is_normalized_and_matched(self):
+        # ORPH_MOUNT is the tempdir; a relative symlink target resolves into it
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            os.symlink("../__all__/Folder/f.mkv", os.path.join(d, "sub", "rel.mkv"))
+            with patch.object(doctor, "ORPH_LINK_DIRS", [os.path.join(d, "sub")]), \
+                 patch.object(doctor, "ORPH_MOUNT", d):
+                used, total = doctor._orphans_used_set()
+        self.assertIn("Folder", used)
         self.assertEqual(total, 1)
 
 
