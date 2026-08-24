@@ -102,6 +102,14 @@ class StateWritersUseAtomicHelperTest(unittest.TestCase):
                 )
 
 
+class SaveStateErrorLoggingTest(unittest.TestCase):
+    def test_save_state_logs_on_failure(self):
+        with patch.object(doctor, "_atomic_write_json", side_effect=OSError("disk full")), \
+             patch.object(doctor.log, "error") as err:
+            doctor._save_state({"x": 1})
+        err.assert_called_once()
+
+
 class SaveStateDurabilityIntegrationTest(unittest.TestCase):
     def test_save_state_survives_crash(self):
         with tempfile.TemporaryDirectory() as d:

@@ -30,6 +30,7 @@ import logging.handlers
 import os
 import random
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -450,6 +451,7 @@ SCRUB_FFMPEG       = os.environ.get("SCRUBBER_FFMPEG", "ffmpeg")
 SCRUB_HEADER_TO    = _i("SCRUBBER_HEADER_TIMEOUT", 30)
 SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 180)    # per skim point timeout (tier 2)
 SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 3)
+SCRUB_CONFIRM_TO   = _i("SCRUBBER_CONFIRM_TIMEOUT", 20)   # short timeout for the 5s confirm-decode gate
 SCRUB_QUAR         = os.environ.get("SCRUBBER_QUARANTINE_DIR", os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine"))
 SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", False)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
 SCRUB_STRICT_STDERR = _b("SCRUBBER_STRICT_STDERR", False)  # if true, rc=0 with non-benign stderr is BAD; false trusts rc (default)
@@ -815,14 +817,19 @@ def _probe_mount(mount, probe):
         ok, ts = _mount_ok_cache[mount]
         if now - ts < MOUNT_GUARD_TTL:
             return ok
-    result = {"ok": False}
+    result = {"ok": False, "why": "probe timed out"}
     def _chk():
         try:
             if not os.path.ismount(mount):
-                result["ok"] = False; return
-            result["ok"] = bool(os.listdir(probe))
-        except Exception:
-            result["ok"] = False
+                result["why"] = "not a mountpoint"; return
+            try:
+                result["ok"] = bool(os.listdir(probe))
+                if not result["ok"]:
+                    result["why"] = "probe dir empty"
+            except Exception as e:
+                result["why"] = "listdir error: %s" % str(e)[:60]
+        except Exception as e:
+            result["why"] = "ismount error: %s" % str(e)[:60]
     th = threading.Thread(target=_chk, daemon=True); th.start(); th.join(MOUNT_GUARD_TIMEOUT)
     ok = result["ok"] if not th.is_alive() else False
     _mount_ok_cache[mount] = (ok, now)
@@ -830,7 +837,7 @@ def _probe_mount(mount, probe):
     if ok:
         log.info("[mount-guard] %s up+responsive (probe %s)", mount, probe)
     else:
-        log.warning("[mount-guard] %s DOWN/empty -> deletions under it will be SKIPPED", mount)
+        log.warning("[mount-guard] %s DOWN/empty (%s) -> deletions under it will be SKIPPED", mount, result["why"])
     return ok
 
 def _reset_mount_cache():
@@ -1131,8 +1138,8 @@ def _load_state():
 def _save_state(s):
     try:
         _atomic_write_json(STATE_FILE, s)
-    except Exception:
-        pass
+    except Exception as e:
+        log.error("state save failed (%s): %s", STATE_FILE, e)
 
 def _offenders(state):
     return state.setdefault("__offenders__", {})
@@ -2218,7 +2225,7 @@ def _scrub_confirm_decode(path):
     cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner",
            "-ss", "0", "-t", "5",
            "-i", path, "-map", "0:v:0", "-f", "null", "-"]
-    rc, err = _scrub_run(cmd, SCRUB_SKIM_TO)
+    rc, err = _scrub_run(cmd, SCRUB_CONFIRM_TO)
     if rc != 0:
         return False, "confirm decode rc=%d %s" % (rc, (err or "").strip()[:200])
     if SCRUB_STRICT_STDERR and err.strip() and not _scrub_benign_only(err):
@@ -3376,6 +3383,13 @@ def check_repair():
     arrs = [a for a in INSTANCES if a.kind in ("sonarr", "radarr")]
     if not arrs:
         return
+    # mount-health gate: a flapping mount makes the arrs mark files "missing" in their DB,
+    # which would trigger spurious re-grabs. Skip repair while any guarded mount is down.
+    if MOUNT_GUARDS:
+        _reset_mount_cache()
+        if any(_probe_mount(m, p) is False for m, p in MOUNT_GUARDS.items()):
+            log.warning("[repair] mount(s) down -> skipping (avoid re-grab on a flapping mount)")
+            return
     if REPAIR_LOAD_MAX > 0 and host_load() > REPAIR_LOAD_MAX:
         log.info("[repair] host load > %d -> skipping", REPAIR_LOAD_MAX); return
     state = _repair_load_state()
@@ -4244,7 +4258,7 @@ def _warm_opened(plex, rk):
 
 def plexlog_loop(stop):
     """Tail Plex's server log; warm the exact title a viewer opens (true pre-play intent)."""
-    cmd = WARM_PLEXLOG_CMD or ("tail -n0 -F %r" % WARM_PLEXLOG_FILE if WARM_PLEXLOG_FILE else "")
+    cmd = WARM_PLEXLOG_CMD or ("tail -n0 -F %s" % shlex.quote(WARM_PLEXLOG_FILE) if WARM_PLEXLOG_FILE else "")
     if not cmd:
         return
     plex = Plex(PLEX_URL, PLEX_TOKEN)

@@ -498,5 +498,32 @@ class MountCacheTTLTest(unittest.TestCase):
             self.assertFalse(doctor._probe_mount("/mnt/zurg", "/mnt/zurg/__all__"))
 
 
+class RepairMountGateTest(unittest.TestCase):
+    def test_repair_skips_when_mount_down(self):
+        arr = MagicMock()
+        arr.kind = "sonarr"
+        arr.name = "sonarr"
+        arr.get_json.return_value = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "MOUNT_GUARDS", {"/mnt/zurg": "/mnt/zurg/__all__"}), \
+             patch.object(doctor, "_probe_mount", return_value=False):
+            doctor.check_repair()
+        arr.get_json.assert_not_called()
+
+    def test_repair_runs_when_mount_up(self):
+        arr = MagicMock()
+        arr.kind = "sonarr"
+        arr.name = "sonarr"
+        arr.get_json.return_value = {}
+        with patch.object(doctor, "INSTANCES", [arr]), \
+             patch.object(doctor, "MOUNT_GUARDS", {"/mnt/zurg": "/mnt/zurg/__all__"}), \
+             patch.object(doctor, "_probe_mount", return_value=True), \
+             patch.object(doctor, "REPAIR_LOAD_MAX", 0), \
+             patch.object(doctor, "_repair_load_state", return_value={}), \
+             patch.object(doctor, "_repair_save_state"):
+            doctor.check_repair()
+        arr.get_json.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()
