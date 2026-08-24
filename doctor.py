@@ -356,6 +356,8 @@ SCRUB_SKIM_TO      = _i("SCRUBBER_SKIM_TIMEOUT", 180)    # per skim point timeou
 SCRUB_FULL_TO      = _i("SCRUBBER_FULL_TIMEOUT", 1800)   # full-decode timeout (tier 3)
 SCRUB_QUAR         = os.environ.get("SCRUBBER_QUARANTINE_DIR", os.environ.get("JANITOR_QUARANTINE_DIR", "/data/quarantine"))
 SCRUB_DEL_ARR      = _b("SCRUBBER_DELETE_ARR_FILE", False)  # DELETE arr movieFile/episodeFile so it re-searches; false = quarantine only
+SCRUB_STRICT_STDERR = _b("SCRUBBER_STRICT_STDERR", False)  # if true, rc=0 with non-benign stderr is BAD; false trusts rc (default)
+SCRUB_CONFIRM_DEL  = _b("SCRUBBER_CONFIRM_BEFORE_DELETE", True)  # quick decode confirm before acting on a tier-1 BAD
 SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
 SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 6)     # skip files newer than this (don't fight the warmer / fresh imports)
 SCRUB_REVERIFY_DAYS = _i("SCRUBBER_REVERIFY_DAYS", 30)   # re-check previously-OK files after N days (0=never)
@@ -1587,13 +1589,31 @@ def _scrub_run(cmd, timeout):
         return 127, "binary not found: %s" % e
 
 # ffprobe/ffmpeg stderr lines that are non-fatal on a decypharr FUSE mount and must
-# NOT cost a re-grab. "File ended prematurely" fires at EOF when a container declares a
-# hair more data than the file actually holds (common in remuxes) or when the mount
-# stops serving at the tail; the tool still exits rc=0 and the file plays in Plex.
-_SCRUB_BENIGN_STDERR = ("File ended prematurely",)
+# NOT cost a re-grab. These are cosmetic decoder/container warnings that occur on
+# otherwise fully-playable files. The list is intentionally conservative: each entry
+# has been verified to appear on rc=0 files that decode and play correctly.
+# "File ended prematurely" fires at EOF when a container declares a hair more data
+# than the file actually holds (common in remuxes) or when the mount stops serving at
+# the tail; the tool still exits rc=0 and the file plays in Plex.
+_SCRUB_BENIGN_STDERR = (
+    "File ended prematurely",
+    "Referenced QT chapter track not found",   # MP4/MOV chapter atom quirk; file plays fine
+    "Estimating duration from bitrate",         # missing/loose duration metadata
+    "co located POCs unavailable",              # H.264 reordering warning, decodes fine
+    "sps_id",                                   # "sps_id N out of range" cosmetic SPS refs
+    "pps_id",
+    "non-existing PPS",
+    "non-existing SPS",
+    "Reinit context",                           # resolution/params re-init, benign
+    "Increasing reorder buffer",
+    "mmco: unref short failure",                # H.264 reference-management warning
+    "number of reference frames",
+    "negative cts, pts",                        # timestamp cosmetic
+    "Could not find codec parameters for stream",  # cosmetic when rc=0 and video stream is present
+)
 
 def _scrub_benign_only(err):
-    """True when every non-empty stderr line is one of the known-benign warnings above."""
+    """True when every non-empty stderr line contains at least one known-benign marker."""
     lines = [ln for ln in (err or "").splitlines() if ln.strip()]
     if not lines:
         return True
@@ -1602,16 +1622,16 @@ def _scrub_benign_only(err):
 def _scrub_t1_header(path):
     """Tier 1: ffprobe parses the container header. Returns (ok, detail).
     A torn/unparseable container makes ffprobe exit non-zero, so rc is the reliable
-    signal. rc=0 means the header parsed; a lone benign EOF-tail warning is ignored
-    (see _SCRUB_BENIGN_STDERR) so cold-cache reads and remux tails don't false-positive
-    into a delete + re-grab."""
+    signal. rc=0 means the header parsed. Cosmetic stderr warnings are ignored unless
+    SCRUBBER_STRICT_STDERR is explicitly enabled; this prevents benign decoder chatter
+    on decypharr/rclone FUSE mounts from false-positiving into a delete + re-grab."""
     cmd = [SCRUB_FFPROBE, "-v", "error", "-hide_banner",
            "-show_entries", "format=duration,bit_rate",
            "-of", "default=nw=1", path]
     rc, err = _scrub_run(cmd, SCRUB_HEADER_TO)
     if rc != 0:
         return False, ("ffprobe rc=%d %s" % (rc, err.strip()[:200])) or "header_fail"
-    if err.strip() and not _scrub_benign_only(err):
+    if SCRUB_STRICT_STDERR and err.strip() and not _scrub_benign_only(err):
         return False, "ffprobe rc=0 %s" % err.strip()[:200]
     return True, ""
 
@@ -1653,8 +1673,22 @@ def _scrub_t3_full(path):
     rc, err = _scrub_run(cmd, SCRUB_FULL_TO)
     if rc != 0:
         return False, "ffmpeg full rc=%d %s" % (rc, (err or "").strip()[:300])
-    if err.strip() and not _scrub_benign_only(err):
+    if SCRUB_STRICT_STDERR and err.strip() and not _scrub_benign_only(err):
         return False, "ffmpeg full rc=0 %s" % (err or "").strip()[:300]
+    return True, ""
+
+def _scrub_confirm_decode(path):
+    """Quick 5-second decode from the start of a file. Used as a safety gate before a
+    tier-1 BAD causes an arr-file delete: if the file really decodes, the header warning
+    was cosmetic and we must not re-grab."""
+    cmd = [SCRUB_FFMPEG, "-v", "error", "-hide_banner",
+           "-ss", "0", "-t", "5",
+           "-i", path, "-map", "0:v:0", "-f", "null", "-"]
+    rc, err = _scrub_run(cmd, SCRUB_SKIM_TO)
+    if rc != 0:
+        return False, "confirm decode rc=%d %s" % (rc, (err or "").strip()[:200])
+    if SCRUB_STRICT_STDERR and err.strip() and not _scrub_benign_only(err):
+        return False, "confirm decode rc=0 %s" % (err or "").strip()[:200]
     return True, ""
 
 def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
@@ -1795,6 +1829,15 @@ def check_scrubber():
                 ok, why = True, "tier2 hiccup cleared by full decode"
             elif ok and not ok3:
                 ok, why = False, "tier3 full: %s" % why3
+        # ----- confirm-before-delete: a tier-1 header warning must not delete an arr file -----
+        # on its own. A quick decode proves the file is playable; downgrade to OK and skip action.
+        if not ok and cur_tier == 1 and SCRUB_CONFIRM_DEL:
+            ok_c, why_c = _scrub_confirm_decode(real_path)
+            if ok_c:
+                ok, why = True, "tier1 header warning not confirmed by decode"
+                log.warning("[scrubber] tier-1 BAD not confirmed by decode, skipping: %s", real_path)
+            else:
+                why = "tier1 header warning confirmed by decode: %s" % why_c
         # ----- record result -----
         size = st.st_size; mtime = int(st.st_mtime)
         prev_strikes = rec.get("strikes", 0)
@@ -3893,6 +3936,7 @@ UI_SCHEMA = [
               ("SCRUBBER_MAX_FILES", "50"), ("SCRUBBER_CONCURRENCY", "1"),
               ("SCRUBBER_LOAD_MAX", "12"), ("SCRUBBER_STRIKES", "2"),
                ("SCRUBBER_REVERIFY_DAYS", "30"), ("SCRUBBER_DELETE_ARR_FILE", "false"),
+               ("SCRUBBER_STRICT_STDERR", "false"), ("SCRUBBER_CONFIRM_BEFORE_DELETE", "true"),
                ("SCRUBBER_MIN_AGE_HOURS", "6"),
                ("MOUNT_HEALTH_GUARDS", "/mnt/zurg=/mnt/zurg/__all__,/mnt/altmount=/mnt/altmount"),
                ("MOUNT_HEALTH_TIMEOUT", "8")]),
@@ -4707,6 +4751,7 @@ _UI_MULTI = {
 _UI_BOOL = set([
     "DOCTOR_DRY_RUN", "WATCHLISTS_INCLUDE_HOME", "HOLIDAYS_PIN_HOME",
     "SCRUBBER_FULL_DECODE_ON_BAD", "SCRUBBER_DELETE_ARR_FILE",
+    "SCRUBBER_STRICT_STDERR", "SCRUBBER_CONFIRM_BEFORE_DELETE",
     "DOCTOR_BLOCKLIST", "WARMER_ONDECK",
 ])
 

@@ -444,6 +444,14 @@ or trivially fetchable) so it's the only check that cannot be tricked by cold-ca
 behavior. Tiers 2 and 3 stay available for libraries on local disk, or as opt-in slow scans
 where you accept some false-positive risk in return for catching mid-file rot.
 
+**Tier 1 trusts `ffprobe`'s exit code by default**. A torn or unparseable container forces
+`ffprobe` to exit non-zero, and that is treated as BAD. Cosmetic stderr warnings on an
+`rc=0` file (e.g. `Referenced QT chapter track not found`, H.264 decoder chatter) are ignored
+by default because they do not affect playback. Set `SCRUBBER_STRICT_STDERR=true` to treat
+any non-benign `rc=0` stderr as BAD instead. Before a tier-1 BAD ever triggers an arr-file
+delete, a 5-second decode confirm runs (`SCRUBBER_CONFIRM_BEFORE_DELETE`, default `true`);
+if the file decodes, the warning is downgraded to OK and nothing is deleted.
+
 The complementary reactive piece on this stack is the [**janitor** check](#checks-toggle-each-with-enable_)
 which tails decypharr's log for `ARTICLE_NOT_FOUND` / "still missing" errors and quarantines
 the affected library symlinks once Plex (or anything else) has actually attempted the read.
@@ -468,6 +476,8 @@ State (`SCRUBBER_STATE_FILE`) caches `(path, size, mtime) -> result`, so the sca
 | `SCRUBBER_PATHS` | (falls back to `JANITOR_LIBRARY_PATHS`) | comma list of library roots to walk |
 | `SCRUBBER_TIER` | `1` | maximum tier to apply (1 = header only, 2 = +ffmpeg skim, 3 = +full decode). Default tier 1 is the only one safe on a decypharr / rclone / zurg FUSE mount — see Scrubber section above. |
 | `SCRUBBER_FULL_DECODE_ON_BAD` | `false` | final-confirm a tier-2 BAD with a full ffmpeg decode before action (slow; off by default) |
+| `SCRUBBER_STRICT_STDERR` | `false` | when `true`, treat `ffprobe`/`ffmpeg` `rc=0` with non-benign stderr as BAD. Default `false` trusts the exit code and ignores cosmetic decoder/container warnings. |
+| `SCRUBBER_CONFIRM_BEFORE_DELETE` | `true` | run a quick 5-second decode confirm before acting on a tier-1 BAD. If the file decodes, downgrade to OK and skip the delete. |
 | `SCRUBBER_SKIM_POINTS` | `4` | tier 2: seek points across the duration |
 | `SCRUBBER_SKIM_SECS` | `5` | tier 2: seconds decoded at each point |
 | `SCRUBBER_MAX_FILES` | `50` | files scanned per sweep (rate limit) |
