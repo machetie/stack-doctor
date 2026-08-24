@@ -28,6 +28,7 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import shutil
 import signal
@@ -160,6 +161,8 @@ UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
+HTTP_RETRIES = _i("DOCTOR_HTTP_RETRIES", 3)             # total attempts for idempotent arr reads/test calls
+HTTP_RETRY_BASE = _f("DOCTOR_HTTP_RETRY_BASE", 0.5)     # first backoff delay (s); doubles each retry, +jitter
 DRY_RUN     = _b("DOCTOR_DRY_RUN", True)
 
 # which checks are on
@@ -765,17 +768,35 @@ class Arr:
                                      headers={"X-Api-Key": self.apikey, "Content-Type": "application/json"})
         return urllib.request.urlopen(req, timeout=t or TIMEOUT)
 
+    def _req_retry(self, method, path, data=None, t=None, tries=None, retry=None):
+        """_req with bounded exponential backoff + jitter for transient failures.
+
+        Only retries idempotent requests: GETs always, plus explicitly opted-in
+        test POSTs (retry=True). Never retries DELETE /queue or ManualImport
+        (non-idempotent) -- a retry there could double-delete or double-grab."""
+        tries = HTTP_RETRIES if tries is None else tries
+        do_retry = (method == "GET") if retry is None else retry
+        delay = HTTP_RETRY_BASE
+        for i in range(max(1, tries)):
+            try:
+                return self._req(method, path, data=data, t=t)
+            except Exception:
+                if not do_retry or i == tries - 1:
+                    raise
+                time.sleep(delay + random.uniform(0, delay / 2))
+                delay *= 2
+
     def queue(self):
         if self.kind == "prowlarr":
             return []                                            # prowlarr has no download queue
         try:
-            return json.load(self._req("GET", "/queue?page=1&pageSize=1000&" + self.unknown)).get("records", [])
+            return json.load(self._req_retry("GET", "/queue?page=1&pageSize=1000&" + self.unknown)).get("records", [])
         except Exception as e:
             log.warning("[%s] queue fetch failed: %s", self.name, e); return None
 
     def health(self):
         try:
-            return json.load(self._req("GET", "/health"))
+            return json.load(self._req_retry("GET", "/health"))
         except Exception:
             return []
 
@@ -786,9 +807,12 @@ class Arr:
         self._req("DELETE", "/queue/%d?%s" % (item_id, q))
 
     def post(self, path, t=150):
-        """POST with empty body (used for /indexer/testall, /downloadclient/testall). Returns parsed JSON or []."""
+        """POST with empty body (used for /indexer/testall, /downloadclient/testall). Returns parsed JSON or [].
+
+        These test calls are idempotent (they just re-probe indexers/clients), so
+        opt into retry to ride out an arr that's briefly slow under search load."""
         try:
-            body = self._req("POST", path, data=b"", t=t).read()
+            body = self._req_retry("POST", path, data=b"", t=t, retry=True).read()
             return json.loads(body) if body else []
         except urllib.error.HTTPError as e:
             try: return json.loads(e.read())
@@ -798,7 +822,7 @@ class Arr:
 
     def get_json(self, path, t=None):
         try:
-            return json.load(self._req("GET", path, t=t))
+            return json.load(self._req_retry("GET", path, t=t))
         except Exception as e:
             log.debug("[%s] GET %s err %s", self.name, path, str(e)[:60]); return None
 
