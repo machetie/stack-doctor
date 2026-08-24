@@ -472,6 +472,7 @@ for _mg in os.environ.get("MOUNT_HEALTH_GUARDS", "").split(","):
         if _m and _p:
             MOUNT_GUARDS[_m] = _p
 MOUNT_GUARD_TIMEOUT = _i("MOUNT_HEALTH_TIMEOUT", 8)      # per-mount probe timeout (seconds)
+MOUNT_GUARD_TTL     = _i("MOUNT_HEALTH_TTL", 60)         # cache a mount verdict for at most this many seconds
 
 # metaclean (orphaned altmount metadata -> yEnc CRC-retry storms). Ported from
 # altmount-maintenance.sh sweep 1: an altmount metadata dir is orphaned when its release NZB is
@@ -746,9 +747,10 @@ def host_load():
     except Exception:
         return 0.0
 
-# mount-health gate helpers. Cache probe results per sweep so we don't hammer a mount.
+# mount-health gate helpers. Cache probe results per sweep (with a short TTL so a
+# long scrubber sweep re-probes instead of trusting a stale "healthy" verdict).
 
-_mount_ok_cache = {}
+_mount_ok_cache = {}   # mount -> (ok, timestamp)
 
 def _realpath_with_timeout(path, timeout=8, return_timeout=False):
     """Resolve a symlink without blocking forever on a hung FUSE mount.
@@ -803,9 +805,14 @@ def _mount_ok_for(path):
     return None
 
 def _probe_mount(mount, probe):
-    """mountpoint + responsive (probe dir lists non-empty within timeout)."""
+    """mountpoint + responsive (probe dir lists non-empty within timeout).
+    Cached with a short TTL so a mount that dies mid-sweep is caught before any
+    delete (a long scrubber sweep could otherwise trust a stale 'healthy')."""
+    now = time.time()
     if mount in _mount_ok_cache:
-        return _mount_ok_cache[mount]
+        ok, ts = _mount_ok_cache[mount]
+        if now - ts < MOUNT_GUARD_TTL:
+            return ok
     result = {"ok": False}
     def _chk():
         try:
@@ -816,7 +823,7 @@ def _probe_mount(mount, probe):
             result["ok"] = False
     th = threading.Thread(target=_chk, daemon=True); th.start(); th.join(MOUNT_GUARD_TIMEOUT)
     ok = result["ok"] if not th.is_alive() else False
-    _mount_ok_cache[mount] = ok
+    _mount_ok_cache[mount] = (ok, now)
     metric_set("stackdoctor_mount_up", 1 if ok else 0, mount=mount)
     if ok:
         log.info("[mount-guard] %s up+responsive (probe %s)", mount, probe)

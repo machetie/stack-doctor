@@ -471,5 +471,32 @@ class MissingFromDiskRetryTest(unittest.TestCase):
                          "item must be dropped after MISSING_DISK_MAX_RETRIES failed retries")
 
 
+class MountCacheTTLTest(unittest.TestCase):
+    def _probe(self, ok):
+        with patch.object(doctor.os.path, "ismount", return_value=True), \
+             patch.object(doctor.os, "listdir", return_value=["x"] if ok else []), \
+             patch.object(doctor, "metric_set"):
+            return doctor._probe_mount("/mnt/zurg", "/mnt/zurg/__all__")
+
+    def test_fresh_cache_is_returned(self):
+        doctor._reset_mount_cache()
+        self.assertTrue(self._probe(True))
+        # second call within TTL returns cached value WITHOUT re-probing
+        with patch.object(doctor.os, "listdir") as ls:
+            self.assertTrue(doctor._probe_mount("/mnt/zurg", "/mnt/zurg/__all__"))
+        ls.assert_not_called()
+
+    def test_stale_cache_reprobes(self):
+        doctor._reset_mount_cache()
+        self.assertTrue(self._probe(True))
+        # age the cache past the TTL -> next call must re-probe (now DOWN)
+        ok, ts = doctor._mount_ok_cache["/mnt/zurg"]
+        doctor._mount_ok_cache["/mnt/zurg"] = (ok, ts - doctor.MOUNT_GUARD_TTL - 1)
+        with patch.object(doctor.os.path, "ismount", return_value=True), \
+             patch.object(doctor.os, "listdir", return_value=[]), \
+             patch.object(doctor, "metric_set"):
+            self.assertFalse(doctor._probe_mount("/mnt/zurg", "/mnt/zurg/__all__"))
+
+
 if __name__ == "__main__":
     unittest.main()
