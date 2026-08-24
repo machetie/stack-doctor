@@ -1,6 +1,6 @@
 """Tests for the Prometheus /metrics registry and exposition rendering."""
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import doctor
 
@@ -117,6 +117,38 @@ class MetricsEndpointTest(unittest.TestCase):
             h.do_GET()
         code, _, _ = h.sent[-1]
         self.assertEqual(code, 200)
+
+
+class PostBodyCapTest(unittest.TestCase):
+    """A huge Content-Length must be rejected with 413 before reading the body."""
+
+    def _handler(self):
+        srv = doctor._build_server(0)
+        H = type(srv.RequestHandlerClass.__name__, (srv.RequestHandlerClass,), {})
+        srv.server_close()
+        inst = H.__new__(H)
+        inst.sent = []
+        inst._send = lambda code, ctype, body: inst.sent.append((code, ctype, body))
+        return inst
+
+    def test_oversized_content_length_returns_413(self):
+        h = self._handler()
+        h.path = "/api/config"
+        h.headers = {"Content-Length": str(doctor.MAX_POST + 1)}
+        h.rfile = MagicMock()
+        h.do_POST()
+        self.assertEqual(h.sent[0][0], 413)
+        h.rfile.read.assert_not_called()
+
+    def test_small_body_is_read(self):
+        h = self._handler()
+        h.path = "/api/scout/clear"
+        h.headers = {"Content-Length": "2"}
+        h.rfile = MagicMock()
+        h.rfile.read.return_value = b"{}"
+        with patch.object(doctor, "EN_UI", False):
+            h.do_POST()
+        h.rfile.read.assert_called_once_with(2)
 
 
 if __name__ == "__main__":

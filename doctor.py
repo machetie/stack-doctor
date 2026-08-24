@@ -206,6 +206,8 @@ UI_PORT     = _i("DOCTOR_UI_PORT", 12345)                            # web dashb
 EN_UI       = _b("ENABLE_UI", False)
 EN_METRICS  = _b("ENABLE_METRICS", True)                             # expose Prometheus /metrics (token-gated if DOCTOR_UI_TOKEN set)
 UI_TOKEN    = os.environ.get("DOCTOR_UI_TOKEN", "")                   # optional ?token= / X-Doctor-Token gate
+BIND_HOST   = os.environ.get("DOCTOR_BIND_HOST", "0.0.0.0")           # what the HTTP server binds to
+MAX_POST    = _i("DOCTOR_MAX_POST_BYTES", 2 * 1024 * 1024)            # cap on webhook/API request bodies (2MB) to avoid OOM
 LOG_LEVEL   = os.environ.get("DOCTOR_LOG_LEVEL", "INFO").upper()
 LOG_FILE    = os.environ.get("DOCTOR_LOG_FILE", "")
 TIMEOUT     = _i("DOCTOR_HTTP_TIMEOUT", 60)
@@ -6262,7 +6264,12 @@ def _build_server(port):
             return self._send(404, "text/plain", "nf")
         def do_POST(self):
             path = urlparse(self.path).path
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except Exception:
+                length = 0
+            if length < 0 or length > MAX_POST:
+                return self._send(413, "text/plain", "payload too large")
             body = self.rfile.read(length) if length else b""
             if path in ("/api/config", "/api/restart", "/api/westrepair/rescan", "/api/scout/get",
                         "/api/scout/clear", "/api/onboard/test", "/api/onboard/save"):
@@ -6304,7 +6311,7 @@ def _build_server(port):
             self._send(404, "text/plain", "nf")
         def log_message(self, *a):
             pass
-    return ThreadingHTTPServer(("0.0.0.0", port), H)
+    return ThreadingHTTPServer((BIND_HOST, port), H)
 
 def main():
     global INSTANCES
@@ -6329,6 +6336,10 @@ def main():
     log.info("safety posture: dry_run=%s scrubber_delete_arr=%s scrubber_min_age=%dh max_actions=%d mount_guards=%d",
              DRY_RUN, SCRUB_DEL_ARR, SCRUB_MIN_AGE, MAX_ACTIONS, len(MOUNT_GUARDS))
     _validate_shell_commands()
+    if EN_UI and not UI_TOKEN and BIND_HOST not in ("127.0.0.1", "localhost", "::1"):
+        log.warning("ENABLE_UI is on with no DOCTOR_UI_TOKEN and DOCTOR_BIND_HOST=%s -> the dashboard, "
+                    "config-mutating POSTs, and /metrics are UNAUTHENTICATED on the network; "
+                    "set DOCTOR_UI_TOKEN and/or DOCTOR_BIND_HOST=127.0.0.1", BIND_HOST)
 
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda *a: stop.set())
