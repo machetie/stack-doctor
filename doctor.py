@@ -483,6 +483,33 @@ META_MIN_AGE    = _i("METACLEAN_MIN_AGE_HOURS", 6)                    # quiet or
 META_FAILED_CMD = os.environ.get("METACLEAN_FAILED_CMD", "")          # cmd listing altmount failed/ release dirs
 META_STORM_CMD  = os.environ.get("METACLEAN_STORM_CMD", "")           # cmd printing recent yEnc CRC mismatch log lines
 
+# orphans check: remove debrid torrents that NO library symlink references at the
+# file level (inverse of the janitor). The debrid mount (decypharr/zurg) projects the
+# whole debrid account as /mnt/zurg/<provider>/; anything there with no symlink into
+# it from the library is a duplicate/abandoned grab wasting account slots (and, when
+# flagged bad by decypharr, spamming its webdav with "marked as bad" errors).
+# HARD SAFETY RULES (each aborts the sweep, never partial):
+#   - mount-health gate on the link dirs + debrid mount (a DOWN mount makes everything
+#     look orphaned -> would mass-delete the whole account),
+#   - ORPHANS_MIN_SYMLINKS floor (a broken/empty symlink scan also aborts),
+#   - ORPHANS_MAX_RATIO ceiling (too many "orphans" = fault, not reality),
+#   - per-sweep ORPHANS_MAX_DELETES cap, ORPHANS_MIN_AGE_HOURS, and global DRY_RUN.
+# Deletion CANNOT use rm on the mount (read-only for deletes) -> debrid provider APIs.
+EN_ORPHANS    = _b("ENABLE_ORPHANS", False)
+ORPH_MOUNT    = os.environ.get("ORPHANS_DEBRID_MOUNT", "/mnt/zurg")   # provider views live here
+ORPH_VIEWS    = [v.strip() for v in os.environ.get("ORPHANS_PROVIDER_VIEWS", "realdebrid,alldebrid,alldebrid2").split(",") if v.strip()]
+ORPH_LINK_DIRS = [p.strip() for p in os.environ.get("ORPHANS_LINK_DIRS", "/mnt/iceberg,/mnt/altmount-links").split(",") if p.strip()]
+ORPH_MIN_AGE   = _i("ORPHANS_MIN_AGE_HOURS", 720)                     # only delete orphans older than this (30d)
+ORPH_MAX_DEL   = _i("ORPHANS_MAX_DELETES", 25)                        # cap torrent deletes per sweep (drains slowly)
+ORPH_MIN_LINKS = _i("ORPHANS_MIN_SYMLINKS", 500)                      # abort if fewer links found (broken scan)
+ORPH_MAX_RATIO = _f("ORPHANS_MAX_RATIO", 0.35)                        # abort a provider if >this fraction looks orphaned
+ORPH_LOAD_MAX  = _i("ORPHANS_LOAD_MAX", 12)
+ORPH_INC_BAD   = _b("ORPHANS_INCLUDE_BAD", True)                      # process the __bad__ view (decypharr-flagged) first
+ORPH_STATE     = os.environ.get("ORPHANS_STATE_FILE", "/data/orphans.json")
+ORPH_RD_KEY    = os.environ.get("ORPHANS_REALDEBRID_APIKEY", "")      # explicit key(s) (preferred over decypharr config)
+ORPH_AD_KEYS   = [k.strip() for k in os.environ.get("ORPHANS_ALLDEBRID_APIKEYS", "").split(",") if k.strip()]
+ORPH_DECY_CFG  = os.environ.get("ORPHANS_DECYPHARR_CONFIG", "/data/decypharr/config.json")  # fallback: read debrids[].api_key
+
 # watchlists (pull Plex Home users + non-Home friends watchlists, add directly to the arrs)
 # Sources:
 #   - Plex Home / managed users: enumerated automatically from PLEX_TOKEN (owner) via plex.tv API.
@@ -1562,6 +1589,259 @@ def _meta_first_key(name):
     """First 8+ char release-name token from a metadata dir name (matches bash `head -1`)."""
     m = re.search(r"[a-z0-9.]{8,}", (name or "").lower())
     return m.group(0) if m else None
+
+# --------------------------------------------------------------------------- #
+# CHECK: orphans  (debrid torrents no library symlink references -> delete)
+# --------------------------------------------------------------------------- #
+
+class Debrid:
+    """Thin debrid-provider client (stdlib urllib, Bearer auth).
+
+    Real-Debrid:  list GET  /rest/1.0/torrents?limit=1000&page=N  (paginate)
+                  delete  DELETE /rest/1.0/torrents/delete/{id}  -> 204
+    AllDebrid:    list GET  /v4.1/magnet/status?agent=stackdoctor
+                  delete  GET /v4.1/magnet/delete?agent=stackdoctor&id={id}
+    (AllDebrid v4 is DISCONTINUED; v4.1 is current.)"""
+    def __init__(self, provider, key):
+        self.provider = provider
+        self.key = key
+
+    def _auth(self):
+        return {"Authorization": "Bearer %s" % self.key}
+
+    def _get(self, url):
+        req = urllib.request.Request(url, headers=self._auth())
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+
+    def list_map(self):
+        """filename -> [ids] (handles duplicates). Returns {} on any error."""
+        m = {}
+        try:
+            if self.provider == "realdebrid":
+                page = 1
+                while True:
+                    data = self._get("https://api.real-debrid.com/rest/1.0/torrents?limit=1000&page=%d" % page)
+                    if not data:
+                        break
+                    for t in data:
+                        m.setdefault(t.get("filename") or "", []).append(t.get("id"))
+                    if len(data) < 1000:
+                        break
+                    page += 1
+                    time.sleep(0.3)
+            else:  # alldebrid / alldebrid2
+                data = self._get("https://api.alldebrid.com/v4.1/magnet/status?agent=stackdoctor")
+                mags = (data.get("data") or {}).get("magnets") or []
+                for mg in mags:
+                    m.setdefault(mg.get("filename") or "", []).append(mg.get("id"))
+        except Exception as e:
+            log.warning("[orphans] %s list failed: %s", self.provider, str(e)[:100])
+        return m
+
+    def delete(self, tid):
+        """Delete one torrent/magnet id. Returns True on success."""
+        try:
+            if self.provider == "realdebrid":
+                url = "https://api.real-debrid.com/rest/1.0/torrents/delete/%s" % tid
+                req = urllib.request.Request(url, headers=self._auth(), method="DELETE")
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status == 204
+            else:
+                data = self._get("https://api.alldebrid.com/v4.1/magnet/delete?agent=stackdoctor&id=%s" % tid)
+                return (data.get("status") == "success")
+        except Exception as e:
+            log.warning("[orphans] %s delete %s failed: %s", self.provider, tid, str(e)[:100])
+            return False
+
+
+def _orphans_debrids():
+    """Resolve configured debrid providers + keys (explicit env preferred, else decypharr config.json)."""
+    out = []
+    if ORPH_RD_KEY:
+        out.append(Debrid("realdebrid", ORPH_RD_KEY))
+    for i, k in enumerate(ORPH_AD_KEYS):
+        out.append(Debrid("alldebrid" if i == 0 else "alldebrid%d" % (i + 1), k))
+    if not out and os.path.exists(ORPH_DECY_CFG):
+        try:
+            cfg = json.load(open(ORPH_DECY_CFG))
+            rd = [d for d in cfg.get("debrids", []) if d.get("provider") == "realdebrid"]
+            ad = [d for d in cfg.get("debrids", []) if d.get("provider") == "alldebrid"]
+            for d in rd:
+                out.append(Debrid("realdebrid", d.get("api_key", "")))
+            for i, d in enumerate(ad):
+                out.append(Debrid("alldebrid" if i == 0 else "alldebrid%d" % (i + 1), d.get("api_key", "")))
+        except Exception as e:
+            log.warning("[orphans] could not read debrid keys from %s: %s", ORPH_DECY_CFG, str(e)[:100])
+    return [d for d in out if d.key]
+
+
+def _orphans_used_set():
+    """File-level used set: the folder-name path component of every library symlink
+    target under the debrid mount. Returns (set_of_folder_names, total_links)."""
+    used = set()
+    total = 0
+    for d in ORPH_LINK_DIRS:
+        try:
+            for root, _, files in os.walk(d):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    if not os.path.islink(fp):
+                        continue
+                    total += 1
+                    try:
+                        target = os.readlink(fp)
+                    except Exception:
+                        continue
+                    p = target.split("/")
+                    # /mnt/zurg/<view>/<folder>/<file...>  ->  folder = p[4]
+                    if len(p) >= 5 and p[1] == "mnt" and p[2] == "zurg":
+                        used.add(p[4])
+        except Exception as e:
+            log.warning("[orphans] walk %s failed: %s", d, str(e)[:80])
+    return used, total
+
+
+def _orphans_load_state():
+    try: return json.load(open(ORPH_STATE))
+    except Exception: return {}
+
+def _orphans_save_state(s):
+    try:
+        _atomic_write_json(ORPH_STATE, s)
+    except Exception as e:
+        log.debug("[orphans] state save failed: %s", e)
+
+
+def _orphans_abort(reason):
+    metric_inc("stackdoctor_orphans_aborted_total", reason=reason)
+    log.error("[orphans] ABORT (%s) -> deleting nothing this sweep", reason)
+
+def check_orphans():
+    """Delete debrid torrents no library symlink references. OFF by default.
+
+    HARD SAFETY RULES (each aborts the WHOLE sweep, never partial):
+      mount-health gate, ORPHANS_MIN_SYMLINKS floor, ORPHANS_MAX_RATIO ceiling,
+      per-sweep ORPHANS_MAX_DELETES cap, ORPHANS_MIN_AGE_HOURS, global DRY_RUN."""
+    if not ORPH_LINK_DIRS or not ORPH_VIEWS:
+        log.debug("[orphans] need ORPHANS_LINK_DIRS + ORPHANS_PROVIDER_VIEWS"); return
+    if ORPH_LOAD_MAX > 0 and host_load() > ORPH_LOAD_MAX:
+        log.info("[orphans] host load > %d -> skipping", ORPH_LOAD_MAX); return
+    debrids = _orphans_debrids()
+    if not debrids:
+        log.warning("[orphans] no debrid credentials (ORPHANS_REALDEBRID_APIKEY / ORPHANS_ALLDEBRID_APIKEYS / decypharr config) -> nothing to delete")
+        return
+
+    _reset_mount_cache()
+    # mount-health gate: library dirs + debrid mount must be up, else everything
+    # looks orphaned and we'd mass-delete the whole account.
+    for p in ORPH_LINK_DIRS + [ORPH_MOUNT]:
+        if _mount_ok_for(p) is False:
+            _orphans_abort("mount_down"); return
+
+    # build the used-set; floor guard catches a broken/empty symlink scan
+    used, total_links = _orphans_used_set()
+    if total_links < ORPH_MIN_LINKS:
+        log.error("[orphans] only %d symlinks found (< ORPHANS_MIN_SYMLINKS=%d) -> abort (broken scan?)",
+                  total_links, ORPH_MIN_LINKS)
+        _orphans_abort("floor"); return
+
+    state = _orphans_load_state()
+    deleted = state.setdefault("deleted", [])
+    cooldown = state.setdefault("cooldown", {})
+    unmatched = state.setdefault("unmatched", {})
+    now = time.time()
+    min_age_s = ORPH_MIN_AGE * 3600
+    found = 0
+    acted = 0
+    capped = False
+
+    # process __bad__ first (decypharr-flagged), then the provider views
+    views = (["__bad__"] if ORPH_INC_BAD else []) + [v for v in ORPH_VIEWS]
+
+    for view in views:
+        vdir = os.path.join(ORPH_MOUNT, view)
+        if not os.path.isdir(vdir):
+            continue
+        try:
+            folders = [n for n in os.listdir(vdir)]
+        except Exception as e:
+            log.warning("[orphans] list %s failed: %s", vdir, str(e)[:80]); continue
+
+        # match a provider client for this view (name-based); __bad__ spans all
+        # providers, so resolve ids from every debrid's map.
+        if view == "__bad__":
+            nmaps = [(d, d.list_map()) for d in debrids]
+        else:
+            client = debrids[0]
+            for d in debrids:
+                if d.provider == view:
+                    client = d; break
+            nmaps = [(client, client.list_map())]
+
+        orphan_names = [f for f in folders if f not in used]
+        # ratio ceiling: too many orphans = fault, not reality
+        if folders and len(orphan_names) / len(folders) > ORPH_MAX_RATIO:
+            log.error("[orphans] %s: %d/%d look orphaned (> ORPHANS_MAX_RATIO=%.2f) -> skip view",
+                      view, len(orphan_names), len(folders), ORPH_MAX_RATIO)
+            _orphans_abort("ratio"); continue
+
+        # age filter + id mapping
+        for name in orphan_names:
+            if acted >= ORPH_MAX_DEL:
+                capped = True; break
+            if cooldown.get(name) and now - cooldown[name] < 86400:
+                continue
+            fp = os.path.join(vdir, name)
+            try:
+                if now - os.path.getmtime(fp) < min_age_s:
+                    continue
+            except Exception:
+                continue
+            # resolve the torrent id(s) for this name across the relevant debrid(s)
+            ids, provider = [], None
+            for cli, nmap in nmaps:
+                got = nmap.get(name) or []
+                if got:
+                    ids += got; provider = cli.provider
+            if not ids:
+                unmatched[name] = now
+                metric_inc("stackdoctor_orphans_skipped_total", reason="unmatched")
+                continue
+            found += 1
+            metric_set("stackdoctor_orphans_found", found, provider=provider or "?")
+            if DRY_RUN:
+                log.info("[orphans] WOULD delete %s (%d id%s)", name, len(ids), "s" if len(ids) != 1 else "")
+                metric_inc("stackdoctor_orphans_skipped_total", reason="dry_run")
+                continue
+            ok = 0
+            for cli, nmap in nmaps:
+                for tid in nmap.get(name) or []:
+                    if acted >= ORPH_MAX_DEL:
+                        capped = True; break
+                    if cli.delete(tid):
+                        deleted.append({"ts": now, "provider": cli.provider, "id": str(tid), "folder": name})
+                        ok += 1; acted += 1
+                        metric_inc("stackdoctor_orphans_deleted_total", provider=cli.provider)
+                    else:
+                        metric_inc("stackdoctor_orphans_skipped_total", reason="failed")
+                    time.sleep(0.3)  # stay under the debrid rate limit (~250/min)
+                if capped:
+                    break
+            if ok:
+                cooldown[name] = now
+                log.warning("[orphans] deleted %d/%d torrent(s) for %s", ok, len(ids), name)
+        if capped:
+            break
+
+    # prune the deleted audit trail to a sane bound
+    if len(deleted) > 2000:
+        del deleted[:len(deleted) - 2000]
+    _orphans_save_state(state)
+    if capped:
+        metric_inc("stackdoctor_orphans_skipped_total", reason="cap")
+    log.info("[orphans] done: %d orphan folder(s) found, %d torrent(s) deleted%s",
+             found, acted, " (capped at %d)" % ORPH_MAX_DEL if capped else "")
 
 def check_metaclean():
     if not (META_ROOT and META_LINK_DIRS):
@@ -4041,6 +4321,7 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("backlog", EN_BACKLOG, check_backlog),
           ("repair", EN_REPAIR, check_repair),
           ("missing-disk", EN_MISSING_DISK, check_missing_from_disk),
+          ("orphans", EN_ORPHANS, check_orphans),
           ("riven", EN_RIVEN, check_riven),
           ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
@@ -4093,7 +4374,7 @@ UI_SCHEMA = [
               ("ENABLE_WATCHLISTS", ""), ("ENABLE_HOLIDAYS", ""), ("ENABLE_BACKLOG", ""),
               ("ENABLE_RIVEN", ""), ("ENABLE_MEDIASTORM", ""),
               ("ENABLE_BAZARR", ""), ("ENABLE_SEERR", ""), ("ENABLE_WARMER", ""), ("ENABLE_WESTREPAIR", ""),
-              ("ENABLE_MISSING_FROM_DISK", "")]),
+              ("ENABLE_MISSING_FROM_DISK", ""), ("ENABLE_ORPHANS", "")]),
     ("AltMount (usenet WebDAV + mount)", [("ALTMOUNT_URL", "http://192.168.50.202:8080"),
               ("ALTMOUNT_APIKEY", "sab api key"), ("ALTMOUNT_MOUNT_TEST", "/mnt/library/altmount"),
               ("ALTMOUNT_RESTART_CMD", "systemctl restart altmount"), ("ALTMOUNT_TMP_UID", "1000"),
