@@ -457,6 +457,7 @@ SCRUB_CONFIRM_DEL  = _b("SCRUBBER_CONFIRM_BEFORE_DELETE", True)  # quick decode 
 SCRUB_EXTS         = tuple(x.strip().lower() for x in os.environ.get("SCRUBBER_EXTENSIONS", ".mkv,.mp4,.avi,.m4v,.ts").split(",") if x.strip())
 SCRUB_MIN_AGE      = _i("SCRUBBER_MIN_AGE_HOURS", 6)     # skip files newer than this (don't fight the warmer / fresh imports)
 SCRUB_REVERIFY_DAYS = _i("SCRUBBER_REVERIFY_DAYS", 30)   # re-check previously-OK files after N days (0=never)
+SCRUB_PRUNE_DAYS    = _i("SCRUBBER_PRUNE_DAYS", 90)       # drop files_state entries older than N days (bounds growth)
 
 # mount-health gate (P0 safety): a file's symlink/bad-file is only deletable if the mount it
 # lives on is a mountpoint AND responsive. This prevents the "transient mount blip -> mass delete"
@@ -507,6 +508,7 @@ ORPH_MAX_DEL   = _i("ORPHANS_MAX_DELETES", 25)                        # cap torr
 ORPH_MIN_LINKS = _i("ORPHANS_MIN_SYMLINKS", 500)                      # abort if fewer links found (broken scan)
 ORPH_MAX_RATIO = _f("ORPHANS_MAX_RATIO", 0.35)                        # abort a provider if >this fraction looks orphaned
 ORPH_LOAD_MAX  = _i("ORPHANS_LOAD_MAX", 12)
+ORPH_RESCAN_SECONDS = _i("ORPHANS_RESCAN_SECONDS", 120)           # re-scan used-set before a delete if older than this (TOCTOU)
 ORPH_INC_BAD   = _b("ORPHANS_INCLUDE_BAD", True)                      # process the __bad__ view (decypharr-flagged) first
 ORPH_STATE     = os.environ.get("ORPHANS_STATE_FILE", "/data/orphans.json")
 ORPH_RD_KEY    = os.environ.get("ORPHANS_REALDEBRID_APIKEY", "")      # explicit key(s) (preferred over decypharr config)
@@ -1788,6 +1790,7 @@ def check_orphans():
 
     # build the used-set; floor guard catches a broken/empty symlink scan
     used, total_links = _orphans_used_set()
+    used_ts = time.time()
     if total_links < ORPH_MIN_LINKS:
         log.error("[orphans] only %d symlinks found (< ORPHANS_MIN_SYMLINKS=%d) -> abort (broken scan?)",
                   total_links, ORPH_MIN_LINKS)
@@ -1864,6 +1867,18 @@ def check_orphans():
                 log.info("[orphans] WOULD delete %s (%d id%s)", name, len(ids), "s" if len(ids) != 1 else "")
                 metric_inc("stackdoctor_orphans_skipped_total", reason="dry_run")
                 continue
+            # TOCTOU guard: if the used-set is stale (a slow sweep can delete minutes after
+            # the scan), refresh it and re-check this candidate -- a re-import may have just
+            # created a symlink pointing into a folder we'd otherwise delete.
+            if time.time() - used_ts > ORPH_RESCAN_SECONDS:
+                used2, n2 = _orphans_used_set()
+                used_ts = time.time()
+                if n2 >= ORPH_MIN_LINKS:
+                    used = used2
+                if name in used:
+                    log.info("[orphans] %s became referenced mid-sweep -> skipping delete", name)
+                    metric_inc("stackdoctor_orphans_skipped_total", reason="rescanned_referenced")
+                    continue
             ok = 0
             for cli, nmap in nmaps:
                 for tid in nmap.get(name) or []:
@@ -1887,6 +1902,13 @@ def check_orphans():
     # prune the deleted audit trail to a sane bound
     if len(deleted) > 2000:
         del deleted[:len(deleted) - 2000]
+    # prune cooldown (only meaningful for 24h) and unmatched (30d) so state stays bounded
+    for name, ts in list(cooldown.items()):
+        if now - ts > 86400:
+            del cooldown[name]
+    for name, ts in list(unmatched.items()):
+        if now - ts > 30 * 86400:
+            del unmatched[name]
     _orphans_save_state(state)
     if capped:
         metric_inc("stackdoctor_orphans_skipped_total", reason="cap")
@@ -2390,6 +2412,12 @@ def check_scrubber():
             _atomic_write_json(os.path.join(sweep_qroot, "manifest.json"), manifest, indent=1)
         except Exception:
             pass
+    # prune stale files_state entries (deleted/replaced files) so state doesn't grow unboundedly
+    if SCRUB_PRUNE_DAYS > 0:
+        prune_before = now - SCRUB_PRUNE_DAYS * 86400
+        stale = [p for p, rec in files_state.items() if rec.get("ts", 0) < prune_before]
+        for p in stale:
+            files_state.pop(p, None)
     _scrub_save_state(state)
     metric_inc("stackdoctor_scrubber_files_total", ok_n, result="ok")
     metric_inc("stackdoctor_scrubber_files_total", suspect, result="suspect")

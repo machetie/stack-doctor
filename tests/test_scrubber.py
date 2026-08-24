@@ -189,5 +189,43 @@ class ScrubMissingBinaryTest(unittest.TestCase):
             self.assertFalse(doctor._scrub_bins_ok())
 
 
+class ScrubStatePruneTest(unittest.TestCase):
+    def test_stale_files_state_entries_are_pruned(self):
+        st = MagicMock()
+        st.st_mtime = 0.0
+        st.st_size = 12345
+        files = [("/mnt/zurg/real.mkv", "/mnt/lib/link.mkv")]
+        state = {"files": {"/old/path.mkv": {"ts": 0, "status": "ok"},
+                           "/fresh/path.mkv": {"ts": 9_999_999_999, "status": "ok"}}}
+        saved = {}
+
+        def save(s):
+            saved.update(s)
+
+        with tempfile.TemporaryDirectory() as quar, \
+             patch.object(doctor, "SCRUB_PATHS", ["/mnt/lib"]), \
+             patch.object(doctor, "SCRUB_QUAR", quar), \
+             patch.object(doctor, "SCRUB_LOAD_MAX", 0), \
+             patch.object(doctor, "SCRUB_STRIKES", 1), \
+             patch.object(doctor, "SCRUB_MIN_AGE", 0), \
+             patch.object(doctor, "SCRUB_MAX_DELETES", 1), \
+             patch.object(doctor, "SCRUB_MAX_FILES", 10), \
+             patch.object(doctor, "SCRUB_PRUNE_DAYS", 90), \
+             patch.object(doctor, "SCRUB_CONFIRM_DEL", False), \
+             patch.object(doctor, "DRY_RUN", False), \
+             patch.object(doctor, "_scrub_bins_ok", return_value=True), \
+             patch.object(doctor, "_scrub_walk", return_value=iter(files)), \
+             patch.object(doctor, "_stat_with_timeout", return_value=st), \
+             patch.object(doctor, "_scrub_load_state", return_value=state), \
+             patch.object(doctor, "_scrub_save_state", side_effect=save), \
+             patch.object(doctor, "_scrub_t1_header", return_value=(True, "")), \
+             patch.object(doctor, "_mount_ok_for", return_value=True), \
+             patch.object(doctor.time, "time", return_value=2_000_000_000.0), \
+             patch.object(doctor.time, "sleep"):
+            doctor.check_scrubber()
+        self.assertNotIn("/old/path.mkv", saved["files"])
+        self.assertIn("/fresh/path.mkv", saved["files"])
+
+
 if __name__ == "__main__":
     unittest.main()

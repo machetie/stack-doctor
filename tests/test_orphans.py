@@ -408,5 +408,86 @@ class DebridKeyResolutionTest(unittest.TestCase):
             self.assertEqual(doctor._orphans_debrids(), [])
 
 
+class OrphansTocTouTest(unittest.TestCase):
+    def test_toctou_refresh_skips_newly_referenced_folder(self):
+        # first scan: folder orphaned; refresh (forced) shows it referenced -> skip delete
+        client = MagicMock()
+        client.provider = "realdebrid"
+        client.list_map.return_value = {"Orphan": ["id1"]}
+        used_calls = [set(), {"Orphan"}]
+
+        def used_fn():
+            return (used_calls.pop(0), 1000)
+
+        clock = [0.0]
+
+        def fake_time():
+            clock[0] += 1.0
+            return clock[0]
+
+        with tempfile.TemporaryDirectory() as d:
+            view = os.path.join(d, "realdebrid"); os.makedirs(view)
+            p = os.path.join(view, "Orphan"); os.makedirs(p); os.utime(p, (0, 0))
+            with patch.object(doctor, "ORPH_LINK_DIRS", ["/lib"]), \
+                 patch.object(doctor, "ORPH_VIEWS", ["realdebrid"]), \
+                 patch.object(doctor, "ORPH_MOUNT", d), \
+                 patch.object(doctor, "ORPH_MIN_LINKS", 0), \
+                 patch.object(doctor, "ORPH_MIN_AGE", 0), \
+                 patch.object(doctor, "ORPH_MAX_RATIO", 1.0), \
+                 patch.object(doctor, "ORPH_LOAD_MAX", 0), \
+                 patch.object(doctor, "ORPH_INC_BAD", False), \
+                 patch.object(doctor, "ORPH_STATE", os.path.join(d, "state.json")), \
+                 patch.object(doctor, "DRY_RUN", False), \
+                 patch.object(doctor, "ORPH_RESCAN_SECONDS", 0), \
+                 patch.object(doctor, "_mount_ok_for", return_value=True), \
+                 patch.object(doctor, "host_load", return_value=0.0), \
+                 patch.object(doctor, "_orphans_debrids", return_value=[client]), \
+                 patch.object(doctor, "_orphans_used_set", side_effect=used_fn), \
+                 patch.object(doctor.time, "time", side_effect=fake_time), \
+                 patch.object(doctor.time, "sleep"):
+                doctor.check_orphans()
+        client.delete.assert_not_called()
+
+
+class OrphansPruneTest(unittest.TestCase):
+    def test_old_cooldown_and_unmatched_are_pruned(self):
+        client = MagicMock()
+        client.provider = "realdebrid"
+        client.list_map.return_value = {}  # -> candidate goes to unmatched
+        state = {"cooldown": {"old": 0, "fresh": 9_999_999_999},
+                 "unmatched": {"old_u": 0, "fresh_u": 9_999_999_999}}
+        captured = {}
+
+        def save(s):
+            captured.update(s)
+
+        with tempfile.TemporaryDirectory() as d:
+            view = os.path.join(d, "realdebrid"); os.makedirs(view)
+            p = os.path.join(view, "Orphan"); os.makedirs(p); os.utime(p, (0, 0))
+            with patch.object(doctor, "ORPH_LINK_DIRS", ["/lib"]), \
+                 patch.object(doctor, "ORPH_VIEWS", ["realdebrid"]), \
+                 patch.object(doctor, "ORPH_MOUNT", d), \
+                 patch.object(doctor, "ORPH_MIN_LINKS", 0), \
+                 patch.object(doctor, "ORPH_MIN_AGE", 0), \
+                 patch.object(doctor, "ORPH_MAX_RATIO", 1.0), \
+                 patch.object(doctor, "ORPH_LOAD_MAX", 0), \
+                 patch.object(doctor, "ORPH_INC_BAD", False), \
+                 patch.object(doctor, "ORPH_STATE", os.path.join(d, "state.json")), \
+                 patch.object(doctor, "DRY_RUN", False), \
+                 patch.object(doctor, "_mount_ok_for", return_value=True), \
+                 patch.object(doctor, "host_load", return_value=0.0), \
+                 patch.object(doctor, "_orphans_debrids", return_value=[client]), \
+                 patch.object(doctor, "_orphans_used_set", return_value=(set(), 1000)), \
+                 patch.object(doctor, "_orphans_load_state", return_value=state), \
+                 patch.object(doctor, "_orphans_save_state", side_effect=save), \
+                 patch.object(doctor.time, "time", return_value=2_000_000_000.0), \
+                 patch.object(doctor.time, "sleep"):
+                doctor.check_orphans()
+        self.assertNotIn("old", captured["cooldown"])
+        self.assertIn("fresh", captured["cooldown"])
+        self.assertNotIn("old_u", captured["unmatched"])
+        self.assertIn("fresh_u", captured["unmatched"])
+
+
 if __name__ == "__main__":
     unittest.main()
