@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -78,6 +79,28 @@ def _human(sec):
         if sec >= size and sec % size == 0:
             return "%d%s" % (sec // size, suf)
     return "%ds" % sec
+
+def _atomic_write_json(path, obj, indent=None):
+    """Write JSON durably: temp file in the same dir, fsync, atomic rename.
+
+    A crash mid-write leaves the previous good file intact (never truncated).
+    On POSIX os.replace is atomic, so a reader sees either the old or the new
+    file's full contents, never a half-written one."""
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)   # atomic on POSIX
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
 
 # UI-saved overrides: merge a JSON overlay over the inherited env BEFORE config is read, so edits win.
 CONFIG_FILE = os.environ.get("DOCTOR_CONFIG_FILE", "/data/config.json")
@@ -896,8 +919,7 @@ def _load_state():
 
 def _save_state(s):
     try:
-        os.makedirs(os.path.dirname(STATE_FILE) or ".", exist_ok=True)
-        json.dump(s, open(STATE_FILE, "w"))
+        _atomic_write_json(STATE_FILE, s)
     except Exception:
         pass
 
@@ -1510,8 +1532,7 @@ def _scrub_load_state():
 
 def _scrub_save_state(s):
     try:
-        os.makedirs(os.path.dirname(SCRUB_STATE) or ".", exist_ok=True)
-        json.dump(s, open(SCRUB_STATE, "w"))
+        _atomic_write_json(SCRUB_STATE, s)
     except Exception as e:
         log.debug("[scrubber] state save failed: %s", e)
 
@@ -1865,7 +1886,7 @@ def check_scrubber():
     # persist this sweep's manifest (fresh dir per sweep => a clean, isolated undo record)
     if manifest:
         try:
-            json.dump(manifest, open(os.path.join(sweep_qroot, "manifest.json"), "w"), indent=1)
+            _atomic_write_json(os.path.join(sweep_qroot, "manifest.json"), manifest, indent=1)
         except Exception:
             pass
     _scrub_save_state(state)
@@ -2170,8 +2191,7 @@ def _wl_load_state():
 
 def _wl_save_state(s):
     try:
-        os.makedirs(os.path.dirname(WL_STATE) or ".", exist_ok=True)
-        json.dump(s, open(WL_STATE, "w"))
+        _atomic_write_json(WL_STATE, s)
     except Exception as e:
         log.debug("[watchlists] state save failed: %s", e)
 
@@ -2584,8 +2604,7 @@ def _hol_load_state():
 
 def _hol_save_state(s):
     try:
-        os.makedirs(os.path.dirname(HOL_STATE) or ".", exist_ok=True)
-        json.dump(s, open(HOL_STATE, "w"))
+        _atomic_write_json(HOL_STATE, s)
     except Exception as e:
         log.debug("[holidays] state save failed: %s", e)
 
@@ -2696,8 +2715,7 @@ def _backlog_load_state():
 
 def _backlog_save_state(s):
     try:
-        os.makedirs(os.path.dirname(BACKLOG_STATE) or ".", exist_ok=True)
-        json.dump(s, open(BACKLOG_STATE, "w"))
+        _atomic_write_json(BACKLOG_STATE, s)
     except Exception as e:
         log.debug("[backlog] state save failed: %s", e)
 
@@ -2801,8 +2819,7 @@ def _repair_load_state():
 
 def _repair_save_state(s):
     try:
-        os.makedirs(os.path.dirname(REPAIR_STATE) or ".", exist_ok=True)
-        json.dump(s, open(REPAIR_STATE, "w"))
+        _atomic_write_json(REPAIR_STATE, s)
     except Exception as e:
         log.debug("[repair] state save failed: %s", e)
 
@@ -2884,8 +2901,7 @@ def _missing_disk_load_state():
 
 def _missing_disk_save_state(s):
     try:
-        os.makedirs(os.path.dirname(MISSING_DISK_STATE) or ".", exist_ok=True)
-        json.dump(s, open(MISSING_DISK_STATE, "w"))
+        _atomic_write_json(MISSING_DISK_STATE, s)
     except Exception as e:
         log.debug("[missing-disk] state save failed: %s", e)
 
@@ -3092,8 +3108,7 @@ def _riven_load_state():
 
 def _riven_save_state(s):
     try:
-        os.makedirs(os.path.dirname(RIVEN_STATE) or ".", exist_ok=True)
-        json.dump(s, open(RIVEN_STATE, "w"))
+        _atomic_write_json(RIVEN_STATE, s)
     except Exception as e:
         log.debug("[riven] state save failed: %s", e)
 
@@ -4063,8 +4078,7 @@ def _scout_load():
 
 def _scout_save(s):
     try:
-        os.makedirs(os.path.dirname(SCOUT_STATE) or ".", exist_ok=True)
-        json.dump(s, open(SCOUT_STATE, "w"))
+        _atomic_write_json(SCOUT_STATE, s)
     except Exception as e:
         log.debug("[scout] state save failed: %s", e)
 
@@ -4790,8 +4804,7 @@ def _ui_save(body):
         if k in UI_KEYS and not _is_secret(k):
             ov[k] = v; os.environ[str(k)] = str(v); n += 1
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-        json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+        _atomic_write_json(CONFIG_FILE, ov, indent=1)
     except Exception as e:
         return False, str(e)[:80]
     return True, "saved %d (restart to apply)" % n
@@ -4948,8 +4961,7 @@ def _config_write(updates, drop_prefixes=()):
                 del ov[k]
     for k, v in updates.items():
         ov[str(k)] = str(v); os.environ[str(k)] = str(v)
-    os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-    json.dump(ov, open(CONFIG_FILE, "w"), indent=1)
+    _atomic_write_json(CONFIG_FILE, ov, indent=1)
 
 def _onb_save(body):
     try:
