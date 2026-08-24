@@ -1780,8 +1780,11 @@ def check_orphans():
             nmaps = [(client, client.list_map())]
 
         orphan_names = [f for f in folders if f not in used]
-        # ratio ceiling: too many orphans = fault, not reality
-        if folders and len(orphan_names) / len(folders) > ORPH_MAX_RATIO:
+        # ratio ceiling: too many orphans = fault, not reality. Exempt __bad__:
+        # it is decypharr's own small, high-confidence bad-marked list (a handful
+        # of folders, most unused by design), so the mass-orphan heuristic doesn't
+        # apply there -- the per-name `used` + age checks still gate each delete.
+        if view != "__bad__" and folders and len(orphan_names) / len(folders) > ORPH_MAX_RATIO:
             log.error("[orphans] %s: %d/%d look orphaned (> ORPHANS_MAX_RATIO=%.2f) -> skip view",
                       view, len(orphan_names), len(folders), ORPH_MAX_RATIO)
             _orphans_abort("ratio"); continue

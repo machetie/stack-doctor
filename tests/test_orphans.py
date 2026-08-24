@@ -240,6 +240,35 @@ class GuardAbortTest(unittest.TestCase):
         self.assertTrue(any(c.kwargs.get("reason") == "ratio" for c in mi.call_args_list))
         client.delete.assert_not_called()
 
+    def test_bad_view_exempt_from_ratio_ceiling(self):
+        # __bad__ is decypharr's small bad-marked list: high orphan ratio must NOT
+        # trip the ratio guard (but the `used` + age checks still apply per folder).
+        client = MagicMock()
+        client.provider = "realdebrid"
+        client.list_map.return_value = {"BadOrphan": ["id1"], "BadUsed": ["id2"]}
+        with tempfile.TemporaryDirectory() as d:
+            view = os.path.join(d, "__bad__"); os.makedirs(view)
+            for n in ("BadOrphan", "BadUsed"):
+                p = os.path.join(view, n); os.makedirs(p); os.utime(p, (0, 0))
+            with patch.object(doctor, "ORPH_LINK_DIRS", ["/lib"]), \
+                 patch.object(doctor, "ORPH_VIEWS", ["realdebrid"]), \
+                 patch.object(doctor, "ORPH_MOUNT", d), \
+                 patch.object(doctor, "ORPH_MIN_LINKS", 0), \
+                 patch.object(doctor, "ORPH_MIN_AGE", 0), \
+                 patch.object(doctor, "ORPH_MAX_RATIO", 0.01), \
+                 patch.object(doctor, "ORPH_LOAD_MAX", 0), \
+                 patch.object(doctor, "ORPH_INC_BAD", True), \
+                 patch.object(doctor, "ORPH_STATE", os.path.join(d, "state.json")), \
+                 patch.object(doctor, "DRY_RUN", False), \
+                 patch.object(doctor, "_mount_ok_for", return_value=True), \
+                 patch.object(doctor, "host_load", return_value=0.0), \
+                 patch.object(doctor, "_orphans_debrids", return_value=[client]), \
+                 patch.object(doctor, "_orphans_used_set", return_value=({"BadUsed"}, 1000)), \
+                 patch.object(doctor.time, "sleep"):
+                doctor.check_orphans()
+        # BadOrphan (unused) deleted; BadUsed skipped (still referenced). Ratio 0.01 did not abort.
+        client.delete.assert_called_once_with("id1")
+
 
 class CorrectnessTest(unittest.TestCase):
     def test_folder_with_used_file_is_not_orphan(self):
