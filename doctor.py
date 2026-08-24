@@ -646,6 +646,35 @@ def _mask_cmd(cmd):
         return cmd
     return _MASK_RE.sub(lambda m: m.group(1) + "***", str(cmd))
 
+_MASK_URL_RE = re.compile(
+    r"(?i)([?&][^=&\s]*(?:token|apikey|api[_-]?key|password|passwd|secret)[^=&\s]*=)[^&\s]+")
+
+def _mask_url(s):
+    """Redact secret query-param values (token/apikey/password/...) in a URL string."""
+    if not s:
+        return s
+    return _MASK_URL_RE.sub(lambda m: m.group(1) + "***", str(s))
+
+def _mask_arg(a):
+    return _mask_url(a) if isinstance(a, str) else a
+
+class _SecretFilter(logging.Filter):
+    """Mask secret URL query params in every log record (msg + args), so a
+    urllib error or a logged URL never leaks an apikey / X-Plex-Token / password."""
+    def filter(self, record):
+        try:
+            record.msg = _mask_url(str(record.msg))
+            if record.args:
+                if isinstance(record.args, tuple):
+                    record.args = tuple(_mask_arg(a) for a in record.args)
+                elif isinstance(record.args, dict):
+                    record.args = {k: _mask_arg(v) for k, v in record.args.items()}
+        except Exception:
+            pass
+        return True
+
+log.addFilter(_SecretFilter())
+
 def run_cmd(cmd):
     if not cmd:
         return None

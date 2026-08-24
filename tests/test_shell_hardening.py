@@ -33,6 +33,53 @@ class MaskCmdTest(unittest.TestCase):
         self.assertIsNone(doctor._mask_cmd(None))
 
 
+class MaskUrlTest(unittest.TestCase):
+    def test_masks_apikey_param(self):
+        self.assertEqual(doctor._mask_url("http://x/api?mode=v&apikey=SECRET"),
+                         "http://x/api?mode=v&apikey=***")
+
+    def test_masks_x_plex_token(self):
+        out = doctor._mask_url("https://plex.tv/library/x?X-Plex-Token=TOK123")
+        self.assertNotIn("TOK123", out)
+        self.assertIn("X-Plex-Token=***", out)
+
+    def test_masks_multiple_params_and_keeps_others(self):
+        out = doctor._mask_url("http://x?token=a&safe=1&X-Plex-Token=b&apikey=c")
+        self.assertEqual(out, "http://x?token=***&safe=1&X-Plex-Token=***&apikey=***")
+
+    def test_empty_and_non_url_passthrough(self):
+        self.assertEqual(doctor._mask_url(""), "")
+        self.assertIsNone(doctor._mask_url(None))
+        self.assertEqual(doctor._mask_url("no secrets here"), "no secrets here")
+
+
+class SecretLogFilterTest(unittest.TestCase):
+    def test_filter_masks_secret_in_args(self):
+        rec = MagicMock()
+        rec.msg = "GET %s err: %s"
+        rec.args = ("http://x?apikey=SECRET", "HTTP Error 500")
+        f = doctor._SecretFilter()
+        self.assertTrue(f.filter(rec))
+        self.assertNotIn("SECRET", str(rec.args))
+        self.assertIn("apikey=***", str(rec.args))
+
+    def test_filter_masks_secret_in_msg(self):
+        rec = MagicMock()
+        rec.msg = "failed: http://x?token=SECRET"
+        rec.args = None
+        f = doctor._SecretFilter()
+        f.filter(rec)
+        self.assertNotIn("SECRET", rec.msg)
+
+    def test_filter_leaves_plain_records_untouched(self):
+        rec = MagicMock()
+        rec.msg = "all good"
+        rec.args = ("/mnt/zurg/__all__/Folder/file.mkv", 42)
+        f = doctor._SecretFilter()
+        f.filter(rec)
+        self.assertEqual(rec.args, ("/mnt/zurg/__all__/Folder/file.mkv", 42))
+
+
 class RunCmdTest(unittest.TestCase):
     def test_run_cmd_masks_secrets_in_debug_log(self):
         with patch.object(doctor.log, "debug") as dbg, \
