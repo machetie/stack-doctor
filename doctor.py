@@ -411,6 +411,8 @@ WARM_NEXT_NEAR_END = WARM_NEXT_REMAIN if WARM_NEXT_REMAIN > 0 else (10 if WARM_L
 WARM_SOURCES      = [s.strip().lower() for s in os.environ.get("WARMER_SOURCES", "ondeck,next").split(",") if s.strip()]
 WARM_ONDECK       = _b("WARMER_ONDECK", True)          # quick on/off for Continue Watching (On Deck) warming
 WARM_PATH_MAP     = os.environ.get("WARMER_PATH_MAP", "")   # "plexPrefix:hostPrefix" if Plex's file path != this host's
+WARM_VERIFY       = _b("WARMER_VERIFY", False)             # run a scrubber tier check before warming files (closes Plex crash race)
+WARM_VERIFY_TIER  = _i("WARMER_VERIFY_TIER", 1)           # scrub tier to run pre-warm (1..3); tier 1 is fast and FUSE-safe
 # detail-page warming: tail Plex's server log and warm the exact title a viewer opens (the one true
 # pre-play signal Plex emits). Give it a streaming command (tail -F, or `pct exec ... tail -F`) OR a file.
 WARM_PLEXLOG_CMD  = os.environ.get("WARMER_PLEXLOG_CMD", "")
@@ -3940,6 +3942,62 @@ def _host_path(f):
             return b + f[len(a):]
     return f
 
+def _warm_verify_and_act(path, reason="cycle"):
+    """Scrubber-backed pre-warm gate: ffprobe/verify a file before Plex reads it.
+
+    Only runs when WARMER_VERIFY is enabled and the host-side path falls inside
+    SCRUBBER_PATHS (so we never quarantine files outside the managed libraries).
+    On failure, quarantines the library symlink and asks the owning arr to re-search,
+    exactly like the scrubber's normal sweep. Returns (ok, why_or_none)."""
+    if not WARM_VERIFY:
+        return True, None
+    if not SCRUB_PATHS:
+        return True, None
+    if not _scrub_bins_ok():
+        return True, None
+    host_path = _host_path(path)
+    if not any(host_path == sp or host_path.startswith(sp.rstrip("/") + "/") for sp in SCRUB_PATHS):
+        return True, None
+    real_path, timed_out = _realpath_with_timeout(host_path, MOUNT_GUARD_TIMEOUT, return_timeout=True)
+    if timed_out:
+        log.warning("[warmer] verify timed out resolving %s", os.path.basename(host_path))
+        return True, None
+    if _mount_ok_for(real_path) is False:
+        log.warning("[warmer] verify skipped %s: backing mount down/empty", os.path.basename(host_path))
+        return True, None
+    tier = max(1, min(3, WARM_VERIFY_TIER))
+    ok, why = _scrub_t1_header(real_path)
+    cur_tier = 1
+    if ok and tier >= 2:
+        ok, why = _scrub_t2_skim(real_path); cur_tier = 2
+    if ok and tier >= 3:
+        ok, why = _scrub_t3_full(real_path); cur_tier = 3
+    if ok:
+        return True, None
+    # Before acting on a tier-1 header failure, do the same 5-second confirm decode
+    # the scrubber uses, so cosmetic container warnings don't cost a re-grab.
+    if cur_tier == 1 and SCRUB_CONFIRM_DEL:
+        ok_c, why_c = _scrub_confirm_decode(real_path)
+        if ok_c:
+            log.info("[warmer] tier-1 warning not confirmed by decode, warming anyway: %s", host_path)
+            return True, None
+        why = "tier1 header confirmed by decode: %s" % why_c
+    qroot = os.path.join(SCRUB_QUAR, time.strftime("warmer-verify-%Y%m%d-%H%M%S"))
+    manifest = []
+    action_reason = "warmer-verify t%d (%s): %s" % (cur_tier, reason, why[:180])
+    acted = _scrub_act_on_bad(real_path, host_path, action_reason, qroot, manifest)
+    if manifest:
+        try:
+            _atomic_write_json(os.path.join(qroot, "manifest.json"), manifest, indent=1)
+        except Exception:
+            pass
+    if acted:
+        log.error("[warmer] quarantined BAD file and triggered re-search: %s", host_path)
+    else:
+        log.warning("[warmer] verify BAD but did not act (dry-run/mount-down): %s", host_path)
+    metric_inc("stackdoctor_warmer_verify_bad_total", 1, acted="true" if acted else "false")
+    return False, why
+
 def _warm_file(path, reason="cycle"):
     p = _host_path(path)
     # a title you actively opened tolerates more load (2x) than speculative background warming, but
@@ -3951,6 +4009,14 @@ def _warm_file(path, reason="cycle"):
         if time.time() - _warm_state.get(p, 0) < WARM_COOLDOWN:
             return False
         _warm_state[p] = time.time()
+    # Pre-warm integrity gate: run a cheap ffprobe header (or deeper tier) on the
+    # same files the scrubber would walk, and quarantine+re-search any dead file
+    # before Plex reaches it. Done outside the lock so ffprobe doesn't block peers.
+    ok, why = _warm_verify_and_act(path, reason)
+    if not ok:
+        _warm_state.pop(p, None)                         # release cooldown; bad file will be re-grabbed
+        log.warning("[warmer] skipped warm after verify BAD: %s :: %s", os.path.basename(p), why)
+        return False
     try:
         sz = os.path.getsize(p)
     except Exception as e:
@@ -4551,6 +4617,7 @@ UI_SCHEMA = [
               ("DOCTOR_CHURN_LIMIT", "0"), ("DOCTOR_CHURN_ACTION", "report|park|backoff"), ("DOCTOR_CHURN_BACKOFF", "10m,1h,24h")]),
     ("Warmer", [("WARMER_PRECACHE_MB", "64"), ("WARMER_TAIL_MB", "8"), ("WARMER_SOURCES", "ondeck,next"),
               ("WARMER_ONDECK", "true|false"), ("WARMER_MAX_PER_CYCLE", "40"), ("WARMER_NEXT_EPISODES", "1"),
+              ("WARMER_VERIFY", "true|false"), ("WARMER_VERIFY_TIER", "1"),
               ("WARMER_COOLDOWN", "3600"), ("WARMER_LOAD_MAX", "0")]),
     ("Resources", [("RES_LOAD_WARN", "40"), ("RES_SWAP_WARN_MB", "7000"), ("RES_MEM_MIN_MB", "800")]),
     ("Seerr (failed-request retry)", [("SEERR_URL", "http://seerr:5055"), ("SEERR_RETRY_MAX", "10"), ("SEERR_MAX_ATTEMPTS", "5")]),
@@ -5330,7 +5397,7 @@ _UI_BOOL = set([
     "DOCTOR_DRY_RUN", "WATCHLISTS_INCLUDE_HOME", "HOLIDAYS_PIN_HOME",
     "SCRUBBER_FULL_DECODE_ON_BAD", "SCRUBBER_DELETE_ARR_FILE",
     "SCRUBBER_STRICT_STDERR", "SCRUBBER_CONFIRM_BEFORE_DELETE",
-    "DOCTOR_BLOCKLIST", "WARMER_ONDECK",
+    "DOCTOR_BLOCKLIST", "WARMER_ONDECK", "WARMER_VERIFY",
 ])
 
 def _ui_control(k, ph):

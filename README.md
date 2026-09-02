@@ -390,6 +390,16 @@ cooldown, a host-load guard, and a hard pause on background warming whenever **a
 so it never competes with a live stream. The title you actively open still warms instantly, in its
 own concurrency lane, even during playback.
 
+### Pre-warm integrity gate
+
+On debrid/usenet FUSE mounts a file can import cleanly and then **die later** when its torrent is
+purged or an article ages out. Plex reading that file can segfault. Set **`WARMER_VERIFY=true`** to
+run the scrubber's same tier check on a file **before** the warmer pulls it into cache. If the file is
+BAD, the warmer quarantines the library symlink and tells the owning arr to re-search a clean release
+instead of passing the dead file to Plex. The check uses `WARMER_VERIFY_TIER` (default `1`, the
+FUSE-safe header check) and honors `SCRUBBER_CONFIRM_BEFORE_DELETE`, so a cosmetic `ffprobe` warning
+doesn't cost a re-grab.
+
 | var | default | meaning |
 |---|---|---|
 | `ENABLE_WARMER` | `false` | turn the warmer on (needs `PLEX_URL` + `PLEX_TOKEN`) |
@@ -397,6 +407,8 @@ own concurrency lane, even during playback.
 | `WARMER_TAIL_MB` | `8` | also pull the tail (mkv cues / Plex end-probe); `0` = off |
 | `WARMER_SOURCES` | `ondeck,next` | background signals to warm from (`ondeck`, `next`, `recent`). Detail-page warming is separate, via the log vars below |
 | `WARMER_ONDECK` | `true` | quick on/off for **Continue Watching** (On Deck) warming, without editing `WARMER_SOURCES` |
+| `WARMER_VERIFY` | `false` | run a scrubber integrity check before warming any file; BAD files are quarantined + re-searched before Plex reads them |
+| `WARMER_VERIFY_TIER` | `1` | scrub tier to run pre-warm (`1`..`3`). Tier `1` (default) is fast and FUSE-safe |
 | `WARMER_PLEXLOG_CMD` | *(none)* | stream command for Plex's server log (e.g. `tail -n0 -F '<log>'`, or `pct exec <ct> -- tail -n0 -F '<log>'`). Enables detail-page warming |
 | `WARMER_PLEXLOG_FILE` | *(none)* | a directly-readable path to Plex's log (alternative to `_CMD`) |
 | `WARMER_INTERVAL` | `120` | seconds between session polls (next-episode prefetch) |

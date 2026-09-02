@@ -101,6 +101,9 @@ services:
       # WARMER_PATH_MAP: "/data/media:/mnt/library"   # if Plex's file path differs from this container's
       # detail-page warming: warm the exact title a viewer opens (bind-mount Plex's log read-only, then:)
       # WARMER_PLEXLOG_FILE: "/plexlog/Plex Media Server.log"
+      # pre-warm integrity gate: ffprobe-verify files before warming; BAD files are quarantined + re-searched before Plex reads them
+      # WARMER_VERIFY: "true"
+      # WARMER_VERIFY_TIER: "1"        # 1..3; tier 1 is the fast, FUSE-safe header check
 
       # ---------- resources ----------
       RES_LOAD_WARN: "40"
