@@ -4565,6 +4565,65 @@ def _wr_plex_rescan():
     log.info("[westrepair] triggered Plex rescan for %d section(s): %s", len(triggered), triggered)
     return True, "triggered %d section(s)" % len(triggered)
 
+PLACEHOLDER_LEDGER_RECONCILE = _b("PLACEHOLDER_LEDGER_RECONCILE", True)
+
+def _placeholder_ledger_reconcile():
+    """Reap stale registry entries whose episode now has a REAL file again.
+    After a prefetch swap (or any manual re-grab), the dummy is replaced by the real
+    release and Sonarr shows hasFile=True. The parked ledger entry must then be removed
+    so _parked_episode_ids() stops treating the episode as parked (else repair/missing-disk
+    would wrongly skip it). Batches by series to avoid per-entry API calls."""
+    if not PLACEHOLDER_LEDGER_RECONCILE or not _phops:
+        return 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0
+    reg = _phops._load_registry()
+    if not reg:
+        return 0
+    # group entries by series_id
+    by_series = {}
+    for k, v in reg.items():
+        sid = v.get("series_id")
+        if sid is None:
+            continue
+        by_series.setdefault(int(sid), []).append(k)
+    reaped = 0
+    changed = False
+    for sid, keys in by_series.items():
+        try:
+            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
+        except Exception:
+            continue
+        has_by_id = {e.get("id"): bool(e.get("hasFile")) for e in eps}
+        for k in keys:
+            v = reg.get(k) or {}
+            eid = v.get("episode_id")
+            dp = v.get("dummy_path")
+            if eid is None:
+                continue
+            if not has_by_id.get(eid):
+                continue  # still parked / no real file -> keep entry
+            # real file present. Only reap if the dummy path is NOT a small dummy anymore
+            # (i.e. it was overwritten by the real import) or is gone.
+            try:
+                if dp and os.path.isfile(dp) and os.path.getsize(dp) <= PLACEHOLDER_DUMMY_MAX_BYTES:
+                    continue  # a small file still sits at dummy_path -> not a real swap, keep
+            except Exception:
+                pass
+            del reg[k]
+            reaped += 1
+            changed = True
+    if changed:
+        try:
+            _phops._save_registry(reg)
+            log.info("[placeholder] ledger reconcile: reaped %d stale parked entr%s (real file restored)",
+                     reaped, "y" if reaped == 1 else "ies")
+        except Exception as e:
+            log.warning("[placeholder] ledger reconcile save failed: %s", str(e)[:120])
+    return reaped
+
+
 def check_placeholder():
     """Placeholder/park integration: keep Pulsarr rolling-managed shows filled with dummies
     for unaired/non-monitored episodes so Plex shows the full series list, plus nightly
@@ -4574,6 +4633,10 @@ def check_placeholder():
             _placeholder_unaired_guard()
         except Exception as e:
             log.warning("[placeholder] unaired guard error: %s", str(e)[:120])
+    try:
+        _placeholder_ledger_reconcile()
+    except Exception as e:
+        log.warning("[placeholder] ledger reconcile error: %s", str(e)[:120])
     if PLACEHOLDER_ROLLING_DUMMY_FILL:
         try:
             n = _placeholder_rolling_dummy_fill()
