@@ -259,6 +259,7 @@ PLACEHOLDER_SCOPE     = os.environ.get("PLACEHOLDER_SCOPE", "/mnt/iceberg/shows,
 PLACEHOLDER_MAX_PER_RUN = _i("PLACEHOLDER_MAX_PER_RUN", 25)  # series per sweep
 PLACEHOLDER_SLEEP_MS  = _i("PLACEHOLDER_SLEEP_MS", 300)      # sleep between series
 PLACEHOLDER_RECLAIM_BEHIND = _i("PLACEHOLDER_RECLAIM_BEHIND", 2)
+PLACEHOLDER_UNAIRED_GUARD = _b("PLACEHOLDER_UNAIRED_GUARD", True)  # nightly: unaired eps must stay monitored + never have dummies
 PLACEHOLDER_STATE_FILE = os.environ.get("PLACEHOLDER_STATE_FILE", "/data/placeholder-state.json")
 PLACEHOLDER_PREFETCH_RETRY_FILE = os.environ.get("PLACEHOLDER_PREFETCH_RETRY_FILE", "/data/placeholder-prefetch-retry.json")
 PLACEHOLDER_PREFETCH_RETRY_AFTER = _i("PLACEHOLDER_PREFETCH_RETRY_AFTER_MIN", 10) * 60
@@ -4568,6 +4569,11 @@ def check_placeholder():
     """Placeholder/park integration: keep Pulsarr rolling-managed shows filled with dummies
     for unaired/non-monitored episodes so Plex shows the full series list, plus nightly
     staleness/backfill park pass."""
+    if PLACEHOLDER_UNAIRED_GUARD:
+        try:
+            _placeholder_unaired_guard()
+        except Exception as e:
+            log.warning("[placeholder] unaired guard error: %s", str(e)[:120])
     if PLACEHOLDER_ROLLING_DUMMY_FILL:
         try:
             n = _placeholder_rolling_dummy_fill()
@@ -5974,6 +5980,70 @@ def _placeholder_rolling_dummy_fill():
     if written:
         log.info("[placeholder] rolling dummy fill total: wrote %d dummies", written)
     return written
+
+def _placeholder_unaired_guard():
+    """Nightly invariant (rule D): an unaired episode must NEVER be parked and MUST
+    stay monitored so Sonarr grabs it when it airs. Fixes violations:
+      - deletes any dummy file (and its registry entry) for an unaired episode,
+      - re-monitors any unaired episode that got unmonitored.
+    This is the self-healing guard for the MobLand S02 bug (ad-hoc park wrote dummies
+    + unmonitored future episodes)."""
+    if not _phops:
+        return 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0
+    scope = [x.strip() for x in PLACEHOLDER_SCOPE.split(",") if x.strip()]
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    reg = _phops._load_registry()
+    deleted = 0
+    remonitor = []
+    try:
+        series = arr.get_json("/series") or []
+    except Exception as e:
+        log.warning("[placeholder] unaired guard: could not fetch series: %s", str(e)[:80])
+        return 0
+    for s in series:
+        sid = s.get("id")
+        sp = s.get("path", "")
+        if scope and not any(sp.startswith(x) for x in scope):
+            continue
+        try:
+            episodes = arr.get_json("/episode?seriesId=%d" % sid) or []
+        except Exception:
+            continue
+        for ep in episodes:
+            se = ep.get("seasonNumber"); e = ep.get("episodeNumber")
+            if se is None or e is None or se == 0:
+                continue
+            air = _parse_air_date(ep.get("airDateUtc"))
+            if air is not None and air <= now_utc:
+                continue  # aired -> not covered by this guard
+            # UNAIRED (future or no date) -> must be monitored + must have no dummy
+            if not ep.get("monitored"):
+                remonitor.append(ep["id"])
+            key = "%d:S%02dE%02d" % (sid, se, e)
+            ent = reg.get(key)
+            if ent:
+                dp = ent.get("dummy_path")
+                if dp and os.path.isfile(dp) and not os.path.islink(dp):
+                    try:
+                        if os.path.getsize(dp) < PLACEHOLDER_DUMMY_MAX_BYTES:
+                            os.remove(dp)
+                            deleted += 1
+                    except OSError:
+                        pass
+                del reg[key]
+    if remonitor:
+        try:
+            _phops.sonarr_monitor_episodes(remonitor)
+            log.info("[placeholder] unaired guard: re-monitored %d unaired episodes", len(remonitor))
+        except Exception as e:
+            log.warning("[placeholder] unaired guard: re-monitor failed: %s", str(e)[:80])
+    if deleted or remonitor:
+        _phops._save_registry(reg)
+        log.info("[placeholder] unaired guard: deleted %d unaired dummies, re-monitored %d", deleted, len(remonitor))
+    return deleted + len(remonitor)
 
 def _placeholder_load_state():
     try:
