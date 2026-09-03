@@ -5801,8 +5801,11 @@ def _prefetch_webhook(body):
         media = body.get("media") or {}
         if media.get("type") != "episode":
             return {"ok": False, "msg": "media type is not episode"}
-        season = int(media.get("season_num", 0))
-        episode = int(media.get("episode_num", 0))
+        def _toint(v):
+            try: return int(str(v).strip() or 0)
+            except Exception: return 0
+        season = _toint(media.get("season_num", 0))
+        episode = _toint(media.get("episode_num", 0))
         if season < 1 or episode < 1:
             return {"ok": False, "msg": "invalid season/episode"}
         file_path = (media.get("file_info") or {}).get("path", "")
@@ -5816,7 +5819,7 @@ def _prefetch_webhook(body):
         return {"ok": True, "msg": msg, "series_id": series_id, "targets": n}
     except Exception as e:
         log.warning("[placeholder] prefetch webhook error: %s", str(e)[:120])
-        return {"ok": False, "msg": str(e)[:120]}
+        return {"ok": False, "error": True, "msg": str(e)[:120]}
 
 PLACEHOLDER_DEMOTE_SERIES = _b("PLACEHOLDER_DEMOTE_SERIES", True)
 
@@ -7077,7 +7080,12 @@ def _build_server(port):
                     try: p = json.loads(body or b"{}")
                     except Exception: p = {}
                     res = _prefetch_webhook(p)
-                    return self._send(200 if res.get("ok") else 404, "application/json", json.dumps(res))
+                    # Always 200: the JSON "ok" field carries the semantic result.
+                    # Non-episode / unresolved plays (movies, music, no-session test) are
+                    # normal no-ops, not failures -> avoid Tautulli logging them as errors.
+                    # Only a genuine handler exception returns non-2xx (503) below.
+                    code = 200 if not res.get("error") else 503
+                    return self._send(code, "application/json", json.dumps(res))
                 if path == "/api/onboard/test":
                     try: od = json.loads(body or b"{}")
                     except Exception: od = {}
