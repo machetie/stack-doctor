@@ -5899,13 +5899,20 @@ def _pulsarr_rolling_series_ids():
     return ids
 
 def _derive_dummy_path(series_path, template_path, season, episode):
-    """Build a plausible dummy path for an episode. Simpler names are fine for Plex;
-    Sonarr will rename to its preferred pattern when it imports the real file."""
+    """Build a dummy path for an episode that MATCHES Sonarr's naming exactly
+    (standardEpisodeFormat = '{Series TitleYear} - SxxEyy'), so the dummy lands at the
+    same path Sonarr would use. Keeps the (YEAR) - stripping it created duplicate
+    no-year orphan files that Plex and the ledger could not reconcile."""
     sp = series_path.rstrip("/")
+    # Prefer the template (a real episodeFile path in the same series) so we mirror
+    # the exact folder+filename scheme Sonarr uses; fall back to the series folder name.
     title = os.path.basename(sp)
-    # Strip year/ids tags from title for the filename (Plex still parses season/episode)
-    clean = re.sub(r"\s*\(\d{4}\).*", "", title)
-    return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, clean, season, episode)
+    if template_path:
+        td = os.path.dirname(template_path)
+        if td.startswith(sp):
+            title = os.path.basename(sp)  # series folder title (keeps year)
+    # Keep the series-folder title verbatim (it already carries the (YYYY) + {imdb-id})
+    return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, title, season, episode)
 
 def _placeholder_rolling_dummy_fill():
     """For Pulsarr rolling-managed shows, write playable dummies for aired episodes that are
