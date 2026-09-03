@@ -33,6 +33,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,17 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
+
+# Shared placeholder helpers live in /data (rules_engine.py, placeholder_ops.py)
+sys.path.insert(0, "/data")
+try:
+    import rules_engine as _reng
+except Exception:
+    _reng = None
+try:
+    import placeholder_ops as _phops
+except Exception:
+    _phops = None
 
 VERSION = "0.3"
 
@@ -238,6 +250,19 @@ EN_RIVEN      = _b("ENABLE_RIVEN", False)       # Riven (rivenmedia/riven): heal
 EN_MEDIASTORM = _b("ENABLE_MEDIASTORM", False)  # mediastorm (godver3/mediastorm): up/health watch (no import queue to manage)
 EN_SCOUT      = _b("ENABLE_SCOUT", True)        # dashboard Scout tab: search a title -> Get -> watch it acquire -> play in Plex (uses whatever backend is enabled)
 EN_REPAIR     = _b("ENABLE_REPAIR", False)      # proactive self-heal: re-grab a file the instant it goes missing/bad (don't wait for the throttled backlog)
+EN_PLACEHOLDER = _b("ENABLE_PLACEHOLDER", False)  # placeholder/park integration: rolling dummy fill, nightly park/backfill
+
+# placeholder / park config
+PLACEHOLDER_MODE      = _b("PLACEHOLDER_MODE", False)      # master switch: park/backfill actually writes
+PLACEHOLDER_DRY_RUN   = _b("PLACEHOLDER_DRY_RUN", True)    # if true, only log what would be parked
+PLACEHOLDER_SCOPE     = os.environ.get("PLACEHOLDER_SCOPE", "/mnt/iceberg/shows,/mnt/iceberg/anime_shows")
+PLACEHOLDER_MAX_PER_RUN = _i("PLACEHOLDER_MAX_PER_RUN", 25)  # series per sweep
+PLACEHOLDER_SLEEP_MS  = _i("PLACEHOLDER_SLEEP_MS", 300)      # sleep between series
+PLACEHOLDER_RECLAIM_BEHIND = _i("PLACEHOLDER_RECLAIM_BEHIND", 2)
+PLACEHOLDER_STATE_FILE = os.environ.get("PLACEHOLDER_STATE_FILE", "/data/placeholder-state.json")
+PLACEHOLDER_PREFETCH_RETRY_FILE = os.environ.get("PLACEHOLDER_PREFETCH_RETRY_FILE", "/data/placeholder-prefetch-retry.json")
+PLACEHOLDER_PREFETCH_RETRY_AFTER = _i("PLACEHOLDER_PREFETCH_RETRY_AFTER_MIN", 10) * 60
+PLACEHOLDER_PREFETCH_MAX_RETRIES = _i("PLACEHOLDER_PREFETCH_MAX_RETRIES", 1)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -518,6 +543,11 @@ ORPH_STATE     = os.environ.get("ORPHANS_STATE_FILE", "/data/orphans.json")
 ORPH_RD_KEY    = os.environ.get("ORPHANS_REALDEBRID_APIKEY", "")      # explicit key(s) (preferred over decypharr config)
 ORPH_AD_KEYS   = [k.strip() for k in os.environ.get("ORPHANS_ALLDEBRID_APIKEYS", "").split(",") if k.strip()]
 ORPH_DECY_CFG  = os.environ.get("ORPHANS_DECYPHARR_CONFIG", "/data/decypharr/config.json")  # fallback: read debrids[].api_key
+
+# altmount local download orphan cleanup (complement to debrid orphan removal)
+EN_ALTMOUNT_ORPHANS = _b("ENABLE_ALTMOUNT_ORPHANS", False)
+ALTMOUNT_URL        = os.environ.get("ALTMOUNT_URL", "http://altmount:8080")
+ALTMOUNT_API_KEY    = os.environ.get("ALTMOUNT_API_KEY", "")
 
 # watchlists (pull Plex Home users + non-Home friends watchlists, add directly to the arrs)
 # Sources:
@@ -1923,6 +1953,40 @@ def check_orphans():
         metric_inc("stackdoctor_orphans_skipped_total", reason="cap")
     log.info("[orphans] done: %d orphan folder(s) found, %d torrent(s) deleted%s",
              found, acted, " (capped at %d)" % ORPH_MAX_DEL if capped else "")
+
+def check_altmount_orphans():
+    """Trigger AltMount's library-sync cleanup so it removes source NZBs/metadata for
+    items no longer present in the library. Requires altmount to have
+    delete_source_nzb_on_removal enabled."""
+    if not EN_ALTMOUNT_ORPHANS:
+        return
+    if not ALTMOUNT_API_KEY:
+        log.warning("[altmount-orphans] ALTMOUNT_API_KEY not set"); return
+    base = ALTMOUNT_URL.rstrip("/")
+    def _api(path):
+        req = urllib.request.Request(
+            base + path,
+            headers={"X-API-Key": ALTMOUNT_API_KEY, "Accept": "application/json"},
+            method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    try:
+        dry = _api("/api/health/library-sync/dry-run")
+    except urllib.error.HTTPError as e:
+        log.warning("[altmount-orphans] dry-run HTTP %d: %s", e.code, e.read().decode()[:120]); return
+    except Exception as e:
+        log.warning("[altmount-orphans] dry-run failed: %s", str(e)[:120]); return
+    data = dry.get("data", {}) or {}
+    log.info("[altmount-orphans] dry-run: orphaned_metadata=%s orphaned_library_files=%s db_records=%s would_cleanup=%s",
+             data.get("orphaned_metadata_count"), data.get("orphaned_library_files"),
+             data.get("database_records_to_clean"), data.get("would_cleanup"))
+    if not data.get("would_cleanup"):
+        return
+    try:
+        res = _api("/api/health/library-sync/start")
+        log.info("[altmount-orphans] library-sync started: %s", res.get("message", "ok"))
+    except Exception as e:
+        log.warning("[altmount-orphans] library-sync start failed: %s", str(e)[:120])
 
 def check_metaclean():
     if not (META_ROOT and META_LINK_DIRS):
@@ -3366,9 +3430,13 @@ def _repair_save_state(s):
 
 def _repair_needs_grab(arr, tid):
     """True if the item is still monitored, has no file, and (movies) is available to grab -- i.e. the
-    deletion really left a hole (skip upgrades that already have a new file, and un-monitored items)."""
+    deletion really left a hole (skip upgrades that already have a new file, and un-monitored items).
+    PLACEHOLDER-AWARE: never re-grab an episode we deliberately parked as a dummy (its episodeFile
+    deletion is intentional, not a lost file)."""
     try:
         if arr.kind == "sonarr":
+            if _is_parked_episode(tid):
+                return False
             e = arr.get_json("/episode/%d" % tid)
             return bool(e and e.get("monitored") and not e.get("hasFile"))
         m = arr.get_json("/movie/%d" % tid)
@@ -3631,6 +3699,13 @@ def check_missing_from_disk():
             real = _realpath_with_timeout(p, MOUNT_GUARD_TIMEOUT)
             if _stat_with_timeout(real, MOUNT_GUARD_TIMEOUT) is not None:
                 continue                        # file is present -> fine
+            # placeholder-aware guard: a parked/kept dummy is a deliberate small file, not a lost
+            # file. If the reported path is a known dummy (small size), never treat it as missing.
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) <= PLACEHOLDER_DUMMY_MAX_BYTES:
+                    continue
+            except OSError:
+                pass
             missing += 1
             ck = "%s:%s" % (arr.name, it.get("key") or p)
             if now - cool.get(ck, 0) < MISSING_DISK_COOLDOWN:
@@ -4489,6 +4564,26 @@ def _wr_plex_rescan():
     log.info("[westrepair] triggered Plex rescan for %d section(s): %s", len(triggered), triggered)
     return True, "triggered %d section(s)" % len(triggered)
 
+def check_placeholder():
+    """Placeholder/park integration: keep Pulsarr rolling-managed shows filled with dummies
+    for unaired/non-monitored episodes so Plex shows the full series list, plus nightly
+    staleness/backfill park pass."""
+    if PLACEHOLDER_ROLLING_DUMMY_FILL:
+        try:
+            n = _placeholder_rolling_dummy_fill()
+            if n:
+                log.info("[placeholder] check wrote %d rolling dummies", n)
+        except Exception as e:
+            log.warning("[placeholder] rolling dummy fill error: %s", str(e)[:120])
+    try:
+        _placeholder_prefetch_retry_check()
+    except Exception as e:
+        log.warning("[placeholder] prefetch retry check error: %s", str(e)[:120])
+    try:
+        _placeholder_park_pass()
+    except Exception as e:
+        log.warning("[placeholder] park pass error: %s", str(e)[:120])
+
 
 CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_providers),
           ("decypharr", EN_DECYPHARR, check_decypharr), ("altmount", EN_ALTMOUNT, check_altmount), ("plex", EN_PLEX, check_plex), ("silo", EN_SILO, check_silo), ("silo-rematch", SILO_REMATCH, check_silo_rematch),
@@ -4501,10 +4596,12 @@ CHECKS = [("queue", EN_QUEUE, check_queue), ("providers", EN_PROVIDERS, check_pr
           ("repair", EN_REPAIR, check_repair),
           ("missing-disk", EN_MISSING_DISK, check_missing_from_disk),
           ("orphans", EN_ORPHANS, check_orphans),
+          ("altmount-orphans", EN_ALTMOUNT_ORPHANS, check_altmount_orphans),
           ("riven", EN_RIVEN, check_riven),
           ("mediastorm", EN_MEDIASTORM, check_mediastorm),
           ("bazarr", EN_BAZARR, check_bazarr), ("seerr", EN_SEERR, check_seerr),
-          ("westrepair", EN_WESTREPAIR, check_westrepair)]
+          ("westrepair", EN_WESTREPAIR, check_westrepair),
+          ("placeholder", EN_PLACEHOLDER, check_placeholder)]
 
 _lock = threading.Lock()
 
@@ -5449,6 +5546,514 @@ def _ui_logs(n):
         return "log read error: " + str(e)[:80]
 
 # --------------------------------------------------------------------------- #
+# placeholder / prefetch helpers (P4)
+# --------------------------------------------------------------------------- #
+PLACEHOLDER_PREFETCH_AHEAD = _i("PREFETCH_AHEAD", 3)
+PLACEHOLDER_PREFETCH_NEXT_SEASON = _b("PREFETCH_NEXT_SEASON", True)
+PLACEHOLDER_DUMMY_MAX_BYTES = _i("PLACEHOLDER_DUMMY_MAX_BYTES", 10 * 1024 * 1024)  # files under 10 MB treated as dummies
+
+# --- placeholder-aware guard: never re-grab an episode we deliberately PARKED ---
+PLACEHOLDER_REGISTRY_FILE = os.environ.get("PLACEHOLDER_REGISTRY", "/data/stack-doctor-data/placeholder_registry.json")
+_PARKED_CACHE = {"ids": set(), "mtime": 0.0, "ts": 0.0}
+
+def _parked_episode_ids():
+    """Set of Sonarr episodeIds currently parked as placeholder dummies.
+    Read from the placeholder registry (written by placeholder_ops). Cached and
+    invalidated on registry mtime change or after 60s, so repair/missing-disk can
+    cheaply skip re-grabbing episodes we parked on purpose."""
+    try:
+        st = os.stat(PLACEHOLDER_REGISTRY_FILE)
+    except OSError:
+        _PARKED_CACHE["ids"] = set(); _PARKED_CACHE["mtime"] = 0.0
+        return _PARKED_CACHE["ids"]
+    now = time.time()
+    if (st.st_mtime == _PARKED_CACHE["mtime"]) and (now - _PARKED_CACHE["ts"] < 60):
+        return _PARKED_CACHE["ids"]
+    ids = set()
+    try:
+        with open(PLACEHOLDER_REGISTRY_FILE) as f:
+            reg = json.load(f)
+        for v in (reg.values() if isinstance(reg, dict) else []):
+            eid = v.get("episode_id")
+            if eid is not None:
+                ids.add(int(eid))
+    except Exception as e:
+        log.warning("[placeholder] could not read registry for parked-guard: %s", str(e)[:80])
+        return _PARKED_CACHE["ids"]  # keep prior set rather than dropping the guard
+    _PARKED_CACHE["ids"] = ids
+    _PARKED_CACHE["mtime"] = st.st_mtime
+    _PARKED_CACHE["ts"] = now
+    return ids
+
+def _is_parked_episode(tid):
+    try:
+        return int(tid) in _parked_episode_ids()
+    except Exception:
+        return False
+
+def _sonarr_instance():
+    for a in INSTANCES or []:
+        if a.kind == "sonarr":
+            return a
+    return None
+
+def _prefetch_expected_path(base_file_path, season, episode):
+    """Derive the expected on-disk path for a target episode from the played episode's path."""
+    if not base_file_path:
+        return None
+    path = base_file_path
+    path = re.sub(r'Season (\d+)', f'Season {season:02d}', path, count=1)
+    path = re.sub(r'S(\d+)E(\d+)', f'S{season:02d}E{episode:02d}', path, count=1)
+    return path
+
+def _prefetch_remove_dummy(path):
+    """Remove a placeholder file if it looks like a dummy (small size)."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size > PLACEHOLDER_DUMMY_MAX_BYTES:
+            return False
+        os.remove(path)
+        log.info("[placeholder] removed dummy %s (%d bytes)", path, size)
+        return True
+    except Exception as e:
+        log.warning("[placeholder] failed to remove dummy %s: %s", path, str(e)[:80])
+        return False
+
+def _resolve_series_id(file_path, show_name, tvdb_id):
+    """Resolve a Sonarr seriesId from the watched file path, show name, or tvdb id."""
+    arr = _sonarr_instance()
+    if not arr:
+        return None
+    try:
+        series = arr.get_json("/series") or []
+    except Exception:
+        return None
+    # 1) exact path prefix match (most reliable for our symlink layout)
+    if file_path:
+        # drop season folder and below to get series root
+        parts = file_path.split("/")
+        for i in range(len(parts) - 1, -1, -1):
+            if parts[i].lower().startswith("season "):
+                root = "/".join(parts[:i])
+                break
+        else:
+            root = "/".join(parts[:-1])  # parent dir fallback
+        for s in series:
+            sp = (s.get("path") or "").rstrip("/")
+            if sp and (root == sp or (root + "/").startswith(sp + "/")):
+                return s.get("id")
+    # 2) tvdb id
+    if tvdb_id:
+        for s in series:
+            if str(s.get("tvdbId") or "") == str(tvdb_id):
+                return s.get("id")
+    # 3) title substring
+    if show_name:
+        sn = show_name.lower()
+        for s in series:
+            if sn in (s.get("title") or "").lower() or sn in (s.get("sortTitle") or "").lower():
+                return s.get("id")
+    return None
+
+def _prefetch_episodes(series_id, season, episode, base_file_path=""):
+    """Monitor + search the played episode and the next N episodes in the season.
+    Removes any placeholder files first so Sonarr can import the real release."""
+    arr = _sonarr_instance()
+    if not arr:
+        return 0, "no sonarr instance"
+    episodes = arr.get_json("/episode?seriesId=%d" % series_id)
+    if not episodes:
+        return 0, "no episodes"
+    by_key = {}
+    for ep in episodes:
+        if ep.get("seasonNumber") is not None and ep.get("episodeNumber") is not None:
+            by_key[(ep["seasonNumber"], ep["episodeNumber"])] = ep
+
+    targets = []
+    target_keys = []
+    for off in range(0, PLACEHOLDER_PREFETCH_AHEAD + 1):
+        key = (season, episode + off)
+        if key not in by_key:
+            break
+        ep = by_key[key]
+        if ep.get("hasFile"):
+            continue
+        targets.append(ep["id"])
+        target_keys.append(key)
+
+    if PLACEHOLDER_PREFETCH_NEXT_SEASON:
+        key = (season + 1, 1)
+        if key in by_key:
+            ep = by_key[key]
+            if not ep.get("hasFile"):
+                targets.append(ep["id"])
+                target_keys.append(key)
+
+    if not targets:
+        return 0, "all targets already have files"
+
+    # Remove any placeholder files blocking Sonarr import
+    cleaned = 0
+    for s, e in target_keys:
+        path = _prefetch_expected_path(base_file_path, s, e)
+        if path and _prefetch_remove_dummy(path):
+            cleaned += 1
+        # legacy .mp4 dummy next to a .mkv real file
+        if path and path.lower().endswith(".mkv"):
+            legacy = path[:-4] + ".mp4"
+            if _prefetch_remove_dummy(legacy):
+                cleaned += 1
+
+    if arr.set_monitored(targets, True):
+        res = arr.command({"name": "EpisodeSearch", "episodeIds": targets})
+        if res is not None:
+            # Track these targets so we can fall back to a full season search if they stay missing
+            pending = _placeholder_prefetch_retry_load()
+            now = int(time.time())
+            existing = {i.get("episode_id") for i in pending}
+            for ep in [by_key[k] for k in target_keys if k in by_key]:
+                if ep["id"] in existing:
+                    continue
+                pending.append({
+                    "series_id": series_id, "season": season, "episode": ep["episodeNumber"],
+                    "episode_id": ep["id"], "ts": now, "retries": 0,
+                })
+            _placeholder_prefetch_retry_save(pending)
+            return len(targets), "search triggered, cleaned %d dummy(s)" % cleaned
+    return 0, "monitor/search failed"
+
+def _placeholder_prefetch_retry_load():
+    try:
+        with open(PLACEHOLDER_PREFETCH_RETRY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _placeholder_prefetch_retry_save(state):
+    try:
+        _atomic_write_json(PLACEHOLDER_PREFETCH_RETRY_FILE, state)
+    except Exception as e:
+        log.warning("[placeholder] prefetch retry save failed: %s", e)
+
+def _placeholder_prefetch_retry_check():
+    """Retry failed prefetches by running a SeasonSearch fallback if an episode still
+    has no file and no active grab after PLACEHOLDER_PREFETCH_RETRY_AFTER_MIN."""
+    arr = _sonarr_instance()
+    if not arr:
+        return
+    now = time.time()
+    threshold = PLACEHOLDER_PREFETCH_RETRY_AFTER
+    state = _placeholder_prefetch_retry_load()
+    if not state:
+        return
+    changed = False
+    remaining = []
+    for item in state:
+        ep_id = item.get("episode_id")
+        series_id = item.get("series_id")
+        season = item.get("season")
+        retries = item.get("retries", 0)
+        if not ep_id or not series_id:
+            continue
+        try:
+            ep = arr.get_json("/episode/%d" % ep_id)
+        except Exception:
+            remaining.append(item); continue
+        if ep and ep.get("hasFile"):
+            continue  # success, drop
+        # check if a grab is in progress
+        try:
+            queue = arr.get_json("/queue?page=1&pageSize=50&episodeIds=%d" % ep_id)
+            records = queue.get("records", []) if isinstance(queue, dict) else []
+        except Exception:
+            records = []
+        if records:
+            remaining.append(item); continue  # still trying
+        if retries >= PLACEHOLDER_PREFETCH_MAX_RETRIES:
+            remaining.append(item); continue
+        if now - item.get("ts", now) < threshold:
+            remaining.append(item); continue
+        # fallback: full season search
+        try:
+            arr.command({"name": "SeasonSearch", "seriesId": series_id, "seasonNumber": season})
+            log.info("[placeholder] prefetch retry: SeasonSearch fallback for series=%d season=%d episode=%d",
+                     series_id, season, item.get("episode"))
+            item["retries"] = retries + 1
+            item["last_retry"] = int(now)
+            changed = True
+        except Exception as e:
+            log.warning("[placeholder] prefetch retry season search failed: %s", str(e)[:120])
+        remaining.append(item)
+    if changed or len(remaining) != len(state):
+        _placeholder_prefetch_retry_save(remaining)
+
+def _prefetch_webhook(body):
+    """Handle a Tautulli playback_start webhook: prefetch current+next eps."""
+    try:
+        media = body.get("media") or {}
+        if media.get("type") != "episode":
+            return {"ok": False, "msg": "media type is not episode"}
+        season = int(media.get("season_num", 0))
+        episode = int(media.get("episode_num", 0))
+        if season < 1 or episode < 1:
+            return {"ok": False, "msg": "invalid season/episode"}
+        file_path = (media.get("file_info") or {}).get("path", "")
+        show_name = media.get("show_name", "")
+        ids = media.get("ids") or {}
+        series_id = _resolve_series_id(file_path, show_name, ids.get("tvdb"))
+        if not series_id:
+            return {"ok": False, "msg": "could not resolve Sonarr series"}
+        n, msg = _prefetch_episodes(series_id, season, episode, file_path)
+        log.info("[placeholder] prefetch S%02dE%02d series=%s targets=%d msg=%s", season, episode, series_id, n, msg)
+        return {"ok": True, "msg": msg, "series_id": series_id, "targets": n}
+    except Exception as e:
+        log.warning("[placeholder] prefetch webhook error: %s", str(e)[:120])
+        return {"ok": False, "msg": str(e)[:120]}
+
+PLACEHOLDER_DEMOTE_SERIES = _b("PLACEHOLDER_DEMOTE_SERIES", True)
+
+def _dummy_asset_path():
+    candidates = [
+        os.environ.get("PLACEHOLDER_DUMMY_ASSET"),
+        "/data/assets/dummy.mp4",
+        "/data/stack-doctor-data/assets/dummy.mp4",
+        "/data/placeholdarr/dummy.mp4",
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+def _parse_air_date(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def _demote_series_to_premieres(series_id):
+    """Safety-net for new Sonarr series: keep only SxxE01 + unaired monitored,
+    unmonitor/cancel everything else so a whole-show add does not re-inflate the library."""
+    arr = _sonarr_instance()
+    if not arr:
+        return {"ok": False, "msg": "no sonarr instance"}
+    try:
+        episodes = arr.get_json("/episode?seriesId=%d" % series_id) or []
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        to_unmonitor = []
+        pilot_ids = []
+        for ep in episodes:
+            s = ep.get("seasonNumber")
+            e = ep.get("episodeNumber")
+            if s is None or e is None:
+                continue
+            air = _parse_air_date(ep.get("airDateUtc"))
+            is_pilot = e == 1
+            unaired = air is None or air > now_utc
+            if is_pilot or unaired:
+                pilot_ids.append(ep["id"])
+            elif ep.get("monitored"):
+                to_unmonitor.append(ep["id"])
+        if to_unmonitor:
+            arr.set_monitored(to_unmonitor, False)
+            log.info("[placeholder] demoted series %d: unmonitored %d non-pilot episodes", series_id, len(to_unmonitor))
+        # Cancel any queued grabs for the demoted episodes
+        try:
+            queue = arr.get_json("/queue?page=1&pageSize=200&seriesId=%d" % series_id) or {}
+            cancelled = 0
+            for rec in queue.get("records", []):
+                qeid = rec.get("episodeId")
+                if qeid in to_unmonitor:
+                    arr.req("DELETE", "/queue/%d" % rec.get("id"))
+                    cancelled += 1
+            if cancelled:
+                log.info("[placeholder] demoted series %d: cancelled %d queue grabs", series_id, cancelled)
+        except Exception as qe:
+            log.warning("[placeholder] queue cancel error: %s", str(qe)[:80])
+        return {"ok": True, "msg": "kept %d pilots/unaired, unmonitored %d" % (len(pilot_ids), len(to_unmonitor)),
+                "series_id": series_id}
+    except Exception as e:
+        log.warning("[placeholder] demote series %s error: %s", series_id, str(e)[:120])
+        return {"ok": False, "msg": str(e)[:120]}
+
+PLACEHOLDER_ROLLING_DUMMY_FILL = _b("PLACEHOLDER_ROLLING_DUMMY_FILL", True)
+PLACEHOLDER_ROLLING_DB = os.environ.get("PLACEHOLDER_ROLLING_DB", "/pulsarr_data/db/pulsarr.db")
+
+def _pulsarr_rolling_series_ids():
+    """Return set of Sonarr series ids currently managed by Pulsarr rolling monitoring."""
+    ids = set()
+    if not os.path.exists(PLACEHOLDER_ROLLING_DB):
+        return ids
+    try:
+        conn = sqlite3.connect(PLACEHOLDER_ROLLING_DB)
+        cur = conn.cursor()
+        for row in cur.execute("SELECT DISTINCT sonarr_series_id FROM rolling_monitored_shows"):
+            if row[0]:
+                ids.add(int(row[0]))
+        conn.close()
+    except Exception as e:
+        log.warning("[placeholder] failed to read pulsarr rolling DB: %s", str(e)[:120])
+    return ids
+
+def _derive_dummy_path(series_path, template_path, season, episode):
+    """Build a plausible dummy path for an episode. Simpler names are fine for Plex;
+    Sonarr will rename to its preferred pattern when it imports the real file."""
+    sp = series_path.rstrip("/")
+    title = os.path.basename(sp)
+    # Strip year/ids tags from title for the filename (Plex still parses season/episode)
+    clean = re.sub(r"\s*\(\d{4}\).*", "", title)
+    return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, clean, season, episode)
+
+def _placeholder_rolling_dummy_fill():
+    """For Pulsarr rolling-managed shows, write playable dummies for aired episodes that are
+    not monitored (so Pulsarr will not grab them) and have no file, so Plex shows the full
+    season/series list. Does not delete/unmonitor anything."""
+    if not PLACEHOLDER_ROLLING_DUMMY_FILL:
+        return 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0
+    rolling = _pulsarr_rolling_series_ids()
+    if not rolling:
+        return 0
+    dummy_asset = _dummy_asset_path()
+    if not dummy_asset or not os.path.exists(dummy_asset):
+        log.warning("[placeholder] rolling dummy fill: dummy asset not found")
+        return 0
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    written = 0
+    for sid in sorted(rolling):
+        try:
+            series = arr.get_json("/series/%d" % sid)
+            episodes = arr.get_json("/episode?seriesId=%d" % sid) or []
+            files = arr.get_json("/episodefile?seriesId=%d" % sid) or []
+            if not series or not episodes:
+                continue
+            template = None
+            for f in files:
+                p = f.get("path")
+                if p and os.path.exists(p):
+                    template = p
+                    break
+            series_path = series.get("path", "")
+            season_files = {}
+            for ep in episodes:
+                s = ep.get("seasonNumber")
+                e = ep.get("episodeNumber")
+                if s is None or e is None or s == 0:
+                    continue
+                if ep.get("hasFile") or ep.get("monitored"):
+                    continue
+                air = _parse_air_date(ep.get("airDateUtc"))
+                if air is None or air > now_utc:
+                    continue
+                # Prefer a template from same season, else any
+                tpl = template
+                if tpl is None:
+                    continue
+                path = _derive_dummy_path(series_path, tpl, s, e)
+                if os.path.exists(path):
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                shutil.copy2(dummy_asset, path)
+                written += 1
+            if written:
+                log.info("[placeholder] rolling dummy fill series %d: wrote %d dummies", sid, written)
+        except Exception as e:
+            log.warning("[placeholder] rolling dummy fill series %d error: %s", sid, str(e)[:120])
+    if written:
+        log.info("[placeholder] rolling dummy fill total: wrote %d dummies", written)
+    return written
+
+def _placeholder_load_state():
+    try:
+        with open(PLACEHOLDER_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _placeholder_save_state(st):
+    try:
+        with open(PLACEHOLDER_STATE_FILE, "w") as f:
+            json.dump(st, f)
+    except Exception as e:
+        log.warning("[placeholder] state save failed: %s", e)
+
+def _placeholder_park_pass():
+    """Nightly staleness/backfill pass: compute KEEP-REAL for non-rolling series,
+    park the rest in batches. PLACEHOLDER_DRY_RUN=true logs without writing."""
+    if not _phops:
+        log.warning("[placeholder] placeholder_ops not importable, skipping park pass")
+        return 0, 0
+    if not _reng:
+        log.warning("[placeholder] rules_engine not importable, skipping park pass")
+        return 0, 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0, 0
+    scope = [p.strip() for p in PLACEHOLDER_SCOPE.split(",") if p.strip()]
+    rolling = _pulsarr_rolling_series_ids()
+    st = _placeholder_load_state()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    last_run = st.get("last_park_run")
+    if last_run == today:
+        log.debug("[placeholder] park pass already ran today")
+        return 0, 0
+
+    try:
+        all_series = arr.get_json("/series") or []
+    except Exception as e:
+        log.warning("[placeholder] park pass failed to fetch series: %s", str(e)[:80])
+        return 0, 0
+
+    eligible = []
+    for s in all_series:
+        sid = s.get("id")
+        sp = s.get("path", "")
+        if sid in rolling:
+            continue
+        if scope and not any(sp.startswith(p) for p in scope):
+            continue
+        # skip fileless series
+        if s.get("statistics", {}).get("episodeFileCount", 0) == 0:
+            continue
+        eligible.append(s)
+
+    if not eligible:
+        st["last_park_run"] = today
+        _placeholder_save_state(st)
+        return 0, 0
+
+    random.shuffle(eligible)
+    cap = PLACEHOLDER_MAX_PER_RUN
+    batch = eligible[:cap]
+    parked = 0
+    dry = PLACEHOLDER_DRY_RUN or not PLACEHOLDER_MODE
+    for s in batch:
+        sid = s["id"]
+        try:
+            res = _phops.park_series(sid, dry_run=dry, scope_paths=scope)
+            parked += len([x for x in (res or []) if not x.get("dry_run", dry)])
+        except Exception as e:
+            log.warning("[placeholder] park series %d error: %s", sid, str(e)[:120])
+        if PLACEHOLDER_SLEEP_MS > 0:
+            time.sleep(PLACEHOLDER_SLEEP_MS / 1000.0)
+
+    st["last_park_run"] = today
+    _placeholder_save_state(st)
+    log.info("[placeholder] park pass %s: processed %d series, parked %d episodes",
+             "(DRY-RUN)" if dry else "live", len(batch), parked)
+    return len(batch), parked
+
+def _placeholder_reclaim_pass():
+    """Stub for reclaim pass: repark episodes that are >REPARK_BEHIND behind the latest
+    watched position. Will be expanded once park pass is dry-run validated."""
+    return 0
+
+# --------------------------------------------------------------------------- #
 # onboarding: first-run setup wizard (auto-detect + manual, writes config.json)
 # --------------------------------------------------------------------------- #
 
@@ -6388,9 +6993,14 @@ def _build_server(port):
                 return self._send(413, "text/plain", "payload too large")
             body = self.rfile.read(length) if length else b""
             if path in ("/api/config", "/api/restart", "/api/westrepair/rescan", "/api/scout/get",
-                        "/api/scout/clear", "/api/onboard/test", "/api/onboard/save"):
+                        "/api/scout/clear", "/api/onboard/test", "/api/onboard/save", "/api/prefetch"):
                 if not EN_UI or not self._authed():
                     return self._send(401, "text/plain", "unauthorized")
+                if path == "/api/prefetch":
+                    try: p = json.loads(body or b"{}")
+                    except Exception: p = {}
+                    res = _prefetch_webhook(p)
+                    return self._send(200 if res.get("ok") else 404, "application/json", json.dumps(res))
                 if path == "/api/onboard/test":
                     try: od = json.loads(body or b"{}")
                     except Exception: od = {}
@@ -6420,6 +7030,11 @@ def _build_server(port):
                 self._send(200, "text/plain", "ok")
                 if ev == "Test":
                     log.info("webhook Test from %s", inst or "?"); return
+                if ev == "SeriesAdd" and PLACEHOLDER_DEMOTE_SERIES:
+                    sid = (p.get("series") or {}).get("id")
+                    if sid:
+                        log.info("event 'SeriesAdd' from %s -> demote to pilots (series %s)", inst or "?", sid)
+                        threading.Thread(target=lambda: _demote_series_to_premieres(sid), daemon=True).start(); return
                 if TRIGGER_EVENTS and ev not in TRIGGER_EVENTS:
                     return
                 log.info("event '%s' from %s -> sweep", ev, inst or "all")
