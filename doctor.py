@@ -5929,6 +5929,9 @@ def _placeholder_rolling_dummy_fill():
     season/series list. Does not delete/unmonitor anything."""
     if not PLACEHOLDER_ROLLING_DUMMY_FILL:
         return 0
+    if not _phops:
+        log.warning("[placeholder] rolling dummy fill: placeholder_ops unavailable")
+        return 0
     arr = _sonarr_instance()
     if not arr:
         return 0
@@ -5941,6 +5944,8 @@ def _placeholder_rolling_dummy_fill():
         return 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     written = 0
+    reg = _phops._load_registry()      # route rolling-fill dummies through the ledger (no untracked dummies)
+    reg_dirty = False
     for sid in sorted(rolling):
         try:
             series = arr.get_json("/series/%d" % sid)
@@ -5974,14 +5979,27 @@ def _placeholder_rolling_dummy_fill():
                 if os.path.exists(path):
                     continue
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                shutil.copy2(dummy_asset, path)
+                # hardened, fail-safe write via placeholder_ops (same primitive as park_series)
+                _phops.write_dummy(path, dummy_asset)
+                # record in the ledger so this dummy is TRACKED (parked-guard / prefetch / audits see it)
+                reg[_phops._reg_key(sid, s, e)] = {
+                    "series_id": sid, "season": s, "episode": e,
+                    "episode_id": ep.get("id"), "dummy_path": path,
+                    "quarantine_path": None, "orig_path": path,
+                }
+                reg_dirty = True
                 written += 1
             if written:
                 log.info("[placeholder] rolling dummy fill series %d: wrote %d dummies", sid, written)
         except Exception as e:
             log.warning("[placeholder] rolling dummy fill series %d error: %s", sid, str(e)[:120])
+    if reg_dirty:
+        try:
+            _phops._save_registry(reg)
+        except Exception as e:
+            log.warning("[placeholder] rolling dummy fill: registry save failed: %s", str(e)[:120])
     if written:
-        log.info("[placeholder] rolling dummy fill total: wrote %d dummies", written)
+        log.info("[placeholder] rolling dummy fill total: wrote %d dummies (ledgered)", written)
     return written
 
 def _placeholder_unaired_guard():
