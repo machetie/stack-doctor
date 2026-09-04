@@ -4637,6 +4637,11 @@ def check_placeholder():
         _placeholder_ledger_reconcile()
     except Exception as e:
         log.warning("[placeholder] ledger reconcile error: %s", str(e)[:120])
+    if PLACEHOLDER_DEDUP_GUARD:
+        try:
+            _placeholder_dedup_guard()
+        except Exception as e:
+            log.warning("[placeholder] dedup guard error: %s", str(e)[:120])
     if PLACEHOLDER_ROLLING_DUMMY_FILL:
         try:
             n = _placeholder_rolling_dummy_fill()
@@ -5983,7 +5988,9 @@ def _derive_dummy_path(series_path, template_path, season, episode):
         td = os.path.dirname(template_path)
         if td.startswith(sp):
             title = os.path.basename(sp)  # series folder title (keeps year)
-    # Keep the series-folder title verbatim (it already carries the (YYYY) + {imdb-id})
+    # Strip the trailing ' {imdb-...}'/' {tvdb-...}' tag so the dummy filename matches
+    # Sonarr's {Series TitleYear} format exactly (else Sonarr cannot associate it -> re-grab).
+    title = re.sub(r'\s*\{[^}]*\}\s*$', '', title)
     return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, title, season, episode)
 
 def _placeholder_rolling_dummy_fill():
@@ -6208,6 +6215,203 @@ def _placeholder_park_pass():
     log.info("[placeholder] park pass %s: processed %d series, parked %d episodes",
              "(DRY-RUN)" if dry else "live", len(batch), parked)
     return len(batch), parked
+
+# --------------------------------------------------------------------------- #
+# DEDUP GUARD (self-heals the "duplicate / mis-named dummy" class, MASTER-HANDOFF §25)
+# Episodes parked across sessions accumulated 2-3 dummies each (no-year / +imdb-tag /
+# correct name) as _derive_dummy_path evolved. Mis-named dummies Sonarr can't see cause
+# re-grab loops. This pass, per parked series (ledger-scoped), collapses to ONE correctly
+# named survivor, deletes dummies next to a real file, re-points the ledger, and stops
+# park re-grab loops (rename mis-named lone dummy + unmonitor) while protecting KEEP-REAL.
+# --------------------------------------------------------------------------- #
+PLACEHOLDER_DEDUP_GUARD    = _b("PLACEHOLDER_DEDUP_GUARD", True)
+PLACEHOLDER_DEDUP_MAX_SERIES = _i("PLACEHOLDER_DEDUP_MAX_SERIES", 60)   # series processed per daily run
+PLACEHOLDER_DEDUP_MAX_DELETES = _i("PLACEHOLDER_DEDUP_MAX_DELETES", 3000)  # dummy deletes per run (safety cap)
+
+_DEDUP_EPRE = re.compile(r"S(\d{1,2})E(\d{1,2})", re.I)
+
+def _dedup_ep_of(fn):
+    m = _DEDUP_EPRE.search(fn)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+def _dedup_is_dummy(fp):
+    try:
+        return (not os.path.islink(fp)) and os.lstat(fp).st_size <= PLACEHOLDER_DUMMY_MAX_BYTES and \
+               fp.lower().endswith((".mkv", ".mp4", ".avi", ".m4v"))
+    except OSError:
+        return False
+
+def _dedup_correct_name(series_path, season, episode):
+    """The path Sonarr would use: '{Series TitleYear} - SxxEyy.mkv' (folder title with the
+    trailing ' {imdb-...}' / ' {tvdb-...}' tag stripped)."""
+    folder = os.path.basename(series_path.rstrip("/"))
+    title_year = re.sub(r"\s*\{[^}]*\}\s*$", "", folder)
+    return os.path.join(series_path.rstrip("/"), "Season %02d" % season,
+                        "%s - S%02dE%02d.mkv" % (title_year, season, episode))
+
+def _placeholder_dedup_guard():
+    """Daily (gated) self-heal of duplicate / mis-named park dummies. Ledger-scoped so it
+    only walks series that actually have parked entries. Returns (deleted, unmonitored)."""
+    if not PLACEHOLDER_DEDUP_GUARD or not _phops or not _reng:
+        return 0, 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0, 0
+    st = _placeholder_load_state()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    if st.get("last_dedup_run") == today:
+        return 0, 0
+
+    reg = _phops._load_registry()
+    if not reg:
+        st["last_dedup_run"] = today; _placeholder_save_state(st)
+        return 0, 0
+    # candidate series = those with ledger entries
+    sids = sorted({int(v["series_id"]) for v in reg.values() if v.get("series_id") is not None})
+    # round-robin: process a bounded batch each day, remember where we stopped
+    start = int(st.get("dedup_cursor", 0))
+    if start >= len(sids):
+        start = 0
+    batch = sids[start:start + PLACEHOLDER_DEDUP_MAX_SERIES]
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    deleted = unmonitored = 0
+    changed_reg = False
+    rescan_ids = set()
+    # build a quick ledger index by (sid,se,ep)
+    led_by_ep = {}
+    for k, v in reg.items():
+        try:
+            led_by_ep[(int(v["series_id"]), int(v["season"]), int(v["episode"]))] = k
+        except Exception:
+            pass
+
+    for sid in batch:
+        if deleted >= PLACEHOLDER_DEDUP_MAX_DELETES:
+            break
+        try:
+            s = arr.get_json("/series/%d" % sid)
+            if not s:
+                continue
+            spath = s.get("path", "")
+            if not spath or not os.path.isdir(spath):
+                continue
+            eplist = arr.get_json("/episode?seriesId=%d" % sid) or []
+            files = {f["id"]: f for f in (arr.get_json("/episodefile?seriesId=%d" % sid) or [])}
+        except Exception:
+            continue
+        eps = {(e["seasonNumber"], e["episodeNumber"]): e for e in eplist}
+        try:
+            kr = _reng.compute_keep_real(s, eplist, list(files.values()),
+                                         _reng.fetch_tautulli_history(s.get("title", "")), now)["keep"]
+        except Exception:
+            kr = set()
+        # gather dummies on disk by (season,episode)
+        dbe = {}
+        for dp, _, fns in os.walk(spath):
+            for fn in fns:
+                fp = os.path.join(dp, fn)
+                if not _dedup_is_dummy(fp):
+                    continue
+                k = _dedup_ep_of(fn)
+                if k:
+                    dbe.setdefault(k, []).append(fp)
+        if not dbe:
+            continue
+
+        for (se, ep), dfiles in sorted(dbe.items()):
+            if deleted >= PLACEHOLDER_DEDUP_MAX_DELETES:
+                break
+            e = eps.get((se, ep))
+            if not e:
+                continue
+            ef = files.get(e.get("episodeFileId") or 0)
+            sonarr_file = ef.get("path") if ef else None
+            real_is_link = bool(sonarr_file and os.path.islink(sonarr_file))
+            has_real = bool(e.get("hasFile") and sonarr_file and os.path.lexists(sonarr_file) and
+                            (real_is_link or (os.path.isfile(sonarr_file) and os.path.getsize(sonarr_file) > PLACEHOLDER_DUMMY_MAX_BYTES)))
+            rk = "%d:S%02dE%02d" % (sid, se, ep)
+
+            # CASE C: real file present -> delete all dummies, drop ledger entry
+            if has_real:
+                for d in dfiles:
+                    if os.path.normpath(d) == os.path.normpath(sonarr_file or ""):
+                        continue
+                    try:
+                        os.remove(d); deleted += 1
+                    except OSError:
+                        pass
+                if rk in reg:
+                    del reg[rk]; changed_reg = True
+                rescan_ids.add(sid)
+                continue
+
+            # choose survivor for a parked episode
+            correct = _dedup_correct_name(spath, se, ep)
+            norm = [os.path.normpath(d) for d in dfiles]
+            survivor = None
+            if sonarr_file and os.path.normpath(sonarr_file) in norm:
+                survivor = os.path.normpath(sonarr_file)          # what Sonarr already recognises
+            elif os.path.normpath(correct) in norm:
+                survivor = os.path.normpath(correct)              # the correctly-named one
+            # PARK re-grab loop: Sonarr can't see any dummy (missing+monitored+aired) & not keep-real
+            aired = not _reng.is_unaired(e, now)
+            regrab_loop = (not e.get("hasFile")) and e.get("monitored") and aired and (_reng.ep_key(se, ep) not in kr)
+            if survivor is None:
+                if regrab_loop:
+                    # rename the first dummy to the correct name so Sonarr will see it
+                    src = dfiles[0]
+                    try:
+                        os.makedirs(os.path.dirname(correct), exist_ok=True)
+                        os.replace(src, correct)
+                    except OSError:
+                        try: _phops.write_dummy(correct)
+                        except Exception: pass
+                    survivor = os.path.normpath(correct)
+                    rescan_ids.add(sid)
+                else:
+                    survivor = norm[0]
+            # delete every non-survivor dummy
+            for d in dfiles:
+                if os.path.normpath(d) != survivor:
+                    try:
+                        os.remove(d); deleted += 1
+                    except OSError:
+                        pass
+            # re-point ledger to survivor
+            v = reg.get(rk)
+            if not v or os.path.normpath(v.get("dummy_path", "")) != survivor:
+                reg[rk] = {"series_id": sid, "season": se, "episode": ep, "episode_id": e["id"],
+                           "dummy_path": survivor, "quarantine_path": (v or {}).get("quarantine_path"),
+                           "orig_path": (v or {}).get("orig_path", survivor)}
+                changed_reg = True
+            # stop a park re-grab loop
+            if regrab_loop and e.get("monitored"):
+                try:
+                    arr.set_monitored([e["id"]], False); unmonitored += 1
+                    rescan_ids.add(sid)
+                except Exception:
+                    pass
+
+    if changed_reg:
+        try: _phops._save_registry(reg)
+        except Exception as e:
+            log.warning("[placeholder] dedup guard: registry save failed: %s", str(e)[:100])
+    for sid in rescan_ids:
+        try: arr.command({"name": "RescanSeries", "seriesId": sid})
+        except Exception:
+            pass
+    # advance cursor
+    st["dedup_cursor"] = (start + PLACEHOLDER_DEDUP_MAX_SERIES) if (start + PLACEHOLDER_DEDUP_MAX_SERIES) < len(sids) else 0
+    # only mark "done for today" once we've swept the whole ledger at least once this cycle
+    if st["dedup_cursor"] == 0:
+        st["last_dedup_run"] = today
+    _placeholder_save_state(st)
+    if deleted or unmonitored:
+        log.info("[placeholder] dedup guard: deleted %d duplicate/orphan dummies, unmonitored %d park loop(s), rescans=%d",
+                 deleted, unmonitored, len(rescan_ids))
+    return deleted, unmonitored
+
 
 def _placeholder_reclaim_pass():
     """Stub for reclaim pass: repark episodes that are >REPARK_BEHIND behind the latest
