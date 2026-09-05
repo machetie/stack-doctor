@@ -263,7 +263,7 @@ PLACEHOLDER_UNAIRED_GUARD = _b("PLACEHOLDER_UNAIRED_GUARD", True)  # nightly: un
 PLACEHOLDER_STATE_FILE = os.environ.get("PLACEHOLDER_STATE_FILE", "/data/placeholder-state.json")
 PLACEHOLDER_PREFETCH_RETRY_FILE = os.environ.get("PLACEHOLDER_PREFETCH_RETRY_FILE", "/data/placeholder-prefetch-retry.json")
 PLACEHOLDER_PREFETCH_RETRY_AFTER = _i("PLACEHOLDER_PREFETCH_RETRY_AFTER_MIN", 10) * 60
-PLACEHOLDER_PREFETCH_MAX_RETRIES = _i("PLACEHOLDER_PREFETCH_MAX_RETRIES", 1)
+PLACEHOLDER_PREFETCH_MAX_RETRIES = _i("PLACEHOLDER_PREFETCH_MAX_RETRIES", 3)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -5852,7 +5852,7 @@ def _placeholder_prefetch_retry_check():
             remaining.append(item); continue  # still trying
         if retries >= PLACEHOLDER_PREFETCH_MAX_RETRIES:
             remaining.append(item); continue
-        if now - item.get("ts", now) < threshold:
+        if now - item.get("last_retry", item.get("ts", now)) < threshold:
             remaining.append(item); continue
         # fallback: full season search
         try:
