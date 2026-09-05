@@ -5957,6 +5957,7 @@ def _demote_series_to_premieres(series_id):
         return {"ok": False, "msg": str(e)[:120]}
 
 PLACEHOLDER_ROLLING_DUMMY_FILL = _b("PLACEHOLDER_ROLLING_DUMMY_FILL", True)
+PLACEHOLDER_REQUIRE_PREMIERE = _b("PLACEHOLDER_REQUIRE_PREMIERE", True)  # do not dummy-fill a season unless its SxxE01 premiere is a REAL file
 PLACEHOLDER_ROLLING_DB = os.environ.get("PLACEHOLDER_ROLLING_DB", "/pulsarr_data/db/pulsarr.db")
 
 def _pulsarr_rolling_series_ids():
@@ -5993,6 +5994,36 @@ def _derive_dummy_path(series_path, template_path, season, episode):
     title = re.sub(r'\s*\{[^}]*\}\s*$', '', title)
     return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, title, season, episode)
 
+
+def _seasons_with_real_premiere(episodes, files):
+    """Return the set of season numbers whose SxxE01 premiere is present as a REAL file
+    (hasFile + episodeFile that is a symlink or larger than a dummy). The premiere is the
+    KEEP-REAL anchor for a season; we refuse to 'add' (dummy-fill) a season until its
+    premiere actually exists, so Plex never shows a season you cannot start."""
+    file_by_id = {ff.get("id"): ff for ff in (files or [])}
+    real = set()
+    for ep in (episodes or []):
+        if ep.get("episodeNumber") != 1 or (ep.get("seasonNumber") or 0) < 1:
+            continue
+        if not ep.get("hasFile"):
+            continue
+        ef = file_by_id.get(ep.get("episodeFileId") or 0)
+        p = (ef or {}).get("path")
+        is_real = False
+        try:
+            if p and os.path.islink(p):
+                is_real = True
+            elif p and os.path.isfile(p) and os.path.getsize(p) > PLACEHOLDER_DUMMY_MAX_BYTES:
+                is_real = True
+            elif ef and (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES:
+                is_real = True
+        except OSError:
+            is_real = bool(ef and (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES)
+        if is_real:
+            real.add(ep.get("seasonNumber"))
+    return real
+
+
 def _placeholder_rolling_dummy_fill():
     """For Pulsarr rolling-managed shows, write playable dummies for aired episodes that are
     not monitored (so Pulsarr will not grab them) and have no file, so Plex shows the full
@@ -6014,6 +6045,7 @@ def _placeholder_rolling_dummy_fill():
         return 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     written = 0
+    skipped_no_prem = 0
     reg = _phops._load_registry()      # route rolling-fill dummies through the ledger (no untracked dummies)
     reg_dirty = False
     for sid in sorted(rolling):
@@ -6030,6 +6062,8 @@ def _placeholder_rolling_dummy_fill():
                     template = p
                     break
             series_path = series.get("path", "")
+            # premiere gate: only fill seasons whose SxxE01 premiere is a REAL file
+            real_prem = _seasons_with_real_premiere(episodes, files) if PLACEHOLDER_REQUIRE_PREMIERE else None
             season_files = {}
             for ep in episodes:
                 s = ep.get("seasonNumber")
@@ -6040,6 +6074,10 @@ def _placeholder_rolling_dummy_fill():
                     continue
                 air = _parse_air_date(ep.get("airDateUtc"))
                 if air is None or air > now_utc:
+                    continue
+                if real_prem is not None and s not in real_prem:
+                    # season premiere (SxxE01) is not a real file yet -> do not add this season
+                    skipped_no_prem += 1
                     continue
                 # Prefer a template from same season, else any
                 tpl = template
@@ -6068,6 +6106,8 @@ def _placeholder_rolling_dummy_fill():
             _phops._save_registry(reg)
         except Exception as e:
             log.warning("[placeholder] rolling dummy fill: registry save failed: %s", str(e)[:120])
+    if skipped_no_prem:
+        log.info("[placeholder] rolling dummy fill: skipped %d episode-fills in seasons whose premiere (SxxE01) is not a real file yet", skipped_no_prem)
     if written:
         log.info("[placeholder] rolling dummy fill total: wrote %d dummies (ledgered)", written)
     return written
