@@ -3439,6 +3439,8 @@ def _repair_needs_grab(arr, tid):
             if _is_parked_episode(tid):
                 return False
             e = arr.get_json("/episode/%d" % tid)
+            if e and _reng.is_unaired(e, datetime.datetime.now(datetime.timezone.utc)):
+                return False                                   # rule D: never re-grab unaired
             return bool(e and e.get("monitored") and not e.get("hasFile"))
         m = arr.get_json("/movie/%d" % tid)
         return bool(m and m.get("monitored") and not m.get("hasFile") and m.get("isAvailable", True))
