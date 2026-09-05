@@ -4642,6 +4642,11 @@ def check_placeholder():
             _placeholder_dedup_guard()
         except Exception as e:
             log.warning("[placeholder] dedup guard error: %s", str(e)[:120])
+    if PLACEHOLDER_PREMIERE_GUARD:
+        try:
+            _placeholder_premiere_guard()
+        except Exception as e:
+            log.warning("[placeholder] premiere guard error: %s", str(e)[:120])
     if PLACEHOLDER_ROLLING_DUMMY_FILL:
         try:
             n = _placeholder_rolling_dummy_fill()
@@ -6189,6 +6194,105 @@ def _placeholder_save_state(st):
             json.dump(st, f)
     except Exception as e:
         log.warning("[placeholder] state save failed: %s", e)
+
+# --------------------------------------------------------------------------- #
+# PREMIERE GUARD (recurring): actively ensure every AIRED season premiere (SxxE01) gets a
+# real file. The §30 gate is passive (skips filling premiere-less seasons); this guard is
+# active: it keeps the premiere monitored and searches for it, escalating single-episode
+# EpisodeSearch -> SeasonSearch (season pack) if the single episode can't be found. Daily-
+# gated + ledger-independent + round-robin + capped so it never floods.
+# --------------------------------------------------------------------------- #
+PLACEHOLDER_PREMIERE_GUARD          = _b("PLACEHOLDER_PREMIERE_GUARD", True)
+PLACEHOLDER_PREMIERE_ESCALATE_AFTER = _i("PLACEHOLDER_PREMIERE_ESCALATE_AFTER", 3)   # single-ep search attempts before SeasonSearch
+PLACEHOLDER_PREMIERE_SEASON_MONITOR = _b("PLACEHOLDER_PREMIERE_SEASON_MONITOR", True) # on escalation, monitor the season so a pack can grab
+PLACEHOLDER_PREMIERE_MAX_SERIES     = _i("PLACEHOLDER_PREMIERE_MAX_SERIES", 40)       # series processed per daily run
+
+def _placeholder_premiere_guard():
+    """For every season whose AIRED premiere (SxxE01) is not a real file: keep it monitored
+    and search it. Escalate EpisodeSearch -> SeasonSearch after N attempts (a season pack
+    usually contains the premiere; the park pass later re-parks the non-keep-real extras).
+    Returns (searched, escalated)."""
+    if not PLACEHOLDER_PREMIERE_GUARD or not _reng:
+        return 0, 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0, 0
+    st = _placeholder_load_state()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    try:
+        all_series = arr.get_json("/series") or []
+    except Exception:
+        return 0, 0
+    sids = [s["id"] for s in all_series]
+    start = int(st.get("premiere_cursor", 0))
+    if start >= len(sids):
+        start = 0
+    batch_series = [s for s in all_series if s["id"] in set(sids[start:start + PLACEHOLDER_PREMIERE_MAX_SERIES])]
+    att = st.get("premiere_attempts", {})   # "sid:Sxx" -> {"n":int,"escalated":bool}
+
+    searched = escalated = 0
+    for s in batch_series:
+        sid = s["id"]
+        try:
+            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
+            files = arr.get_json("/episodefile?seriesId=%d" % sid) or []
+        except Exception:
+            continue
+        real_prem = _seasons_with_real_premiere(eps, files)
+        seasons = sorted(set(e["seasonNumber"] for e in eps if (e.get("seasonNumber") or 0) > 0))
+        for se in seasons:
+            if se in real_prem:
+                # premiere is real now -> clear any tracked attempts
+                att.pop("%d:S%02d" % (sid, se), None)
+                continue
+            prem = next((e for e in eps if e.get("seasonNumber") == se and e.get("episodeNumber") == 1), None)
+            if not prem or _reng.is_unaired(prem, now):
+                continue  # no premiere object, or unaired (never force)
+            key = "%d:S%02d" % (sid, se)
+            rec = att.get(key) or {"n": 0, "escalated": False}
+            # always keep the premiere monitored so any grab can import
+            if not prem.get("monitored"):
+                try: arr.set_monitored([prem["id"]], True)
+                except Exception: pass
+            if rec.get("escalated"):
+                # already escalated to SeasonSearch; let Sonarr keep working it, don't spam
+                att[key] = rec
+                continue
+            if rec["n"] < PLACEHOLDER_PREMIERE_ESCALATE_AFTER:
+                # single-episode search
+                try:
+                    arr.command({"name": "EpisodeSearch", "episodeIds": [prem["id"]]})
+                    searched += 1
+                except Exception:
+                    pass
+                rec["n"] += 1
+            else:
+                # ESCALATE: full season search (a pack usually carries the premiere)
+                if PLACEHOLDER_PREMIERE_SEASON_MONITOR:
+                    season_eids = [e["id"] for e in eps if e.get("seasonNumber") == se and not e.get("hasFile")
+                                   and not _reng.is_unaired(e, now)]
+                    if season_eids:
+                        try: arr.set_monitored(season_eids, True)
+                        except Exception: pass
+                try:
+                    arr.command({"name": "SeasonSearch", "seriesId": sid, "seasonNumber": se})
+                    rec["escalated"] = True
+                    escalated += 1
+                    log.info("[placeholder] premiere guard: SeasonSearch fallback series=%d S%02dE01 (single-ep search exhausted)", sid, se)
+                except Exception:
+                    pass
+            att[key] = rec
+
+    st["premiere_attempts"] = att
+    st["premiere_cursor"] = (start + PLACEHOLDER_PREMIERE_MAX_SERIES) if (start + PLACEHOLDER_PREMIERE_MAX_SERIES) < len(sids) else 0
+    if st["premiere_cursor"] == 0:
+        st["last_premiere_guard_run"] = today
+    _placeholder_save_state(st)
+    if searched or escalated:
+        log.info("[placeholder] premiere guard: %d premiere EpisodeSearches, %d SeasonSearch escalations", searched, escalated)
+    return searched, escalated
+
 
 def _placeholder_park_pass():
     """Nightly staleness/backfill pass: compute KEEP-REAL for non-rolling series,
