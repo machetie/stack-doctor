@@ -5750,6 +5750,7 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         if ep.get("seasonNumber") is not None and ep.get("episodeNumber") is not None:
             by_key[(ep["seasonNumber"], ep["episodeNumber"])] = ep
 
+    _now = datetime.datetime.now(datetime.timezone.utc)
     targets = []
     target_keys = []
     for off in range(0, PLACEHOLDER_PREFETCH_AHEAD + 1):
@@ -5757,6 +5758,10 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         if key not in by_key:
             break
         ep = by_key[key]
+        # never prefetch/search unaired episodes (rule D). Episodes air in order, so the
+        # first unaired ep marks the airing frontier -> stop the ahead-window here.
+        if _reng.is_unaired(ep, _now):
+            break
         if ep.get("hasFile"):
             continue
         targets.append(ep["id"])
@@ -5766,7 +5771,7 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         key = (season + 1, 1)
         if key in by_key:
             ep = by_key[key]
-            if not ep.get("hasFile"):
+            if not ep.get("hasFile") and not _reng.is_unaired(ep, _now):
                 targets.append(ep["id"])
                 target_keys.append(key)
 
@@ -5842,6 +5847,10 @@ def _placeholder_prefetch_retry_check():
             remaining.append(item); continue
         if ep and ep.get("hasFile"):
             continue  # success, drop
+        # never SeasonSearch for an unaired episode (rule D) - purge it from the ledger
+        if ep and _reng.is_unaired(ep, datetime.datetime.now(datetime.timezone.utc)):
+            changed = True
+            continue
         # check if a grab is in progress
         try:
             queue = arr.get_json("/queue?page=1&pageSize=50&episodeIds=%d" % ep_id)
