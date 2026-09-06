@@ -5974,6 +5974,12 @@ def _demote_series_to_premieres(series_id):
 
 PLACEHOLDER_ROLLING_DUMMY_FILL = _b("PLACEHOLDER_ROLLING_DUMMY_FILL", True)
 PLACEHOLDER_REQUIRE_PREMIERE = _b("PLACEHOLDER_REQUIRE_PREMIERE", True)  # do not dummy-fill a season unless its SxxE01 premiere is a REAL file
+# SYSTEMIC FILL (MASTER-HANDOFF §36): dummy-fill was historically scoped to the ~14 Pulsarr
+# rolling shows only, leaving ~20k aired episodes in ~600 non-rolling shows as holes (real
+# premiere, rest NONE - e.g. Evil S2, Top Boy S3). Widen the fill to ALL scoped series,
+# round-robin batched so we do not hammer Sonarr. Legacy rolling-only behaviour: set false.
+PLACEHOLDER_FILL_ALL_SERIES = _b("PLACEHOLDER_FILL_ALL_SERIES", True)
+PLACEHOLDER_FILL_MAX_SERIES = _i("PLACEHOLDER_FILL_MAX_SERIES", 25)  # series filled per sweep (round-robin)
 PLACEHOLDER_ROLLING_DB = os.environ.get("PLACEHOLDER_ROLLING_DB", "/pulsarr_data/db/pulsarr.db")
 
 def _pulsarr_rolling_series_ids():
@@ -6052,19 +6058,45 @@ def _placeholder_rolling_dummy_fill():
     arr = _sonarr_instance()
     if not arr:
         return 0
-    rolling = _pulsarr_rolling_series_ids()
-    if not rolling:
-        return 0
     dummy_asset = _dummy_asset_path()
     if not dummy_asset or not os.path.exists(dummy_asset):
         log.warning("[placeholder] rolling dummy fill: dummy asset not found")
         return 0
+    # Series source: all scoped series (round-robin batched) OR legacy Pulsarr-rolling set.
+    st = _placeholder_load_state()
+    fill_cursor = 0
+    fill_ids = []
+    if PLACEHOLDER_FILL_ALL_SERIES:
+        scope = [p.strip() for p in PLACEHOLDER_SCOPE.split(",") if p.strip()]
+        try:
+            all_series = arr.get_json("/series") or []
+        except Exception as e:
+            log.warning("[placeholder] rolling dummy fill: fetch series failed: %s", str(e)[:80])
+            return 0
+        for sv in all_series:
+            sp = sv.get("path", "")
+            # need at least one real file (a template + a real premiere) -> skip fileless series
+            if (sv.get("statistics", {}) or {}).get("episodeFileCount", 0) == 0:
+                continue
+            if scope and not any(sp.startswith(p) for p in scope):
+                continue
+            fill_ids.append(sv.get("id"))
+        fill_ids.sort()
+        fill_cursor = int(st.get("fill_cursor", 0))
+        if fill_cursor >= len(fill_ids):
+            fill_cursor = 0
+        batch_ids = fill_ids[fill_cursor:fill_cursor + PLACEHOLDER_FILL_MAX_SERIES]
+    else:
+        rolling = _pulsarr_rolling_series_ids()
+        if not rolling:
+            return 0
+        batch_ids = sorted(rolling)
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     written = 0
     skipped_no_prem = 0
     reg = _phops._load_registry()      # route rolling-fill dummies through the ledger (no untracked dummies)
     reg_dirty = False
-    for sid in sorted(rolling):
+    for sid in batch_ids:
         try:
             series = arr.get_json("/series/%d" % sid)
             episodes = arr.get_json("/episode?seriesId=%d" % sid) or []
@@ -6126,6 +6158,13 @@ def _placeholder_rolling_dummy_fill():
         log.info("[placeholder] rolling dummy fill: skipped %d episode-fills in seasons whose premiere (SxxE01) is not a real file yet", skipped_no_prem)
     if written:
         log.info("[placeholder] rolling dummy fill total: wrote %d dummies (ledgered)", written)
+    if PLACEHOLDER_FILL_ALL_SERIES:
+        nxt = fill_cursor + PLACEHOLDER_FILL_MAX_SERIES
+        st["fill_cursor"] = nxt if nxt < len(fill_ids) else 0
+        try:
+            _placeholder_save_state(st)
+        except Exception:
+            pass
     return written
 
 def _placeholder_unaired_guard():
