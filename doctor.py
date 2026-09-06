@@ -4635,6 +4635,11 @@ def check_placeholder():
             _placeholder_unaired_guard()
         except Exception as e:
             log.warning("[placeholder] unaired guard error: %s", str(e)[:120])
+    if PLACEHOLDER_STALE_MONITOR_GUARD:
+        try:
+            _placeholder_stale_monitor_guard()
+        except Exception as e:
+            log.warning("[placeholder] stale-monitor guard error: %s", str(e)[:120])
     try:
         _placeholder_ledger_reconcile()
     except Exception as e:
@@ -6421,6 +6426,12 @@ def _placeholder_park_pass():
 PLACEHOLDER_DEDUP_GUARD    = _b("PLACEHOLDER_DEDUP_GUARD", True)
 PLACEHOLDER_DEDUP_MAX_SERIES = _i("PLACEHOLDER_DEDUP_MAX_SERIES", 60)   # series processed per daily run
 PLACEHOLDER_DEDUP_MAX_DELETES = _i("PLACEHOLDER_DEDUP_MAX_DELETES", 3000)  # dummy deletes per run (safety cap)
+# STALE-MONITOR GUARD (§40): counterpart to the unaired guard. Prefetch temporarily monitors
+# the next-N episodes on play; if the real file never arrives (poorly-propagated content),
+# they get stuck monitored+dummy -> Sonarr/Pulsarr keep re-grabbing parked content. This
+# guard re-parks them (unmonitors) once they are no longer being prefetched.
+PLACEHOLDER_STALE_MONITOR_GUARD = _b("PLACEHOLDER_STALE_MONITOR_GUARD", True)
+PLACEHOLDER_STALE_MONITOR_MAX_SERIES = _i("PLACEHOLDER_STALE_MONITOR_MAX_SERIES", 15)  # ledger series/run (kept low: compute_keep_real is heavy; daily-gated round-robin so full pass takes many sweeps)
 
 _DEDUP_EPRE = re.compile(r"S(\d{1,2})E(\d{1,2})", re.I)
 
@@ -6442,6 +6453,93 @@ def _dedup_correct_name(series_path, season, episode):
     title_year = re.sub(r"\s*\{[^}]*\}\s*$", "", folder)
     return os.path.join(series_path.rstrip("/"), "Season %02d" % season,
                         "%s - S%02dE%02d.mkv" % (title_year, season, episode))
+
+def _placeholder_stale_monitor_guard():
+    """Re-park stale monitored dummies. An episode that is a DUMMY + aired + monitored +
+    NOT keep-real + NOT actively being prefetched is a leftover from a prefetch whose real
+    file never arrived; leaving it monitored makes Sonarr/Pulsarr keep re-grabbing parked
+    content. Unmonitor it. Ledger-scoped, round-robin batched, daily-gated. (§40)"""
+    if not PLACEHOLDER_STALE_MONITOR_GUARD or not _phops or not _reng:
+        return 0
+    arr = _sonarr_instance()
+    if not arr:
+        return 0
+    st = _placeholder_load_state()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    if st.get("last_stalemon_run") == today:
+        return 0
+    reg = _phops._load_registry()
+    if not reg:
+        st["last_stalemon_run"] = today; _placeholder_save_state(st)
+        return 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    MAXB = PLACEHOLDER_DUMMY_MAX_BYTES
+    # active prefetch targets are exempt (real file may still be arriving)
+    try:
+        active_pf = {(i.get("series_id"), i.get("season"), i.get("episode"))
+                     for i in (_placeholder_prefetch_retry_load() or [])}
+    except Exception:
+        active_pf = set()
+    sids = sorted({int(v["series_id"]) for v in reg.values() if v.get("series_id") is not None})
+    start = int(st.get("stalemon_cursor", 0))
+    if start >= len(sids):
+        start = 0
+    batch = sids[start:start + PLACEHOLDER_STALE_MONITOR_MAX_SERIES]
+    # ledger episodes per series in this batch
+    led = {}
+    for v in reg.values():
+        try:
+            sid = int(v["series_id"])
+            led.setdefault(sid, set()).add((int(v["season"]), int(v["episode"])))
+        except Exception:
+            pass
+    unmon_total = 0
+    for sid in batch:
+        want = led.get(sid)
+        if not want:
+            continue
+        try:
+            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
+            files = {ff["id"]: ff for ff in (arr.get_json("/episodefile?seriesId=%d" % sid) or [])}
+            if not eps:
+                continue
+            kr = _reng.compute_keep_real(arr.get_json("/series/%d" % sid), eps, list(files.values()), [], now)["keep"]
+        except Exception as e:
+            log.warning("[placeholder] stale-monitor guard series %d error: %s", sid, str(e)[:100])
+            continue
+        ids = []
+        for e in eps:
+            se, ep = e.get("seasonNumber"), e.get("episodeNumber")
+            if se is None or ep is None or (se, ep) not in want:
+                continue
+            if not e.get("monitored"):
+                continue
+            fid = e.get("episodeFileId"); ff = files.get(fid, {}); sz = ff.get("size", 0)
+            if not (e.get("hasFile") and 0 < sz <= MAXB):        # must still be a dummy
+                continue
+            if _reng.is_unaired(e, now):                          # rule D -> keep monitored
+                continue
+            if _reng.ep_key(se, ep) in kr:                        # keep-real -> wants real file
+                continue
+            if (sid, se, ep) in active_pf:                        # active prefetch -> leave
+                continue
+            ids.append(e["id"])
+        if ids:
+            try:
+                arr.set_monitored(ids, False)
+                unmon_total += len(ids)
+                log.info("[placeholder] stale-monitor guard: unmonitored %d stale monitored-dummy eps in series %d", len(ids), sid)
+            except Exception as e:
+                log.warning("[placeholder] stale-monitor guard set_monitored failed (series %d): %s", sid, str(e)[:100])
+    nxt = start + PLACEHOLDER_STALE_MONITOR_MAX_SERIES
+    st["stalemon_cursor"] = nxt if nxt < len(sids) else 0
+    if st["stalemon_cursor"] == 0:
+        st["last_stalemon_run"] = today   # completed a full pass -> gate until tomorrow
+    _placeholder_save_state(st)
+    if unmon_total:
+        log.info("[placeholder] stale-monitor guard total: unmonitored %d stale monitored-dummy episodes", unmon_total)
+    return unmon_total
+
 
 def _placeholder_dedup_guard():
     """Daily (gated) self-heal of duplicate / mis-named park dummies. Ledger-scoped so it
