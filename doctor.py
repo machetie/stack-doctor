@@ -5979,7 +5979,7 @@ PLACEHOLDER_REQUIRE_PREMIERE = _b("PLACEHOLDER_REQUIRE_PREMIERE", True)  # do no
 # premiere, rest NONE - e.g. Evil S2, Top Boy S3). Widen the fill to ALL scoped series,
 # round-robin batched so we do not hammer Sonarr. Legacy rolling-only behaviour: set false.
 PLACEHOLDER_FILL_ALL_SERIES = _b("PLACEHOLDER_FILL_ALL_SERIES", True)
-PLACEHOLDER_FILL_MAX_SERIES = _i("PLACEHOLDER_FILL_MAX_SERIES", 25)  # series filled per sweep (round-robin)
+PLACEHOLDER_FILL_MAX_SERIES = _i("PLACEHOLDER_FILL_MAX_SERIES", 15)  # series/sweep (round-robin); lowered 25->15 to keep sweep dur well under DOCTOR_INTERVAL on big-gap batches
 PLACEHOLDER_ROLLING_DB = os.environ.get("PLACEHOLDER_ROLLING_DB", "/pulsarr_data/db/pulsarr.db")
 
 def _pulsarr_rolling_series_ids():
