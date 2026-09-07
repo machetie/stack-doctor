@@ -5784,9 +5784,7 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
     def _has_real_file(e):
         if not e.get("hasFile"):
             return False
-        ff = _files.get(e.get("episodeFileId"))
-        # real if the episodefile is bigger than a dummy; a dummy (<=max) must be prefetched
-        return bool(ff and ff.get("size", 0) > PLACEHOLDER_DUMMY_MAX_BYTES)
+        return _is_real_episode_file(_files.get(e.get("episodeFileId")))
 
     _now = datetime.datetime.now(datetime.timezone.utc)
     targets = []
@@ -6086,6 +6084,24 @@ def _derive_dummy_path(series_path, template_path, season, episode):
     return "%s/Season %02d/%s - S%02dE%02d.mkv" % (sp, season, title, season, episode)
 
 
+def _is_real_episode_file(ef):
+    """SINGLE SOURCE OF TRUTH for real-vs-dummy episode-file detection (audit #4).
+    A REAL file is a symlink into a mount (debrid/usenet) OR larger than a dummy.
+    A DUMMY is a regular file <= PLACEHOLDER_DUMMY_MAX_BYTES. Keeps the islink==real
+    coupling in ONE place so a future symlink-dummy design can change it here alone."""
+    if not ef:
+        return False
+    p = ef.get("path")
+    try:
+        if p and os.path.islink(p):
+            return True
+        if p and os.path.isfile(p) and os.path.getsize(p) > PLACEHOLDER_DUMMY_MAX_BYTES:
+            return True
+    except OSError:
+        pass
+    return (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES
+
+
 def _seasons_with_real_premiere(episodes, files):
     """Return the set of season numbers whose SxxE01 premiere is present as a REAL file
     (hasFile + episodeFile that is a symlink or larger than a dummy). The premiere is the
@@ -6099,18 +6115,7 @@ def _seasons_with_real_premiere(episodes, files):
         if not ep.get("hasFile"):
             continue
         ef = file_by_id.get(ep.get("episodeFileId") or 0)
-        p = (ef or {}).get("path")
-        is_real = False
-        try:
-            if p and os.path.islink(p):
-                is_real = True
-            elif p and os.path.isfile(p) and os.path.getsize(p) > PLACEHOLDER_DUMMY_MAX_BYTES:
-                is_real = True
-            elif ef and (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES:
-                is_real = True
-        except OSError:
-            is_real = bool(ef and (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES)
-        if is_real:
+        if _is_real_episode_file(ef):
             real.add(ep.get("seasonNumber"))
     return real
 
