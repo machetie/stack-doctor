@@ -5794,13 +5794,31 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
     if not targets:
         return 0, "all targets already have files"
 
-    # Remove any placeholder files blocking Sonarr import
+    # Un-park each dummy target: DELETE the Sonarr episodeFile record (not just the disk file).
+    # If we only remove the dummy from disk, Sonarr keeps a stale episodeFile record
+    # (hasFile=True) and - with profile upgrades disabled - REJECTS every real release as
+    # "Existing file and the Quality profile does not allow upgrades" (0 grabbed). Deleting the
+    # record clears hasFile so the real release is accepted. (§43)
     cleaned = 0
-    for s, e in target_keys:
+    for k in target_keys:
+        ep = by_key.get(k)
+        if not ep:
+            continue
+        fid = ep.get("episodeFileId")
+        ff = _files.get(fid) if fid else None
+        is_dummy = bool(ep.get("hasFile") and ff and ff.get("size", 0) <= PLACEHOLDER_DUMMY_MAX_BYTES)
+        if is_dummy and fid:
+            try:
+                arr._req("DELETE", "/episodefile/%d" % fid)   # removes record + dummy file
+                cleaned += 1
+                continue
+            except Exception as ex:
+                log.warning("[placeholder] prefetch: failed to delete dummy episodefile %s: %s", fid, str(ex)[:80])
+        # fallback: no record but a stray dummy on disk -> remove by path
+        s, e = k
         path = _prefetch_expected_path(base_file_path, s, e)
         if path and _prefetch_remove_dummy(path):
             cleaned += 1
-        # legacy .mp4 dummy next to a .mkv real file
         if path and path.lower().endswith(".mkv"):
             legacy = path[:-4] + ".mp4"
             if _prefetch_remove_dummy(legacy):
