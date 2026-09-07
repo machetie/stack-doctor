@@ -3826,6 +3826,12 @@ def check_mediastorm():
 
 
 _PROVIDER_KEYWORDS = ("indexer", "download client", "applications unavailable", "applications are unavailable")
+# Cooldown between expensive /indexer/testall re-tests (audit #1). A dead indexer (e.g. the
+# Seadexerr/NinjaCentral 502/504 failures) makes testall hang on its timeout for EVERY indexer,
+# every sweep -> the providers check alone cost ~90s/sweep. We still log the health warning
+# each sweep (cheap); we just avoid re-testing all indexers more than every N seconds.
+PROVIDER_TEST_COOLDOWN = _i("PROVIDER_TEST_COOLDOWN_MIN", 30) * 60
+_provider_last_test = {}   # arr.name -> epoch of last testall
 
 def check_providers():
     for arr in INSTANCES:
@@ -3840,7 +3846,11 @@ def check_providers():
                     " | ".join((h.get("message") or "")[:60] for h in issues[:2]))
         if DRY_RUN:
             continue
-        # re-test everything; a passing test clears the failure status and re-enables recovered ones
+        # re-test everything; a passing test clears the failure status and re-enables recovered ones.
+        # Only run the expensive testall at most every PROVIDER_TEST_COOLDOWN seconds (audit #1).
+        if time.time() - _provider_last_test.get(arr.name, 0) < PROVIDER_TEST_COOLDOWN:
+            continue
+        _provider_last_test[arr.name] = time.time()
         for ep, label in (("/indexer/testall", "indexers"), ("/downloadclient/testall", "download-clients")):
             res = arr.post(ep)
             if isinstance(res, list) and res:
@@ -4702,19 +4712,30 @@ def sweep(only=None):
         t0 = time.time()
         ran = 0
         errs = []
+        per = []                       # (duration_seconds, check_id) for per-check timing
         with _state_lock:
             for cid, en, fn in CHECKS:
                 if not en:
                     continue
                 ran += 1
+                t = time.time()
                 try:
                     fn(only) if cid == "queue" else fn()
                 except Exception as e:
                     errs.append(cid)
                     metric_inc("stackdoctor_sweep_errors_total", check=cid)
                     log.error("[%s] check error: %s", cid, e)
+                per.append((time.time() - t, cid))
         metric_inc("stackdoctor_sweep_total")
         dur = time.time() - t0
+        # per-check timing at debug + slowest checks summarised at info (observability / audit #5)
+        if per:
+            per.sort(reverse=True)
+            slow = ", ".join("%s=%.1fs" % (c, d) for d, c in per[:3] if d >= 1.0)
+            for d, c in per:
+                log.debug("[sweep] check %s took %.2fs", c, d)
+            if slow:
+                log.info("[sweep] slowest checks: %s", slow)
         log.info("sweep done: checks=%d errors=%d%s dur=%.1fs%s",
                  ran, len(errs),
                  " [" + ",".join(errs) + "]" if errs else "",
@@ -6112,6 +6133,12 @@ def _placeholder_rolling_dummy_fill():
         return 0
     # Series source: all scoped series (round-robin batched) OR legacy Pulsarr-rolling set.
     st = _placeholder_load_state()
+    _today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    # DAILY-GATED (audit #1): the fill is a slow backfill, not time-critical. Run a full
+    # round-robin pass once per day, then idle until tomorrow (matches park_pass cadence).
+    # This removes the largest continuous per-sweep cost (was running EVERY 120s sweep).
+    if st.get("last_fill_run") == _today:
+        return 0
     fill_cursor = 0
     fill_ids = []
     if PLACEHOLDER_FILL_ALL_SERIES:
@@ -6208,7 +6235,10 @@ def _placeholder_rolling_dummy_fill():
         log.info("[placeholder] rolling dummy fill total: wrote %d dummies (ledgered)", written)
     if PLACEHOLDER_FILL_ALL_SERIES:
         nxt = fill_cursor + PLACEHOLDER_FILL_MAX_SERIES
-        st["fill_cursor"] = nxt if nxt < len(fill_ids) else 0
+        wrapped = nxt >= len(fill_ids)
+        st["fill_cursor"] = 0 if wrapped else nxt
+        if wrapped:
+            st["last_fill_run"] = _today   # completed a full pass -> idle until tomorrow
         try:
             _placeholder_save_state(st)
         except Exception:
