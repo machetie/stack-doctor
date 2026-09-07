@@ -5757,6 +5757,15 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         if ep.get("seasonNumber") is not None and ep.get("episodeNumber") is not None:
             by_key[(ep["seasonNumber"], ep["episodeNumber"])] = ep
 
+    # size map so we can tell a REAL file from a parked DUMMY (both have hasFile=True)
+    _files = {ff["id"]: ff for ff in (arr.get_json("/episodefile?seriesId=%d" % series_id) or [])}
+    def _has_real_file(e):
+        if not e.get("hasFile"):
+            return False
+        ff = _files.get(e.get("episodeFileId"))
+        # real if the episodefile is bigger than a dummy; a dummy (<=max) must be prefetched
+        return bool(ff and ff.get("size", 0) > PLACEHOLDER_DUMMY_MAX_BYTES)
+
     _now = datetime.datetime.now(datetime.timezone.utc)
     targets = []
     target_keys = []
@@ -5769,7 +5778,7 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         # first unaired ep marks the airing frontier -> stop the ahead-window here.
         if _reng.is_unaired(ep, _now):
             break
-        if ep.get("hasFile"):
+        if _has_real_file(ep):
             continue
         targets.append(ep["id"])
         target_keys.append(key)
@@ -5778,7 +5787,7 @@ def _prefetch_episodes(series_id, season, episode, base_file_path=""):
         key = (season + 1, 1)
         if key in by_key:
             ep = by_key[key]
-            if not ep.get("hasFile") and not _reng.is_unaired(ep, _now):
+            if not _has_real_file(ep) and not _reng.is_unaired(ep, _now):
                 targets.append(ep["id"])
                 target_keys.append(key)
 
