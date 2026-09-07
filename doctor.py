@@ -6102,6 +6102,17 @@ def _is_real_episode_file(ef):
     return (ef.get("size") or 0) > PLACEHOLDER_DUMMY_MAX_BYTES
 
 
+def _placeholder_series_data(arr, sid):
+    """Fetch series + episodes + episodefiles ONCE for a series, returning both the list
+    and id-map forms of files. (audit #3) Collapses the guards' duplicated fetch and the
+    list-vs-map inconsistency that was a latent bug risk."""
+    series = arr.get_json("/series/%d" % sid)
+    episodes = arr.get_json("/episode?seriesId=%d" % sid) or []
+    files_list = arr.get_json("/episodefile?seriesId=%d" % sid) or []
+    files_map = {f["id"]: f for f in files_list if f.get("id")}
+    return series, episodes, files_list, files_map
+
+
 def _seasons_with_real_premiere(episodes, files):
     """Return the set of season numbers whose SxxE01 premiere is present as a REAL file
     (hasFile + episodeFile that is a symlink or larger than a dummy). The premiere is the
@@ -6178,9 +6189,7 @@ def _placeholder_rolling_dummy_fill():
     reg_dirty = False
     for sid in batch_ids:
         try:
-            series = arr.get_json("/series/%d" % sid)
-            episodes = arr.get_json("/episode?seriesId=%d" % sid) or []
-            files = arr.get_json("/episodefile?seriesId=%d" % sid) or []
+            series, episodes, files, _ = _placeholder_series_data(arr, sid)
             if not series or not episodes:
                 continue
             template = None
@@ -6368,8 +6377,7 @@ def _placeholder_premiere_guard():
     for s in batch_series:
         sid = s["id"]
         try:
-            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
-            files = arr.get_json("/episodefile?seriesId=%d" % sid) or []
+            _, eps, files, _ = _placeholder_series_data(arr, sid)
         except Exception:
             continue
         real_prem = _seasons_with_real_premiere(eps, files)
@@ -6577,11 +6585,10 @@ def _placeholder_stale_monitor_guard():
         if not want:
             continue
         try:
-            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
-            files = {ff["id"]: ff for ff in (arr.get_json("/episodefile?seriesId=%d" % sid) or [])}
+            series, eps, files_list, files_map = _placeholder_series_data(arr, sid)
             if not eps:
                 continue
-            kr = _reng.compute_keep_real(arr.get_json("/series/%d" % sid), eps, list(files.values()), [], now)["keep"]
+            kr = _reng.compute_keep_real(series, eps, files_list, [], now)["keep"]
         except Exception as e:
             log.warning("[placeholder] stale-monitor guard series %d error: %s", sid, str(e)[:100])
             continue
@@ -6592,7 +6599,7 @@ def _placeholder_stale_monitor_guard():
                 continue
             if not e.get("monitored"):
                 continue
-            fid = e.get("episodeFileId"); ff = files.get(fid, {}); sz = ff.get("size", 0)
+            fid = e.get("episodeFileId"); ff = files_map.get(fid, {}); sz = ff.get("size", 0)
             if not (e.get("hasFile") and 0 < sz <= MAXB):        # must still be a dummy
                 continue
             if _reng.is_unaired(e, now):                          # rule D -> keep monitored
@@ -6660,14 +6667,12 @@ def _placeholder_dedup_guard():
         if deleted >= PLACEHOLDER_DEDUP_MAX_DELETES:
             break
         try:
-            s = arr.get_json("/series/%d" % sid)
+            s, eplist, _, files = _placeholder_series_data(arr, sid)
             if not s:
                 continue
             spath = s.get("path", "")
             if not spath or not os.path.isdir(spath):
                 continue
-            eplist = arr.get_json("/episode?seriesId=%d" % sid) or []
-            files = {f["id"]: f for f in (arr.get_json("/episodefile?seriesId=%d" % sid) or [])}
         except Exception:
             continue
         eps = {(e["seasonNumber"], e["episodeNumber"]): e for e in eplist}
