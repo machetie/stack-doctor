@@ -7,3 +7,6 @@ state.json
 config.json
 *.log
 .opencode/
+backups/
+*.bak.*
+doctor.py.bak.*
