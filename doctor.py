@@ -264,6 +264,7 @@ PLACEHOLDER_STATE_FILE = os.environ.get("PLACEHOLDER_STATE_FILE", "/data/placeho
 PLACEHOLDER_PREFETCH_RETRY_FILE = os.environ.get("PLACEHOLDER_PREFETCH_RETRY_FILE", "/data/placeholder-prefetch-retry.json")
 PLACEHOLDER_PREFETCH_RETRY_AFTER = _i("PLACEHOLDER_PREFETCH_RETRY_AFTER_MIN", 10) * 60
 PLACEHOLDER_PREFETCH_MAX_RETRIES = _i("PLACEHOLDER_PREFETCH_MAX_RETRIES", 3)
+PLACEHOLDER_PREFETCH_FAIL_ESCALATE = _i("PLACEHOLDER_PREFETCH_FAIL_ESCALATE", 2)  # downloadFailed events before SeasonSearch escalates despite an active grab (§44)
 
 # westrepair config
 WR_SCRIPT          = os.environ.get("WESTREPAIR_SCRIPT", "/app/westrepair/repair.py")
@@ -5885,23 +5886,38 @@ def _placeholder_prefetch_retry_check():
         if ep and _reng.is_unaired(ep, datetime.datetime.now(datetime.timezone.utc)):
             changed = True
             continue
-        # check if a grab is in progress
+        if retries >= PLACEHOLDER_PREFETCH_MAX_RETRIES:
+            remaining.append(item); continue
+        # space escalations by the retry threshold (avoid SeasonSearch spam)
+        if now - item.get("last_retry", item.get("ts", now)) < threshold:
+            remaining.append(item); continue
+        # is a grab currently in progress?
         try:
             queue = arr.get_json("/queue?page=1&pageSize=50&episodeIds=%d" % ep_id)
             records = queue.get("records", []) if isinstance(queue, dict) else []
         except Exception:
             records = []
-        if records:
-            remaining.append(item); continue  # still trying
-        if retries >= PLACEHOLDER_PREFETCH_MAX_RETRIES:
-            remaining.append(item); continue
-        if now - item.get("last_retry", item.get("ts", now)) < threshold:
-            remaining.append(item); continue
-        # fallback: full season search
+        # count downloadFailed events for this episode since the prefetch was registered
+        # -> a grab->fail->regrab loop should escalate to a season pack, not spin forever.
+        fails = 0
+        try:
+            hist = arr.get_json("/history?page=1&pageSize=50&sortKey=date&sortDirection=descending&episodeId=%d" % ep_id) or {}
+            since = item.get("ts", 0)
+            for h in (hist.get("records", []) if isinstance(hist, dict) else []):
+                if h.get("eventType") == "downloadFailed":
+                    fails += 1
+        except Exception:
+            fails = 0
+        # A live grab normally means "still trying" -> wait. BUT if this episode keeps
+        # FAILING (>= PLACEHOLDER_PREFETCH_FAIL_ESCALATE), the single-episode grabs are not
+        # working -> escalate to a SeasonSearch even while a (doomed) grab is active. (§44)
+        if records and fails < PLACEHOLDER_PREFETCH_FAIL_ESCALATE:
+            remaining.append(item); continue  # genuinely still trying
+        # fallback: full season search (a pack often has different/available releases)
         try:
             arr.command({"name": "SeasonSearch", "seriesId": series_id, "seasonNumber": season})
-            log.info("[placeholder] prefetch retry: SeasonSearch fallback for series=%d season=%d episode=%d",
-                     series_id, season, item.get("episode"))
+            log.info("[placeholder] prefetch retry: SeasonSearch fallback for series=%d season=%d episode=%d (fails=%d active_grab=%s)",
+                     series_id, season, item.get("episode"), fails, bool(records))
             item["retries"] = retries + 1
             item["last_retry"] = int(now)
             changed = True
