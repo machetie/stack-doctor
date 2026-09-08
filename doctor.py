@@ -1209,6 +1209,90 @@ def _churn_record(state, arr, rec, title):
         return True
     return False
 
+def _churn_record_target(state, arr, target_id, title):
+    """Same as _churn_record but keyed directly on an episode/movie id (used by the scrubber,
+    which acts on a file rather than a queue record). Counts a dead grab and brakes over the
+    limit. Returns True if it un-monitored the target."""
+    if CHURN_LIMIT <= 0 or not target_id:
+        return False
+    tid = target_id
+    off = _offenders(state).setdefault(arr.name, {})
+    o = off.setdefault(str(tid), {"fails": 0, "until": 0, "level": 0, "title": title})
+    o["fails"] += 1; o["title"] = title or o.get("title", "")
+    if o["fails"] < CHURN_LIMIT or o["until"] != 0:
+        return False
+    if CHURN_ACTION == "report":
+        log.warning("[churn:%s] REPEAT-OFFENDER (%d dead grabs, still retrying): %s", arr.name, o["fails"], o["title"])
+        o["until"] = -1
+        return False
+    if CHURN_ACTION in ("park", "backoff") and arr.set_monitored([int(tid)], False):
+        o["fails"] = 0
+        if CHURN_ACTION == "backoff":
+            lvl = o.get("level", 0)
+            delay = CHURN_BACKOFF[min(lvl, len(CHURN_BACKOFF) - 1)]
+            o["until"] = time.time() + delay; o["level"] = lvl + 1
+            log.warning("[churn:%s] REPEAT-OFFENDER parked (retry #%d in %s) -> un-monitored: %s",
+                        arr.name, lvl + 1, _human(delay), o["title"])
+        else:
+            o["until"] = -1
+            log.warning("[churn:%s] REPEAT-OFFENDER parked (un-monitored, manual re-monitor): %s", arr.name, o["title"])
+        return True
+    return False
+
+# scrubber escalation: how many dead grabs of the SAME episode before we stop relying on the
+# single-episode search (which keeps finding the same dead scene release mirrored across indexers)
+# and escalate to a SEASON search (season packs are different releases -> fastest path to a live
+# file). 0 = escalate on the 2nd dead grab by default.
+SCRUB_SEASON_ESCALATE_AT = _i("SCRUBBER_SEASON_ESCALATE_AT", 2)   # dead-grab count that triggers SeasonSearch
+
+def _scrub_escalate_search(state, arr, kind, target_id, title):
+    """Called after the scrubber blocklists+deletes a dead file. Decides the FASTEST next action
+    to get a good file back into Plex, and applies the churn brake as a last resort.
+      dead#1                         -> let normal repair fire EpisodeSearch (return, do nothing here)
+      dead# >= SCRUB_SEASON_ESCALATE_AT and sonarr -> fire SeasonSearch (different releases/packs)
+      dead# >= CHURN_LIMIT           -> churn brake (park/backoff) so it stops looping
+    Returns True if it parked the target (so repair should not re-grab)."""
+    if not target_id:
+        return False
+    off = _offenders(state).setdefault(arr.name, {})
+    o = off.setdefault(str(target_id), {"fails": 0, "until": 0, "level": 0, "title": title})
+    o["fails"] += 1; o["title"] = title or o.get("title", "")
+    fails = o["fails"]
+    # last resort: churn brake parks it (only if enabled and over the limit)
+    if CHURN_LIMIT > 0 and fails >= CHURN_LIMIT and o["until"] == 0:
+        if CHURN_ACTION == "report":
+            log.warning("[scrubber:churn:%s] REPEAT-OFFENDER (%d dead grabs): %s", arr.name, fails, o["title"])
+            o["until"] = -1
+            return False
+        if CHURN_ACTION in ("park", "backoff") and arr.set_monitored([int(target_id)], False):
+            o["fails"] = 0
+            if CHURN_ACTION == "backoff":
+                lvl = o.get("level", 0)
+                delay = CHURN_BACKOFF[min(lvl, len(CHURN_BACKOFF) - 1)]
+                o["until"] = time.time() + delay; o["level"] = lvl + 1
+                log.warning("[scrubber:churn:%s] parked (retry #%d in %s): %s",
+                            arr.name, lvl + 1, _human(delay), o["title"])
+            else:
+                o["until"] = -1
+                log.warning("[scrubber:churn:%s] parked (un-monitored, manual re-monitor): %s", arr.name, o["title"])
+            return True
+    # escalate to a season search on/after the configured dead-grab count (sonarr only)
+    if kind == "episode" and arr.kind == "sonarr" and fails >= SCRUB_SEASON_ESCALATE_AT:
+        try:
+            ep = arr.get_json("/episode/%d" % int(target_id)) or {}
+            sid = ep.get("seriesId"); season = ep.get("seasonNumber")
+            if sid is not None and season is not None:
+                if DRY_RUN:
+                    log.info("[scrubber:escalate:%s] WOULD SeasonSearch series=%d season=%d (dead#%d): %s",
+                             arr.name, sid, season, fails, o["title"])
+                else:
+                    arr.command({"name": "SeasonSearch", "seriesId": int(sid), "seasonNumber": int(season)})
+                    log.warning("[scrubber:escalate:%s] SeasonSearch series=%d season=%d (dead#%d, single-ep kept finding dead releases): %s",
+                                arr.name, sid, season, fails, o["title"])
+        except Exception as e:
+            log.warning("[scrubber:escalate] SeasonSearch failed for ep %s: %s", target_id, str(e)[:100])
+    return False
+
 def _churn_remonitor(state):
     """Re-monitor parked titles whose backoff delay has elapsed, giving them a fresh attempt."""
     if CHURN_LIMIT <= 0 or CHURN_ACTION != "backoff":
@@ -2133,6 +2217,51 @@ def _scrub_walk(paths):
         except Exception as e:
             log.warning("[scrubber] walk %s failed: %s", libp, e)
 
+def _scrub_blocklist_grab(arr, file_id, kind):
+    """Mark the most-recent *grabbed* history record for the file's episode/movie as failed
+    (POST /history/failed/{id}). This is the arr's native blocklist action, so the subsequent
+    re-search picks a DIFFERENT release instead of the same dead one. Best-effort.
+    Returns (marked_failed, target_id, title) so the caller can also record a churn strike."""
+    target_id = None; title = ""
+    if not BLOCKLIST:
+        return (False, target_id, title)
+    try:
+        if kind == "movie":
+            mf = arr.get_json("/moviefile/%d" % file_id) or {}
+            mid = mf.get("movieId")
+            if not mid:
+                return (False, target_id, title)
+            target_id = mid
+            hist = arr.get_json("/history/movie?movieId=%d&eventType=1" % mid) or []
+            recs = hist if isinstance(hist, list) else (hist.get("records") or [])
+        else:
+            ef = arr.get_json("/episodefile/%d" % file_id) or {}
+            # episodeFile has no episodeId; find the episode(s) that point at this file
+            sid = ef.get("seriesId")
+            if not sid:
+                return (False, target_id, title)
+            eps = arr.get_json("/episode?seriesId=%d" % sid) or []
+            ep_ids = [e["id"] for e in eps if e.get("episodeFileId") == file_id]
+            if ep_ids:
+                target_id = ep_ids[0]
+            recs = []
+            for eid in ep_ids:
+                h = arr.get_json("/history?episodeId=%d&pageSize=5&sortKey=date&sortDirection=descending&eventType=1" % eid) or {}
+                recs += (h.get("records") or [])
+        if recs:
+            recs.sort(key=lambda r: r.get("date", ""), reverse=True)
+            title = recs[0].get("sourceTitle") or ""
+            hid = recs[0].get("id")
+            if hid:
+                arr._req("POST", "/history/failed/%d" % hid, data=b"")
+                log.warning("[scrubber] [%s:%s] blocklisted grab historyId=%d (%s)",
+                            arr.name, kind, hid, title[:60])
+                return (True, target_id, title)
+        return (False, target_id, title)
+    except Exception as e:
+        log.warning("[scrubber] blocklist grab failed (%s fileId=%d): %s", kind, file_id, str(e)[:120])
+        return (False, target_id, title)
+
 def _scrub_arr_index():
     """Build {realpath: (arr, fileId, kind)} once per sweep across all sonarr/radarr instances.
     kind = 'movie' for radarr, 'episode' for sonarr."""
@@ -2347,6 +2476,16 @@ def _scrub_act_on_bad(real_path, lib_symlink, reason, qroot, manifest):
             arr, file_id, kind = ent
             path = "/moviefile/%d" % file_id if kind == "movie" else "/episodefile/%d" % file_id
             try:
+                # blocklist the bad grab FIRST (before the file record is gone) so the
+                # arr's re-search avoids re-grabbing this same dead release.
+                _bl_ok, _tid, _btitle = _scrub_blocklist_grab(arr, file_id, kind)
+                # get a good file back FAST + stop the loop: count this dead grab, and if the
+                # single-episode search keeps finding the same dead scene release (mirrored across
+                # indexers, bypassing the per-release blocklist), escalate to a SeasonSearch;
+                # after CHURN_LIMIT, park via the churn brake.
+                _cstate = _load_state()
+                _scrub_escalate_search(_cstate, arr, kind, _tid, _btitle)
+                _save_state(_cstate)
                 arr._req("DELETE", path)
                 arr_acted = True
                 log.warning("[scrubber] [%s:%s] deleted %s id=%d -> arr will re-search (%s)",
