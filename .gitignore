@@ -11,3 +11,5 @@ backups/
 *.bak.*
 doctor.py.bak.*
 compose-deploy.yaml
+AGENT-F4-GUIDE.md
+AGENT-*.md
