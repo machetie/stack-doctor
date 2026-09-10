@@ -10,3 +10,4 @@ config.json
 backups/
 *.bak.*
 doctor.py.bak.*
+compose-deploy.yaml
